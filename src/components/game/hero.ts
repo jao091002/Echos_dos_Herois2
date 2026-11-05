@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { terrainHeight } from './world';
 
 /* ============================================================================
  *  HERO — rig articulado procedural (Frieren-like)
@@ -599,6 +600,10 @@ export function createHero(scene: THREE.Scene): HeroRig {
   part(new THREE.TorusGeometry(0.046, 0.012, 6, 16), mat.purple, staff, [tie.x, tie.y, tie.z], { rot: [PI / 2, 0, 0] });
   part(new THREE.SphereGeometry(0.016, 10, 8), mat.bead, staff, [tie.x + 0.05, tie.y - 0.05, tie.z + 0.012]);
   const focus = part(new THREE.IcosahedronGeometry(0.026, 1), mat.glow, staff, [0.128, 1.8, 0.02]);
+  // luzes que orbitam a cabeça do cajado e anel rúnico discreto (reagem à magia)
+  const orbiters = [0, 1, 2].map(() => part(new THREE.OctahedronGeometry(0.012, 0), mat.glow, staff, [0.128, 1.8, 0.02], { shadow: false }));
+  const idleRingMat = new THREE.MeshBasicMaterial({ color: '#f6e4ae', transparent: true, opacity: 0.25, depthWrite: false, side: THREE.DoubleSide });
+  const idleRing = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.0035, 5, 44), idleRingMat); idleRing.position.set(0.122, 1.79, 0.01); staff.add(idleRing);
   const spellPoint = new THREE.Object3D(); spellPoint.position.set(0.13, 1.84, 0.02); staff.add(spellPoint);
   const aura = new THREE.PointLight('#efdba9', 0.85, 4, 2); aura.position.set(0.1, 1.8, 0.1); staff.add(aura);
   const haloA = new THREE.Mesh(new THREE.TorusGeometry(0.27, 0.008, 5, 32), mat.halo); haloA.position.set(0.12, 1.78, 0); staff.add(haloA);
@@ -653,7 +658,8 @@ export function createHero(scene: THREE.Scene): HeroRig {
   // ociosidade: pequenos gestos ("fidgets") e passinhos ao girar parada
   let idleClock = 0, fidget = -1, fidgetKind = 2, fidgetT = 0, nextFidget = 7;
   // cajado: em mãos ou preso nas costas (diagonal); troca animada
-  let staffEquipped = true, swapT = -1, swapTo = true;
+  let staffEquipped = true, swapT = -1, swapTo = true, staffPlant = 0;
+  const sv1 = new THREE.Vector3(), sv2 = new THREE.Vector3(), sv3 = new THREE.Vector3();
   const backMount = new THREE.Group(); backMount.name = 'staff-back-mount';
   backMount.position.set(0.02, 0.16, -0.2); backMount.rotation.set(0.12, 0, 0.62); chest.add(backMount);
   const placeStaff = (inHand: boolean) => {
@@ -689,16 +695,22 @@ export function createHero(scene: THREE.Scene): HeroRig {
    * Rcadeia é a composição das rotações procedurais das juntas mapeadas. Quaternion local = D_pai⁻¹ · D.
    */
   type Region = 'legs' | 'torso' | 'armL' | 'armR' | 'hips' | 'head' | 'none';
-  type XNode = { bone: THREE.Bone; parentIdx: number; joint: JointName | null; region: Region; rest: THREE.Quaternion; clip: THREE.Quaternion; Rc: THREE.Quaternion; D: THREE.Quaternion };
+  type XNode = { bone: THREE.Object3D; rootQ: THREE.Quaternion | null; parentIdx: number; joint: JointName | null; region: Region; rest: THREE.Quaternion; clip: THREE.Quaternion; Rc: THREE.Quaternion; D: THREE.Quaternion };
   let xb: null | {
-    model: THREE.Object3D; nodes: XNode[]; rootParentQ: THREE.Quaternion; full: boolean;
+    model: THREE.Object3D; nodes: XNode[]; full: boolean;
     mixer: THREE.AnimationMixer | null; idle: THREE.AnimationAction | null; walk: THREE.AnimationAction | null; run: THREE.AnimationAction | null;
     sockets: { obj: THREE.Object3D; idx: number }[]; hipsIdx: number; hipsBind: THREE.Vector3; hipsClipY: number; walkOff: number; runOff: number;
     fingers: { bones: THREE.Bone[]; sign: number; side: 0 | 1 }[]; chestSocket: THREE.Object3D; shoulderL: THREE.Bone; w: { legs: number; torso: number; armL: number; walk: number; run: number };
   } = null;
   const clipT = { legs: 0, torso: 0, armL: 0, walk: 0, run: 0 };
   const xq = new THREE.Quaternion(), xq2 = new THREE.Quaternion(), xe = new THREE.Euler(), xv = new THREE.Vector3(), bodyQInv = new THREE.Quaternion();
-  const boneKey = (n: string) => n.replace(/^mixamorig[:_]?/, '').replace(/_\d+$/, '');
+  // esqueletos "Biped" (bip001_*) são mapeados para os nomes Mixamo usados pelo retarget
+  const BIPED: Record<string, string> = {
+    pelvis: 'Hips', spine: 'Spine', spine1: 'Spine1', spine2: 'Spine2', neck: 'Neck', head: 'Head',
+    l_clavicle: 'LeftShoulder', l_upperarm: 'LeftArm', l_forearm: 'LeftForeArm', l_hand: 'LeftHand', l_thigh: 'LeftUpLeg', l_calf: 'LeftLeg', l_foot: 'LeftFoot', l_toe0: 'LeftToeBase',
+    r_clavicle: 'RightShoulder', r_upperarm: 'RightArm', r_forearm: 'RightForeArm', r_hand: 'RightHand', r_thigh: 'RightUpLeg', r_calf: 'RightLeg', r_foot: 'RightFoot', r_toe0: 'RightToeBase',
+  };
+  const boneKey = (n: string) => { const k = n.replace(/^mixamorig[:_]?/, '').replace(/_\d+$/, ''), m = /^bip001_(.+)$/.exec(k); return m && BIPED[m[1]] ? BIPED[m[1]] : k; };
 
   const xbSample = (dt: number) => {
     if (!xb) return;
@@ -716,7 +728,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
     if (!xb) return;
     const w = xb.w, I = xq2.identity();
     for (const n of xb.nodes) {
-      const pR = n.parentIdx >= 0 ? xb.nodes[n.parentIdx].Rc : I, pD = n.parentIdx >= 0 ? xb.nodes[n.parentIdx].D : xb.rootParentQ;
+      const pR = n.parentIdx >= 0 ? xb.nodes[n.parentIdx].Rc : I, pD = n.parentIdx >= 0 ? xb.nodes[n.parentIdx].D : n.rootQ!;
       if (n.joint) { const r = J[n.joint].node.rotation; xe.set(r.x, r.y, r.z, 'XYZ'); xq.setFromEuler(xe); } else xq.identity();
       n.Rc.copy(pR).multiply(xq);
       n.D.copy(n.Rc).multiply(n.rest);
@@ -749,13 +761,13 @@ export function createHero(scene: THREE.Scene): HeroRig {
     model.traverse(o => { if ((o as THREE.Bone).isBone) { const k = boneKey(o.name); if (!byName[k]) byName[k] = o as THREE.Bone; } });
     const local = (n: string) => { body.updateWorldMatrix(true, true); return body.worldToLocal(byName[n].getWorldPosition(new THREE.Vector3())); };
     // 1) virar para +Z (direção dos dedos dos pés)
-    const toe = local('LeftToeBase').sub(local('LeftFoot')); holder.rotation.y = -Math.atan2(toe.x, toe.z);
-    // 2) escala pelo comprimento da perna; 3) sola no chão
-    const k = (THIGH + SHIN) / Math.max(0.01, local('LeftUpLeg').y - local('LeftFoot').y);
+    const toeL = local('LeftToeBase').sub(local('LeftFoot')), toeR = local('RightToeBase').sub(local('RightFoot'));
+    holder.rotation.y = -Math.atan2(toeL.x + toeR.x, toeL.z + toeR.z); // média dos dois pés: o abrir das pontas se cancela
+    // 2) escala pelo comprimento real da perna (vale também para poses com perna dobrada)
+    const legLen = local('LeftUpLeg').distanceTo(local('LeftLeg')) + local('LeftLeg').distanceTo(local('LeftFoot'));
+    const k = (THIGH + SHIN) / Math.max(0.01, legLen);
     holder.scale.setScalar(k);
-    const soleY = Math.min(local('LeftToeBase').y, local('RightToeBase').y, local('LeftFoot').y - 0.07 * k);
-    holder.position.y = -soleY + 0.01;
-    holder.updateMatrixWorld(true);
+    holder.updateMatrixWorld(true); // a sola é apoiada depois, com o esqueleto já endireitado
     // lado: "L" do rig procedural = lado -X do corpo
     const leftIsNeg = local('LeftArm').x < 0;
     const sideL = leftIsNeg ? 'Left' : 'Right', sideR = leftIsNeg ? 'Right' : 'Left';
@@ -770,12 +782,24 @@ export function createHero(scene: THREE.Scene): HeroRig {
     outlineSkin.customProgramCacheKey = () => 'hero-outline-skin-v1';
     for (const m of skinned) {
       m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false;
+      if (full) {
+        // modelos baixados: transparência (blend) vira recorte opaco, evitando corpo translúcido e camadas se sobrepondo;
+        // metal=1 (padrão do glTF) fica quase preto sem mapa de reflexo, então é suavizado
+        for (const mt of (Array.isArray(m.material) ? m.material : [m.material]) as THREE.MeshStandardMaterial[]) {
+          if (mt.transparent) { mt.transparent = false; mt.alphaTest = 0.5; mt.opacity = 1; }
+          mt.depthWrite = true; mt.depthTest = true;
+          if ('metalness' in mt) { mt.metalness = Math.min(mt.metalness, 0.12); mt.roughness = Math.max(mt.roughness, 0.6); }
+          mt.needsUpdate = true;
+        }
+      }
       if (!full) {
         m.material = m.name.includes('Joints') ? mat.suit : mat.coat;
         if (OUTLINES && (m as THREE.SkinnedMesh).isSkinnedMesh) { const o = new THREE.SkinnedMesh(m.geometry, outlineSkin); o.position.copy(m.position); o.quaternion.copy(m.quaternion); o.scale.copy(m.scale); o.bind(m.skeleton, m.bindMatrix); o.frustumCulled = false; o.castShadow = false; m.parent!.add(o); }
       }
     }
     if (!full) byName.Head.scale.setScalar(0.001);
+    // acessórios de arma do modelo baixado (ex.: o leque da Agris) somem: os ossos de arma colapsam e levam os vértices junto
+    if (full) model.traverse(o => { if ((o as THREE.Bone).isBone && /weapon/i.test(o.name)) o.scale.setScalar(0.0001); });
 
     // nós do esqueleto em pré-ordem (pais antes dos filhos)
     const MAP: Record<string, [JointName, Region]> = {
@@ -789,23 +813,51 @@ export function createHero(scene: THREE.Scene): HeroRig {
     body.updateWorldMatrix(true, true);
     const bodyQ = body.getWorldQuaternion(new THREE.Quaternion()), bodyQI = bodyQ.clone().invert();
     const wq = (o: THREE.Object3D) => bodyQI.clone().multiply(o.getWorldQuaternion(new THREE.Quaternion()));
-    const DOWN = new THREE.Vector3(0, -1, 0);
-    const nodes: XNode[] = [], idxOf = new Map<THREE.Object3D, number>(), oacc: THREE.Quaternion[] = [];
-    let rootParentQ = new THREE.Quaternion();
-    model.traverse(o => {
-      if (!(o as THREE.Bone).isBone) return;
-      const bone = o as THREE.Bone, key = boneKey(bone.name), pIdx = idxOf.has(bone.parent!) ? idxOf.get(bone.parent!)! : -1;
-      if (pIdx < 0 && nodes.length === 0) rootParentQ = wq(bone.parent!);
-      let O = new THREE.Quaternion();
-      if (key === `${sideL}Arm` || key === `${sideR}Arm`) {
-        const fore = byName[key.replace('Arm', 'ForeArm')];
-        const dir = local(key.replace('Arm', 'ForeArm')).sub(local(key)).normalize();
-        if (fore) O = new THREE.Quaternion().setFromUnitVectors(dir, DOWN);
+    const DOWN = new THREE.Vector3(0, -1, 0), UPV = new THREE.Vector3(0, 1, 0);
+    // endireitar: cada osso principal é girado (sozinho, não acumulado) para apontar na direção da pose neutra,
+    // então um esqueleto em pose de ação/T/A vira a mesma pose reta que o rig procedural espera.
+    const toward = (from: string, to: string, target: THREE.Vector3) => {
+      if (!byName[from] || !byName[to]) return null;
+      const d = local(to).sub(local(from)); if (d.lengthSq() < 1e-8) return null;
+      return new THREE.Quaternion().setFromUnitVectors(d.normalize(), target);
+    };
+    const yawFix = (foot: string, toe: string) => {
+      if (!byName[foot] || !byName[toe]) return null;
+      const d = local(toe).sub(local(foot)); if (Math.hypot(d.x, d.z) < 1e-5) return null;
+      return new THREE.Quaternion().setFromAxisAngle(UPV, -Math.atan2(d.x, d.z));
+    };
+    const straighten = (key: string): THREE.Quaternion | null => {
+      switch (key) {
+        case 'Hips': return toward('Hips', 'Spine', UPV);
+        case 'Spine': return toward('Spine', 'Spine1', UPV) ?? toward('Spine', 'Spine2', UPV);
+        case 'Spine1': return toward('Spine1', 'Spine2', UPV);
+        case 'Spine2': return toward('Spine2', 'Neck', UPV);
+        case 'Neck': return toward('Neck', 'Head', UPV);
+        case 'LeftShoulder': return toward('LeftShoulder', 'LeftArm', new THREE.Vector3(Math.sign(local('LeftArm').x) || 1, 0, 0));
+        case 'RightShoulder': return toward('RightShoulder', 'RightArm', new THREE.Vector3(Math.sign(local('RightArm').x) || -1, 0, 0));
+        case 'LeftArm': return toward('LeftArm', 'LeftForeArm', DOWN);
+        case 'LeftForeArm': return toward('LeftForeArm', 'LeftHand', DOWN);
+        case 'RightArm': return toward('RightArm', 'RightForeArm', DOWN);
+        case 'RightForeArm': return toward('RightForeArm', 'RightHand', DOWN);
+        case 'LeftUpLeg': return toward('LeftUpLeg', 'LeftLeg', DOWN);
+        case 'LeftLeg': return toward('LeftLeg', 'LeftFoot', DOWN);
+        case 'RightUpLeg': return toward('RightUpLeg', 'RightLeg', DOWN);
+        case 'RightLeg': return toward('RightLeg', 'RightFoot', DOWN);
+        case 'LeftFoot': return yawFix('LeftFoot', 'LeftToeBase');
+        case 'RightFoot': return yawFix('RightFoot', 'RightToeBase');
+        default: return null;
       }
-      const acc = (pIdx >= 0 ? oacc[pIdx].clone() : new THREE.Quaternion()).multiply(O);
+    };
+    const nodes: XNode[] = [], idxOf = new Map<THREE.Object3D, number>(), oacc: THREE.Quaternion[] = [];
+    model.traverse(o => {
+      // todos os nós da hierarquia (ossos e grupos intermediários) entram na cadeia; malhas ficam de fora
+      if (o === model || (o as THREE.Mesh).isMesh) return;
+      const bone = o, key = (o as THREE.Bone).isBone ? boneKey(bone.name) : '', pIdx = idxOf.has(bone.parent!) ? idxOf.get(bone.parent!)! : -1;
+      const own = straighten(key);
+      const acc = own ?? (pIdx >= 0 ? oacc[pIdx].clone() : new THREE.Quaternion());
       const m = MAP[key];
       idxOf.set(bone, nodes.length); oacc.push(acc);
-      nodes.push({ bone, parentIdx: pIdx, joint: m ? m[0] : null, region: m ? m[1] : 'none', rest: acc.clone().multiply(wq(bone)), clip: new THREE.Quaternion(), Rc: new THREE.Quaternion(), D: new THREE.Quaternion() });
+      nodes.push({ bone, rootQ: pIdx < 0 ? wq(bone.parent!) : null, parentIdx: pIdx, joint: m ? m[0] : null, region: m ? m[1] : 'none', rest: acc.clone().multiply(wq(bone)), clip: new THREE.Quaternion(), Rc: new THREE.Quaternion(), D: new THREE.Quaternion() });
     });
     const hipsIdx = idxOf.get(byName.Hips)!;
 
@@ -863,7 +915,17 @@ export function createHero(scene: THREE.Scene): HeroRig {
     if (!full) for (const [side, prefix, sign] of [[0, 'RightHand', 1], [1, 'LeftHand', -1]] as const)
       for (const f of ['Index', 'Middle', 'Ring', 'Pinky']) fingers.push({ side, sign, bones: [1, 2, 3].map(i => byName[`${prefix}${f}${i}`]).filter(Boolean) });
 
-    xb = { model, nodes, rootParentQ, full, mixer, idle, walk, run, sockets, hipsIdx, hipsBind: byName.Hips.position.clone(), hipsClipY: byName.Hips.position.y, walkOff, runOff, fingers, chestSocket: chestS, shoulderL: byName[`${sideL}Arm`], w: { legs: 0, torso: 0, armL: 0, walk: 0, run: 0 } };
+    xb = { model, nodes, full, mixer, idle, walk, run, sockets, hipsIdx, hipsBind: byName.Hips.position.clone(), hipsClipY: byName.Hips.position.y, walkOff, runOff, fingers, chestSocket: chestS, shoulderL: byName[`${sideL}Arm`], w: { legs: 0, torso: 0, armL: 0, walk: 0, run: 0 } };
+    // apoia a sola no chão medindo a pose reta (juntas zeradas)
+    {
+      const saved = JOINTS.map(n => J[n].node.rotation.clone()), w0 = { ...xb.w };
+      for (const n of JOINTS) J[n].node.rotation.set(0, 0, 0);
+      (Object.keys(xb.w) as (keyof typeof xb.w)[]).forEach(n => { xb!.w[n] = 0; });
+      holder.position.y = 0; xbApply(); body.updateWorldMatrix(true, true);
+      const low = Math.min(local('LeftToeBase').y, local('RightToeBase').y, local('LeftFoot').y - 0.07 * k);
+      holder.position.y = -low + 0.01; holder.updateMatrixWorld(true);
+      JOINTS.forEach((n, i) => J[n].node.rotation.copy(saved[i])); Object.assign(xb.w, w0);
+    }
   };
 
   return {
@@ -1269,6 +1331,13 @@ export function createHero(scene: THREE.Scene): HeroRig {
         }
       }
 
+      /* ---- cajado vivo: pêndulo ao andar, inércia nas acelerações, leve balanço parado */
+      if (staffEquipped && !overlay && (pose === 'idle' || pose === 'walk' || pose === 'run' || pose === 'land')) {
+        const moving = pose === 'walk' || pose === 'run', sw = sin(phase * TAU), amp = pose === 'run' ? 0.1 : 0.07;
+        P.staffP.t += clamp(-aL.z * 0.0035, -0.14, 0.14) + (moving ? sw * amp : sin(time * 0.9) * 0.012);
+        P.staffR.t += clamp(aL.x * 0.0035, -0.12, 0.12) + (moving ? cos(phase * TAU) * 0.03 : sin(time * 0.7 + 1) * 0.01);
+      }
+
       /* ---- camadas globais sobre qualquer pose */
       if (pose !== 'dodge' && pose !== 'defeat') {
         P.pitch.t += A_LEAN;
@@ -1392,6 +1461,23 @@ export function createHero(scene: THREE.Scene): HeroRig {
         staff.quaternion.copy(qParent).invert().multiply(qDesired);
       }
 
+      /* ---- cajado como bastão: a ponta de baixo toca o chão parada e levanta a cada passo */
+      if (staff.parent === staffMount) {
+        let shift = 0;
+        if (staffEquipped && !overlay && swapT < 0 && (pose === 'idle' || pose === 'walk' || pose === 'land')) {
+          staff.position.set(0, 0, 0); staff.updateWorldMatrix(true, false);
+          const butt = staff.localToWorld(sv1.set(0, -1.0, 0));
+          const lift = pose === 'walk' ? max(0, sin(phase * TAU + 0.6)) * 0.14 : 0;
+          shift = clamp(terrainHeight(butt.x, butt.z) + 0.03 + lift - butt.y, -0.4, 0.4);
+        }
+        staffPlant += (shift - staffPlant) * (1 - Math.exp(-dt * (shift !== 0 ? 14 : 7)));
+        if (abs(staffPlant) > 1e-4) {
+          staffMount.updateWorldMatrix(true, false); staffMount.getWorldPosition(sv1);
+          const a = staffMount.worldToLocal(sv2.copy(sv1)), b = staffMount.worldToLocal(sv3.copy(sv1).setY(sv1.y + staffPlant));
+          staff.position.copy(b).sub(a);
+        } else staff.position.set(0, 0, 0);
+      }
+
       /* ---- IK da mão esquerda segurando o cajado */
       const g = staffEquipped ? clamp(P.gripL.v, 0, 1) : 0;
       if (g > 0.01) {
@@ -1452,6 +1538,11 @@ export function createHero(scene: THREE.Scene): HeroRig {
       /* ---- brilho do foco, halos de magia, luz */
       const magic = clamp(P.magic.v, 0, 1.2);
       focus.scale.setScalar(0.93 + sin(time * 1.8) * 0.08 + magic * 0.35);
+      orbiters.forEach((o, i) => {
+        const a = time * (1.6 + i * 0.5) + i * 2.1, r = 0.12 + 0.02 * sin(time * 2 + i) + magic * 0.05;
+        o.position.set(0.128 + cos(a) * r, 1.8 + sin(a * 1.3 + i) * 0.05, 0.02 + sin(a) * r); o.scale.setScalar(1 + magic * 1.4 + sin(time * 5 + i) * 0.25);
+      });
+      idleRing.rotation.set(time * 0.8, time * 0.5, 0); idleRingMat.opacity = 0.22 + magic * 0.4;
       mat.glow.emissiveIntensity = 1.2 + magic * 1.6 + sin(time * 5) * 0.1 * magic;
       aura.intensity = 0.85 + magic * 1.6;
       const showHalo = magic > 0.12;

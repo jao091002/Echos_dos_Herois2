@@ -444,3 +444,61 @@
 .game-shell.free-cursor .scene canvas { cursor: none }
 .game-shell.free-cursor .aim-reticle { transition: width .14s, height .14s, border-color .14s, box-shadow .14s }
 .game-shell.free-cursor .aim-reticle::after { content: ''; position: absolute; left: 50%; top: 50%; width: 46px; height: 46px; margin: -23px; border-radius: 50%; border: 1px dashed rgba(238, 225, 190, .28); animation: sigil-spin 9s linear infinite }
+
+/* ======================= árvore de habilidades ======================= */
+.tree-modal { width: min(1180px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); padding: 24px 28px 22px }
+.tree-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px }
+.tree-head h2 { margin: 6px 0 0 }
+.tree-points { display: grid; justify-items: end; gap: 2px; padding: 8px 14px; border: 1px solid var(--line-strong); background: rgba(220, 200, 147, .08) }
+.tree-points span { font: 600 8px var(--sans); letter-spacing: .3em; color: var(--gold) }
+.tree-points strong { font: 600 24px var(--serif); color: var(--gold-bright); line-height: 1 }
+.tree-legend { display: flex; flex-wrap: wrap; gap: 6px 20px; margin: 12px 0 4px }
+.tree-legend span { display: flex; align-items: baseline; gap: 7px; font: 600 11px var(--serif); letter-spacing: .1em; color: var(--c) }
+.tree-legend i { width: 9px; height: 9px; align-self: center; transform: rotate(45deg); background: var(--c); box-shadow: 0 0 8px var(--c) }
+.tree-legend small { font: italic 400 13px var(--story); letter-spacing: 0; color: var(--muted) }
+.tree-body { display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 16px; align-items: stretch; margin-top: 6px }
+.tree-svg { width: 100%; height: auto; max-height: 58vh; justify-self: center; border: 1px solid var(--line); background: radial-gradient(ellipse at center, rgba(40, 30, 64, .35), rgba(8, 12, 10, .6)); user-select: none }
+.tl { stroke: var(--c); stroke-opacity: .16; stroke-width: 2.5; stroke-linecap: round }
+.tl.lit { stroke-opacity: .55; stroke-dasharray: 3 7; animation: tl-flow 1.2s linear infinite; filter: drop-shadow(0 0 4px var(--c)) }
+.tl.owned { stroke-opacity: .95; stroke-width: 3.2; filter: drop-shadow(0 0 7px var(--c)) }
+@keyframes tl-flow { to { stroke-dashoffset: -20 } }
+.tn { cursor: pointer; outline: none }
+.tn-hex { fill: #121816; stroke: var(--c); stroke-width: 2; stroke-opacity: .35; transition: stroke-opacity .2s, filter .2s }
+.tn-inner { fill: color-mix(in srgb, var(--c) 8%, #0d1210); transition: fill .2s }
+.tn-glyph { font: 600 21px var(--serif); fill: var(--c); fill-opacity: .4; pointer-events: none }
+.tn-rank { font: 600 10px var(--sans); fill: #c5c0ae; fill-opacity: .55; letter-spacing: .06em; pointer-events: none }
+.tn-halo { fill: none; stroke: var(--c); stroke-width: 1; stroke-opacity: .35; stroke-dasharray: 3 4; animation: sigil-spin 40s linear infinite; transform-box: fill-box; transform-origin: center }
+.tn.avail .tn-hex { stroke-opacity: .9; animation: node-pulse 1.8s ease-in-out infinite }
+.tn.avail .tn-glyph { fill-opacity: .8 }
+.tn.owned .tn-hex, .tn.maxed .tn-hex { stroke-opacity: 1; stroke-width: 2.4; filter: drop-shadow(0 0 8px var(--c)) }
+.tn.owned .tn-inner, .tn.maxed .tn-inner { fill: color-mix(in srgb, var(--c) 32%, #0d1210) }
+.tn.owned .tn-glyph, .tn.maxed .tn-glyph { fill-opacity: 1; fill: #fff6e0 }
+.tn.owned .tn-rank, .tn.maxed .tn-rank { fill-opacity: 1; fill: #f4ecd2 }
+.tn.maxed .tn-hex { stroke: #f4d98a }
+.tn.locked { opacity: .55 }
+.tn:hover .tn-hex, .tn:focus-visible .tn-hex { stroke-opacity: 1; filter: drop-shadow(0 0 10px var(--c)) }
+.tn.sel .tn-hex { stroke: #fff3cf; stroke-opacity: 1; stroke-width: 3 }
+@keyframes node-pulse { 0%, 100% { filter: drop-shadow(0 0 2px var(--c)) } 50% { filter: drop-shadow(0 0 10px var(--c)) } }
+.tree-detail { display: flex; flex-direction: column; gap: 10px; padding: 14px 14px 12px; border: 1px solid var(--line); border-top: 2px solid var(--c); background: linear-gradient(160deg, rgba(20, 27, 24, .9), rgba(14, 19, 17, .9)); max-height: 58vh; overflow: auto }
+.td-top { display: flex; align-items: center; gap: 11px }
+.td-glyph { flex: 0 0 38px; height: 38px; display: grid; place-items: center; border: 1px solid var(--c); color: var(--c); font: 600 20px var(--serif); clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%); background: color-mix(in srgb, var(--c) 14%, transparent) }
+.td-top small { display: block; font: 600 8px var(--sans); letter-spacing: .22em; color: var(--c) }
+.td-top strong { font: 500 15px var(--serif); letter-spacing: .04em; color: #f4eedd }
+.tree-detail p { margin: 0; font: italic 400 15px/1.4 var(--story); color: #d6d3c6 }
+.td-effect { padding: 8px 10px; border-left: 2px solid var(--c); background: rgba(255, 255, 255, .03) }
+.td-effect small { display: block; margin-bottom: 3px; font: 600 8px var(--sans); letter-spacing: .22em; color: var(--muted) }
+.td-effect span { font: 500 12px var(--sans); color: #efe9d6 }
+.td-reqs { margin: 0; padding: 0; list-style: none; display: grid; gap: 3px; font: 500 11px var(--sans); color: var(--muted) }
+.td-reqs li.ok { color: #b8e0b0 }
+.td-totals { display: grid; gap: 4px; margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--line) }
+.td-totals small { margin-bottom: 2px; font: 600 8px var(--sans); letter-spacing: .22em; color: var(--gold) }
+.td-totals div { display: flex; justify-content: space-between; font: 500 11px var(--sans); color: var(--ink-soft) }
+.td-totals b { font: 600 11px var(--sans); color: var(--gold-bright) }
+.tree-detail .text-btn { align-self: flex-start; margin-top: 4px }
+.tree-modal .continue { margin-top: 14px }
+@media (max-width: 860px) {
+  .tree-body { grid-template-columns: 1fr }
+  .tree-svg { max-height: 48vh }
+  .tree-detail { max-height: none }
+  .tree-modal { padding: 20px 16px }
+}

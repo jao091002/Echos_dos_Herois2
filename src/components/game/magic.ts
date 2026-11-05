@@ -397,7 +397,7 @@ class Particles {
  * ------------------------------------------------------------------ */
 /** Shared spell registry, resource economy, projectile simulation, defensive collision and all spell VFX. */
 export class MagicSystem {
-  mana = 1000; readonly maxMana = 1000; flying = false; shieldActive = false; shieldTime = 0; blocks = 0;
+  mana = 1000; /** Mana máxima: base + talentos de Intelecto. */ get maxMana() { return 1000 + this.progression.stats.manaMax; } flying = false; shieldActive = false; shieldTime = 0; blocks = 0;
   /** 0..1 camera-shake request raised by big impacts (already attenuated by distance to the player). Decays on its own; read it from your camera rig. */
   shake = 0;
 
@@ -465,7 +465,7 @@ export class MagicSystem {
     const cost = this.progression.manaCost(COST.shield);
     if (this.shieldActive || this.cooldowns.shield > 0 || this.mana < cost) return false;
     this.mana -= cost;
-    this.shieldHpMax = 100 * this.progression.sizeMultiplier(); this.shieldHp = this.shieldHpMax;
+    this.shieldHpMax = 100 * this.progression.stats.shieldHp; this.shieldHp = this.shieldHpMax;
     this.shieldActive = true; this.shieldTime = 99; this.shieldAge = 0; this.shieldRoot.visible = true; this.shieldFlash = .45; this.shieldCastFx();
     return true;
   }
@@ -473,7 +473,7 @@ export class MagicSystem {
   releaseShield() { if (this.shieldActive) this.endShield(false); }
   private endShield(broke: boolean) {
     this.shieldActive = false; this.shieldBreakFx(broke); this.onSfx(broke ? 'shieldBreak' : 'shieldDown');
-    this.cooldowns.shield = this.cooldownMax.shield = broke ? 9 : 1.5;
+    this.cooldowns.shield = this.cooldownMax.shield = (broke ? 9 : 1.5) * this.progression.stats.shieldCd;
   }
   /** Ponta do cajado (para efeitos que acompanham a pose em tempo real, como o Judradjim). */
   setStaffTip(o: THREE.Object3D) { this.staffTip = o; }
@@ -556,7 +556,10 @@ export class MagicSystem {
     const center = this.shieldRoot.getWorldPosition(new THREE.Vector3());
     const segment = new THREE.Line3(from, to), closest = segment.closestPointToPoint(center, true, new THREE.Vector3());
     if (closest.distanceTo(center) > half * 1.05) return false;
-    this.onSfx('shieldBlock'); this.shieldHp = Math.max(0, this.shieldHp - 22); this.shieldFlash = .5; this.blocks++;
+    this.onSfx('shieldBlock'); const st = this.progression.stats;
+    this.shieldHp = Math.max(0, this.shieldHp - 22 * st.blockCost); this.shieldFlash = .5; this.blocks++;
+    if (st.blockMana) this.mana = Math.min(this.maxMana, this.mana + st.blockMana); // Bastião: bloquear devolve energia
+    if (st.blockHeal) this.combat.heal(st.blockHeal);
     // ponto de impacto em coordenadas da muralha -> anel que percorre os favos
     const local = this.shieldRoot.worldToLocal(closest.clone());
     this.shieldHitUv.value.set(local.x / (MagicSystem.WALL * .5), local.y / (MagicSystem.WALL * .5)); this.shieldHitT.value = 0;
@@ -570,10 +573,10 @@ export class MagicSystem {
   }
 
   update(delta: number, elapsed: number) {
-    this.mana = Math.min(this.maxMana, this.mana + delta * (this.flying ? 1.2 : 4.2));
+    this.mana = Math.min(this.maxMana, this.mana + delta * (this.flying ? 1.2 : 4.2) * this.progression.stats.manaRegen);
     for (const id of Object.keys(this.cooldowns) as SpellId[]) this.cooldowns[id] = Math.max(0, this.cooldowns[id] - delta);
-    if (this.flying) { this.mana -= delta * 8; if (this.mana <= 0) { this.mana = 0; this.flying = false; this.flightBurst(false); } }
-    if (this.shieldActive) { this.mana = Math.max(0, this.mana - delta * MagicSystem.SHIELD_DRAIN); this.shieldTime = this.shieldHp / this.shieldHpMax < .25 ? 1 : 99; }
+    if (this.flying) { this.mana -= delta * 8 * this.progression.stats.flyDrain; if (this.mana <= 0) { this.mana = 0; this.flying = false; this.flightBurst(false); } }
+    if (this.shieldActive) { this.mana = Math.max(0, this.mana - delta * MagicSystem.SHIELD_DRAIN * this.progression.stats.shieldDrain); this.shieldTime = this.shieldHp / this.shieldHpMax < .25 ? 1 : 99; }
     if (this.shieldActive && (this.shieldHp <= 0 || this.mana <= 0)) this.endShield(true);
     const dt = Math.min(delta, .05);
     this.updateShield(delta, elapsed);
@@ -636,7 +639,7 @@ export class MagicSystem {
   private updateCharge(dt: number, elapsed: number) {
     const c = this.charge; if (!c) return;
     c.t += dt;
-    const raw = clamp01((c.t - .1) / CHARGE_TIME), size = this.progression.sizeMultiplier();
+    const raw = clamp01((c.t * this.progression.stats.chargeSpeed - .1) / CHARGE_TIME), size = this.progression.sizeMultiplier();
     c.level = 1 - (1 - raw) * (1 - raw);
     const pos = this.tA.copy(this.aimO).addScaledVector(this.aimD, .22);
     c.group.position.copy(pos); c.group.quaternion.setFromUnitVectors(FWD, this.aimD);

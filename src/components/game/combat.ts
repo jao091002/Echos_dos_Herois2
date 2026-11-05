@@ -1,4 +1,7 @@
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
+import { registerSpecGloss, retargetModel, type Retarget } from './rig-retarget';
 import { terrainHeight } from './world';
 import type { SfxName } from './audio';
 import type { LootItemId } from './progression';
@@ -134,7 +137,7 @@ type Chain = {
 type Rig = {
   pelvis: THREE.Group; chest: THREE.Group; neck: THREE.Group | null; head: THREE.Group; jaw: THREE.Group | null;
   legs: Leg[]; arms: Arm[]; ears: { group: THREE.Group; side: number }[];
-  tail: Chain | null; braids: Chain[]; cloth: Chain[]; breath: THREE.Mesh | null; target: THREE.Mesh;
+  tail: Chain | null; braids: Chain[]; cloth: Chain[]; breath: THREE.Mesh | null; target: THREE.Mesh; modelMesh?: THREE.Mesh; retarget?: Retarget;
 };
 type MatEntry = { m: THREE.MeshStandardMaterial; base: number };
 type ArcFx = { pivot: THREE.Group; ring: THREE.Mesh; material: THREE.MeshBasicMaterial; axis: 'x' | 'y'; from: number; to: number };
@@ -260,6 +263,10 @@ export class CombatSystem {
   readonly targets: THREE.Object3D[] = [];
   readonly playerHealth = 100;
   health = 100;
+  /** Vida máxima e resistência (talentos); o jogo atualiza a cada quadro. */
+  maxHealth = 100;
+  resist = 0;
+  heal(amount: number) { if (this.health > 0) this.health = Math.min(this.maxHealth, this.health + amount); }
   blocked = 0;
   private mobs: Mob[] = [];
   private drops: Drop[] = [];
@@ -323,11 +330,176 @@ export class CombatSystem {
     }
 
     for (let index = 0; index < SPAWNS.length; index++) this.mobs.push(this.createMob(SPAWNS[index], index));
+    // lobo modelado (wolf.glb): chega depois de pronto; até lá (ou se falhar) vale o lobo procedural
+    new GLTFLoader().load('/models/wolf.glb', gltf => { if (!this.disposed) this.onWolfModel(gltf.scene); }, undefined, () => { /* mantém o procedural */ });
+    // demônio modelado (aura.glb): malha de ~1 milhão de vértices, reduzida ao carregar
+    new GLTFLoader().load('/models/aura.glb', gltf => { if (!this.disposed) this.onDemonModel(gltf.scene); }, undefined, () => { /* mantém o procedural */ });
+    // bandido modelado (perso.glb): cada bandido recebe sua própria cópia do modelo
+    const bandits = new GLTFLoader(); registerSpecGloss(bandits);
+    bandits.load('/models/perso.glb', gltf => { if (this.disposed) return; this.banditTemplate = gltf.scene; for (const mob of this.mobs) if (mob.kind === 'bandit') this.attachBanditModel(mob); }, undefined, () => { /* mantém o procedural */ });
+  }
+
+  private disposed = false;
+  private demonGeo: THREE.BufferGeometry | null = null;
+  private demonTex: THREE.Material | null = null;
+  /** Altura final do demônio (m) e giro do modelo (frente = +Z). */
+  private static readonly DEMON_HEIGHT = 2.3;
+  private static readonly DEMON_YAW = -Math.PI / 2;
+
+  /** Reduz a malha: vértices na mesma célula 3D (e na mesma célula de UV, para não borrar as costuras da textura) viram um só. */
+  private static decimate(geo: THREE.BufferGeometry, cell: number, uvCell: number) {
+    const pos = geo.attributes.position as THREE.BufferAttribute, nor = geo.attributes.normal as THREE.BufferAttribute, uv = geo.attributes.uv as THREE.BufferAttribute, idx = geo.index!;
+    const n = pos.count, remap = new Uint32Array(n), map = new Map<number, number>();
+    const sp = new Float32Array(n * 3), sn = new Float32Array(n * 3), su = new Float32Array(n * 2), cnt = new Uint32Array(n);
+    let m = 0;
+    for (let i = 0; i < n; i++) {
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i), u = uv.getX(i), v = uv.getY(i);
+      const key = ((((Math.round(x / cell) + 512) * 1024 + (Math.round(y / cell) + 512)) * 1024 + (Math.round(z / cell) + 512)) * 1024 + Math.min(1023, Math.round(u / uvCell))) * 1024 + Math.min(1023, Math.round(v / uvCell));
+      let id = map.get(key);
+      if (id === undefined) { id = m++; map.set(key, id); }
+      remap[i] = id; cnt[id]++;
+      sp[id * 3] += x; sp[id * 3 + 1] += y; sp[id * 3 + 2] += z;
+      sn[id * 3] += nor.getX(i); sn[id * 3 + 1] += nor.getY(i); sn[id * 3 + 2] += nor.getZ(i);
+      su[id * 2] += u; su[id * 2 + 1] += v;
+    }
+    const P = new Float32Array(m * 3), N = new Float32Array(m * 3), U = new Float32Array(m * 2);
+    for (let i = 0; i < m; i++) {
+      const c = cnt[i]; P[i * 3] = sp[i * 3] / c; P[i * 3 + 1] = sp[i * 3 + 1] / c; P[i * 3 + 2] = sp[i * 3 + 2] / c;
+      const l = Math.hypot(sn[i * 3], sn[i * 3 + 1], sn[i * 3 + 2]) || 1; N[i * 3] = sn[i * 3] / l; N[i * 3 + 1] = sn[i * 3 + 1] / l; N[i * 3 + 2] = sn[i * 3 + 2] / l;
+      U[i * 2] = su[i * 2] / c; U[i * 2 + 1] = su[i * 2 + 1] / c;
+    }
+    const tris: number[] = [];
+    for (let t = 0; t < idx.count; t += 3) {
+      const a = remap[idx.getX(t)], b = remap[idx.getX(t + 1)], c = remap[idx.getX(t + 2)];
+      if (a !== b && b !== c && a !== c) tris.push(a, b, c);
+    }
+    const out = new THREE.BufferGeometry();
+    out.setAttribute('position', new THREE.BufferAttribute(P, 3)); out.setAttribute('normal', new THREE.BufferAttribute(N, 3)); out.setAttribute('uv', new THREE.BufferAttribute(U, 2));
+    out.setIndex(new THREE.BufferAttribute(m > 65535 ? new Uint32Array(tris) : new Uint16Array(tris), 1));
+    return out;
+  }
+
+  private onDemonModel(scene: THREE.Object3D) {
+    scene.updateMatrixWorld(true);
+    let src: THREE.Mesh | null = null; scene.traverse(o => { if (!src && (o as THREE.Mesh).isMesh) src = o as THREE.Mesh; });
+    if (!src) return;
+    const mesh = src as THREE.Mesh, baked = mesh.geometry.clone().applyMatrix4(mesh.matrixWorld);
+    baked.computeBoundingBox();
+    const h = baked.boundingBox!.max.y - baked.boundingBox!.min.y, k = CombatSystem.DEMON_HEIGHT / h;
+    // tamanho final e pés no chão, antes de reduzir (a célula é relativa à altura)
+    baked.rotateY(CombatSystem.DEMON_YAW); baked.scale(k, k, k); baked.computeBoundingBox();
+    const bb = baked.boundingBox!; baked.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2);
+    const geo = CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.0045, 1 / 900);
+    baked.dispose(); geo.computeBoundingBox(); geo.computeBoundingSphere();
+    this.demonGeo = geo; this.geometries.push(geo); this.demonTex = mesh.material as THREE.Material;
+    for (const mob of this.mobs) if (mob.kind === 'demon') this.attachDemonModel(mob);
+  }
+
+  private attachDemonModel(mob: Mob) {
+    if (!this.demonGeo || !this.demonTex || mob.rig.modelMesh) return;
+    const rig = mob.rig, mt = (this.demonTex as THREE.MeshStandardMaterial).clone();
+    mt.metalness = Math.min(mt.metalness, 0.3); mt.roughness = Math.max(mt.roughness, 0.7); mt.emissive = new THREE.Color('#ff5a3a'); mt.emissiveIntensity = 0; mt.needsUpdate = true;
+    this.materials.push(mt);
+    const model = new THREE.Mesh(this.demonGeo, mt); model.castShadow = true; model.receiveShadow = true; model.name = 'demon-model'; model.frustumCulled = false;
+    model.position.set(0, -PELVIS_Y, 0); // pés no chão local (a pelve fica a PELVIS_Y)
+    rig.pelvis.add(model); rig.modelMesh = model;
+    rig.pelvis.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh && m !== model && m !== rig.target) m.visible = false; });
+    mob.mats.push({ m: mt, base: 0 });
+    mob.eyes = mob.eyes.filter(e => { e.m.emissiveIntensity = 0; return false; });
+  }
+  private banditTemplate: THREE.Object3D | null = null;
+
+  private attachBanditModel(mob: Mob) {
+    const tpl = this.banditTemplate, rig = mob.rig;
+    if (!tpl || rig.retarget) return;
+    const model = cloneSkinned(tpl);
+    // materiais próprios (brilho de dano por inimigo); transparência vira recorte opaco; metal suavizado; roupas um pouco mais escuras
+    const mats: MatEntry[] = [];
+    model.traverse(o => {
+      const m = o as THREE.Mesh; if (!m.isMesh) return;
+      m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false;
+      const cloned = (Array.isArray(m.material) ? m.material : [m.material]).map(src => {
+        const mt = (src as THREE.MeshStandardMaterial).clone();
+        if (mt.transparent) { mt.transparent = false; mt.alphaTest = .5; mt.opacity = 1; }
+        mt.depthWrite = true; mt.metalness = Math.min(mt.metalness, .12); mt.roughness = Math.max(mt.roughness, .6);
+        mt.color.multiplyScalar(.82); mt.emissive = new THREE.Color('#ff5a3a'); mt.emissiveIntensity = 0; mt.needsUpdate = true;
+        this.materials.push(mt); mats.push({ m: mt, base: 0 });
+        return mt;
+      });
+      m.material = cloned.length === 1 ? cloned[0] : cloned;
+    });
+    const L = rig.legs, A = rig.arms, left = A.find(a => a.side < 0)!, right = A.find(a => a.side > 0)!, legL = L.find(l => l.side < 0)!, legR = L.find(l => l.side > 0)!;
+    const retarget = retargetModel(mob.root, model, {
+      pelvis: rig.pelvis, chest: rig.chest, head: rig.head,
+      armL: left.shoulder, elbowL: left.elbow, wristL: left.wrist, armR: right.shoulder, elbowR: right.elbow, wristR: right.wrist,
+      hipL: legL.hip, kneeL: legL.knee, ankleL: legL.ankle, hipR: legR.hip, kneeR: legR.knee, ankleR: legR.ankle,
+    }, legL.l1 + legL.l2);
+    if (!retarget) return;
+    rig.retarget = retarget;
+    // esconde o corpo procedural; ficam a área de acerto e a arma (cabo e lâmina) da mão direita
+    const keep = new Set<THREE.Object3D>([rig.target]);
+    right.wrist.children.forEach(c => { if (Math.abs(c.position.y + .05) > 1e-3 || Math.abs(c.position.z - .02) > 1e-3) keep.add(c); }); // a esfera de pele do punho antigo some
+    rig.pelvis.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh && !keep.has(m)) m.visible = false; });
+    mob.mats.push(...mats);
+    mob.eyes = mob.eyes.filter(e => { e.m.emissiveIntensity = 0; return false; });
+    retarget.update();
+  }
+  private wolfGeo: THREE.BufferGeometry | null = null;
+  /** Escala e orientação do modelo (frente do modelo = +Z). */
+  private static readonly WOLF_SCALE = 1.1;
+  private static readonly WOLF_YAW = 0;
+  private static readonly WOLF_TINTS = ['#ffffff', '#f3eadb', '#dcc9aa', '#b9bec8', '#9c9184'];
+
+  /** Gera a geometria única (no espaço Y-para-cima, pés no chão local) com cor de pelagem por vértice. */
+  private onWolfModel(scene: THREE.Object3D) {
+    scene.updateMatrixWorld(true);
+    let src: THREE.Mesh | null = null; scene.traverse(o => { if (!src && (o as THREE.Mesh).isMesh) src = o as THREE.Mesh; });
+    if (!src) return;
+    const mesh = src as THREE.Mesh, geo = mesh.geometry.clone().applyMatrix4(mesh.matrixWorld);
+    geo.rotateY(CombatSystem.WOLF_YAW); geo.scale(CombatSystem.WOLF_SCALE, CombatSystem.WOLF_SCALE, CombatSystem.WOLF_SCALE);
+    geo.computeBoundingBox(); const bb = geo.boundingBox!;
+    geo.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2); // pés em y=0, centrado
+    geo.computeVertexNormals(); geo.computeBoundingBox(); geo.computeBoundingSphere();
+    const pos = geo.attributes.position as THREE.BufferAttribute, nor = geo.attributes.normal as THREE.BufferAttribute, col = new Float32Array(pos.count * 3);
+    const H = geo.boundingBox!.max.y, Lz = geo.boundingBox!.max.z - geo.boundingBox!.min.z, z0 = geo.boundingBox!.min.z;
+    const C = { mid: new THREE.Color('#a39684'), back: new THREE.Color('#5e544a'), belly: new THREE.Color('#e2d8c5'), socks: new THREE.Color('#3b342d'), muzzle: new THREE.Color('#d3c7b1'), tipDark: new THREE.Color('#3a342e') }, c = new THREE.Color();
+    const hash = (x: number, y: number, z: number) => { const v = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453; return v - Math.floor(v); };
+    const sm = (x: number, a: number, b: number) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i), ny = nor.getY(i), h = y / H, along = (z - z0) / Lz;
+      c.copy(C.mid);
+      c.lerp(C.back, sm(ny, 0.05, 0.75) * 0.9);                         // costas e cabeça: pelo escuro
+      c.lerp(C.belly, sm(-ny, 0.15, 0.7) * sm(0.55 - h, 0, 0.35));      // barriga e peito: claro
+      c.lerp(C.socks, sm(0.3 - h, 0, 0.25) * 0.85);                     // patas: "meias" escuras
+      c.lerp(C.muzzle, sm(along, 0.82, 0.97) * sm(0.78 - h, 0, 0.3) * 0.7); // focinho mais claro
+      c.lerp(C.tipDark, sm(h, 0.8, 1.0) * 0.4);                         // pontas altas (orelhas/crista) mais escuras
+      // manchas largas + fios finos de pelo
+      const patch = hash(Math.floor(x * 5), Math.floor(y * 5), Math.floor(z * 5)) - 0.5, strand = hash(Math.floor(x * 28), Math.floor(y * 28), Math.floor(z * 28)) - 0.5;
+      c.multiplyScalar(1 + patch * 0.22 + strand * 0.2);
+      col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    this.wolfGeo = geo; this.geometries.push(geo);
+    for (const mob of this.mobs) if (mob.kind === 'wolf') this.attachWolfModel(mob);
+  }
+
+  private attachWolfModel(mob: Mob) {
+    if (!this.wolfGeo || mob.rig.modelMesh) return;
+    const rig = mob.rig, tint = new THREE.Color(CombatSystem.WOLF_TINTS[mob.spawn % CombatSystem.WOLF_TINTS.length]);
+    const material = new THREE.MeshStandardMaterial({ vertexColors: true, color: tint, roughness: 0.88, metalness: 0.04, emissive: new THREE.Color('#ff5a3a'), emissiveIntensity: 0 });
+    this.materials.push(material);
+    const model = new THREE.Mesh(this.wolfGeo, material); model.castShadow = true; model.receiveShadow = true; model.name = 'wolf-model';
+    model.position.set(0, -0.82, 0); // a pelve fica a 0,82 m: o modelo apoia os pés no chão local
+    rig.pelvis.add(model); rig.modelMesh = model;
+    // esconde o lobo procedural (a área de acerto e o rig seguem funcionando)
+    rig.pelvis.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh && m !== model && m !== rig.target) m.visible = false; });
+    mob.mats.push({ m: material, base: 0 });
+    mob.eyes = mob.eyes.filter(e => { e.m.emissiveIntensity = 0; return false; });
   }
 
   get alive() { return this.mobs.filter(mob => mob.health > 0).length; }
 
-  respawnPlayer() { this.health = this.playerHealth; }
+  respawnPlayer() { this.health = this.maxHealth; }
 
   damageAt(point: THREE.Vector3, radius: number, damage: number) {
     let count = 0;
@@ -417,6 +589,7 @@ export class CombatSystem {
   }
 
   dispose() {
+    this.disposed = true;
     this.root.removeFromParent(); this.dropRoot.removeFromParent(); this.fxRoot.removeFromParent();
     this.particles.mesh.dispose();
     this.geometries.forEach(geometry => geometry.dispose());
@@ -575,7 +748,7 @@ export class CombatSystem {
     this.tmpA.set(player.x, player.y + .9, player.z);
     this.tmpB.set(root.position.x, root.position.y + 1, root.position.z);
     if (block(this.tmpA, this.tmpB)) return;
-    this.health = Math.max(0, this.health - stats.damage * def.damage); this.onSfx('hurt');
+    this.health = Math.max(0, this.health - stats.damage * def.damage * (1 - this.resist)); this.onSfx('hurt');
     this.tmpA.set(player.x, player.y + 1, player.z);
     this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
@@ -724,6 +897,7 @@ export class CombatSystem {
       const { stepZ, lift, toeOff } = this.footCycle(mob, leg, amp, g);
       this.solveLeg(leg, r.pelvis.position.y, r.pelvis.position.z, r.pelvis.rotation.x, 0, .04 + stepZ, leg.footY + lift, toeOff * .4);
     }
+    r.retarget?.update();
 
     for (const chain of r.cloth) {
       if (chain.segs.length === 1 && chain.angle !== 0) this.stepChain(chain, dt, mob.vf * Math.cos(chain.angle) + mob.vs * Math.sin(chain.angle), 0, t * 2 + chain.angle, 0);

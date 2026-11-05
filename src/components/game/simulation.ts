@@ -21,6 +21,8 @@ export class PlayerMotor {
 
   /** Multiplicador de velocidade (ex.: andar devagar enquanto carrega/dispara magia). */
   speedScale = 1;
+  /** Multiplicador da velocidade vertical no voo (subir/descer). */
+  verticalScale = 1;
   constructor(private root: THREE.Group, private colliders: WorldCollider[]) {}
 
   reset() {
@@ -62,7 +64,7 @@ export class PlayerMotor {
     if (flight) {
       // voo: segue a inclinação da câmera ao avançar, acelera com inércia, freia mais rápido, sobe/desce com Espaço/Ctrl
       const forwardLift = -moveForward * Math.sin(cameraPitch) * speed * .95;
-      const vertical = verticalInput * speed * .8 + forwardLift;
+      const vertical = verticalInput * speed * .8 * this.verticalScale + forwardLift;
       this.desired.set(this.direction.x * speed, vertical, this.direction.z * speed);
       const accelerating = this.desired.lengthSq() > this.velocity.lengthSq();
       const rate = this.dodgeTimer > 0 ? 0 : accelerating ? 4.2 : moving || verticalInput ? 6.5 : 3.2; // parar = desliza e flutua

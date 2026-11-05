@@ -11,7 +11,7 @@ import { AmbientAudio } from './audio';
 import { CombatSystem } from './combat';
 import { createHero, type HeroPose } from './hero';
 import { MagicSystem, type SpellId } from './magic';
-import { PlayerProgression, UPGRADE_INFO, LOOT_INFO, MAX_RANK, type LootItemId, type ProgressionSnapshot, type UpgradeId } from './progression';
+import { PlayerProgression, LOOT_INFO, SKILL_NODES, SKILL_BY_ID, BRANCH_INFO, type LootItemId, type ProgressionSnapshot, type SkillNode } from './progression';
 import { PlayerMotor, ThirdPersonCamera } from './simulation';
 import { createWorld, setWorldQuality, terrainHeight, updateWorld, updateDayCycle, pondDist, streamDist, POND, type WorldParts } from './world';
 
@@ -19,7 +19,7 @@ type GameStatus = { area: string; discovered: number };
 type Quality = 'Baixa' | 'Média' | 'Alta';
 type Panel = 'main' | 'options' | 'controls';
 type CombatHud = {
-  mana: number; health: number; alive: number; shield: boolean; flying: boolean; blocks: number;
+  mana: number; maxMana: number; health: number; maxHealth: number; alive: number; shield: boolean; flying: boolean; blocks: number;
   cooldowns: Record<SpellId, number>; cdFrac: Record<SpellId, number>;
 };
 /** Quanto a câmera "entra na mira": cheio ao carregar/disparar o Zoltraak. */
@@ -104,8 +104,8 @@ export default function Game() {
   const [quality, setQuality] = useState<Quality>(() => typeof navigator !== 'undefined' && ((navigator.hardwareConcurrency ?? 8) <= 4 || /Mobi|Android/i.test(navigator.userAgent)) ? 'Baixa' : 'Média');
   const [sensitivity, setSensitivity] = useState(5);
   const [gameError, setGameError] = useState('');
-  const [combatHud, setCombatHud] = useState<CombatHud>({ mana: 1000, health: 100, alive: 7, shield: false, flying: false, blocks: 0, cooldowns: NO_CD, cdFrac: NO_CD });
-  const [progressionHud, setProgressionHud] = useState<ProgressionSnapshot>({ level: 1, experience: 0, nextLevelXp: 100, skillPoints: 0, ranks: { damage: 0, size: 0, efficiency: 0 }, inventory: { echoFragment: 0, sentinelCore: 0, wolfPelt: 0, banditToken: 0, demonAsh: 0, moonFang: 0, ancientSigil: 0, demonHeart: 0 } });
+  const [combatHud, setCombatHud] = useState<CombatHud>({ mana: 1000, maxMana: 1000, health: 100, maxHealth: 100, alive: 7, shield: false, flying: false, blocks: 0, cooldowns: NO_CD, cdFrac: NO_CD });
+  const [progressionHud, setProgressionHud] = useState<ProgressionSnapshot>({ level: 1, experience: 0, nextLevelXp: 100, skillPoints: 0, ranks: { root: 1 }, stats: new PlayerProgression().stats, inventory: { echoFragment: 0, sentinelCore: 0, wolfPelt: 0, banditToken: 0, demonAsh: 0, moonFang: 0, ancientSigil: 0, demonHeart: 0 } });
   uiOpenRef.current = help || questOpen || inventoryOpen || skillsOpen || paused || screen === 'title';
   titleRef.current = screen === 'title';
   qualityRef.current = quality;
@@ -214,7 +214,10 @@ export default function Game() {
     // corpo esquelético (Xbot, exemplo oficial do three.js / Mixamo); se falhar, fica o corpo procedural
     let disposed = false;
     // corpo esquelético (Xbot, exemplo oficial do three.js / Mixamo); se falhar, fica o corpo procedural
-    new GLTFLoader().load('/models/Xbot.glb', gltf => { if (!disposed) hero.attachBody(gltf); }, undefined, () => { /* mantém o corpo procedural */ });
+    // personagem principal: Agris (agris.glb); se falhar, Xbot; se falhar, corpo procedural
+    const loader = new GLTFLoader();
+    loader.load('/models/agris.glb', gltf => { if (!disposed) hero.attachBody(gltf, { full: true }); }, undefined,
+      () => loader.load('/models/Xbot.glb', gltf => { if (!disposed) hero.attachBody(gltf); }, undefined, () => { /* mantém o corpo procedural */ }));
     const motor = new PlayerMotor(hero.root, world.colliders);
     const cameraRig = new ThirdPersonCamera(camera, world);
     cameraRigRef.current = cameraRig;
@@ -478,8 +481,13 @@ export default function Game() {
       if (!uiOpenRef.current) {
         elapsed += delta;
         const wasGrounded = motor.grounded, vyBefore = motor.verticalSpeed;
+        const st = progression.stats; // atributos dos talentos
+        if (st.maxHealth > combat.maxHealth) combat.health += st.maxHealth - combat.maxHealth; // melhorar a vida máxima cura a diferença
+        combat.maxHealth = st.maxHealth; combat.health = Math.min(combat.health, combat.maxHealth); combat.resist = st.resist;
+        motor.verticalScale = st.flyVertical;
+        if (magic.flying) combat.heal(st.flyRegen * delta);
         const zoltraakActive = combat.health > 0 && (magic.charging || magic.beamActive);
-        motor.speedScale = zoltraakActive ? (magic.beamActive ? .35 : .55) : 1;
+        motor.speedScale = (zoltraakActive ? (magic.beamActive ? .35 : .55) : 1) * (magic.flying ? st.flySpeed : 1);
         const inCine = elapsed < cine.until;
         const forward = inCine ? 0 : (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0) + touchMoveRef.current.forward;
         const side = inCine ? 0 : (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0) + touchMoveRef.current.side;
@@ -548,14 +556,14 @@ export default function Game() {
           const ids: SpellId[] = ['zoltraak', 'vollzanbel', 'judradjim', 'shield', 'flight'];
           const cooldowns = {} as Record<SpellId, number>, cdFrac = {} as Record<SpellId, number>;
           for (const id of ids) { cooldowns[id] = Math.ceil(magic.cooldown(id) * 10) / 10; cdFrac[id] = Math.round(magic.cooldownFraction(id) * 40) / 40; }
-          const hud: CombatHud = { mana: Math.round(magic.mana), health: combat.health, alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, cooldowns, cdFrac };
+          const hud: CombatHud = { mana: Math.round(magic.mana), maxMana: Math.round(magic.maxMana), health: Math.round(combat.health), maxHealth: Math.round(combat.maxHealth), alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, cooldowns, cdFrac };
           const hudKey = JSON.stringify(hud);
           if (hudKey !== lastHudKey) { lastHudKey = hudKey; setCombatHud(hud); }
           const snap = progression.snapshot(), snapKey = JSON.stringify(snap);
           if (snap.level > lastLevel) ambient.sfx('levelUp'); lastLevel = snap.level;
           if (snapKey !== lastSnapKey) { lastSnapKey = snapKey; setProgressionHud(snap); }
         }
-        const low = combat.health > 0 && combat.health <= 30;
+        const low = combat.health > 0 && combat.health <= combat.maxHealth * .3;
         if (low !== lowHealth) { lowHealth = low; shellRef.current?.classList.toggle('low-health', low); }
       }
       cameraRig.aim = playingAim(magic);
@@ -662,8 +670,70 @@ export default function Game() {
   }, [sensitivity]);
 
   const closeMenus = () => { setHelp(false); setQuestOpen(false); setInventoryOpen(false); setSkillsOpen(false); setPaused(false); setPausePanel('main'); };
-  const purchaseUpgrade = (id: UpgradeId) => {
-    if (progressionRef.current?.upgrade(id)) setProgressionHud(progressionRef.current.snapshot());
+  const [selectedSkill, setSelectedSkill] = useState('int_a');
+  const purchaseUpgrade = (id: string) => {
+    if (progressionRef.current?.upgrade(id)) { setProgressionHud(progressionRef.current.snapshot()); audioRef.current?.sfx('pickup'); }
+  };
+  const respecTalents = () => {
+    const spent = progressionRef.current?.respec() ?? 0;
+    if (progressionRef.current) setProgressionHud(progressionRef.current.snapshot());
+    if (spent) { audioRef.current?.sfx('ui'); setHint(`${spent} ${spent === 1 ? 'ponto devolvido' : 'pontos devolvidos'}.`); setTimeout(() => setHint(''), 2200); }
+  };
+  const TREE = { x: 500, y: 330 };
+  const nodePos = (n: SkillNode) => ({ x: TREE.x + n.r * Math.cos(n.ang * Math.PI / 180), y: TREE.y + n.r * Math.sin(n.ang * Math.PI / 180) });
+  const hexPts = (cx: number, cy: number, r: number) => Array.from({ length: 6 }, (_, i) => { const a = Math.PI / 3 * i - Math.PI / 6; return `${(cx + r * Math.cos(a)).toFixed(1)},${(cy + r * Math.sin(a)).toFixed(1)}`; }).join(' ');
+  const nodeColor = (n: SkillNode) => n.branch === 'root' ? '#f1dfa6' : BRANCH_INFO[n.branch].color;
+  const rankOf = (id: string) => progressionHud.ranks[id] ?? 0;
+  const reachable = (n: SkillNode) => n.reqs.every(r => rankOf(r) >= 1);
+  const fmtPct = (v: number) => `${v >= 0 ? '+' : ''}${Math.round(v * 100)}%`;
+  const skillTree = () => {
+    const sel = SKILL_BY_ID[selectedSkill] ?? SKILL_BY_ID.int_a, selRank = rankOf(sel.id), selReach = reachable(sel);
+    const canBuy = sel.id !== 'root' && progressionHud.skillPoints >= 1 && selRank < sel.max && selReach;
+    const stt = progressionHud.stats;
+    const totals: [string, string][] = [
+      ['Dano mágico', fmtPct(stt.damage - 1)], ['Mana máxima', `${1000 + stt.manaMax}`], ['Custo de mana', fmtPct(stt.costMult - 1)],
+      ['Durabilidade do escudo', fmtPct(stt.shieldHp - 1)], ['Resistência a dano', fmtPct(stt.resist)],
+      ['Velocidade de voo', fmtPct(stt.flySpeed - 1)], ['Vida máxima', `${stt.maxHealth}`],
+    ];
+    return <div className="tree-wrap">
+      <div className="tree-head">
+        <div><span className="modal-kicker">TALENTOS DO ECO · NÍVEL {progressionHud.level}</span><h2>Árvore de habilidades</h2></div>
+        <div className="tree-points"><span>PONTOS</span><strong>{progressionHud.skillPoints}</strong></div>
+      </div>
+      <div className="tree-legend">{(Object.keys(BRANCH_INFO) as (keyof typeof BRANCH_INFO)[]).map(b => <span key={b} style={{ '--c': BRANCH_INFO[b].color } as CSSProperties}><i />{BRANCH_INFO[b].name}<small>{BRANCH_INFO[b].subtitle}</small></span>)}</div>
+      <div className="tree-body">
+        <svg className="tree-svg" viewBox="170 15 660 635" role="group" aria-label="Árvore de habilidades">
+          <defs><radialGradient id="treeGlow" cx="50%" cy="50%" r="55%"><stop offset="0" stopColor="#3a2c5a" stopOpacity=".5" /><stop offset="1" stopColor="#0c1210" stopOpacity="0" /></radialGradient></defs>
+          <rect x="170" y="15" width="660" height="635" fill="url(#treeGlow)" />
+          {SKILL_NODES.flatMap(n => n.reqs.map(r => {
+            const a = nodePos(SKILL_BY_ID[r]), b = nodePos(n), lit = rankOf(r) >= 1, owned = rankOf(n.id) >= 1;
+            return <line key={`${r}-${n.id}`} className={`tl ${owned ? 'owned' : lit ? 'lit' : ''}`} x1={a.x} y1={a.y} x2={b.x} y2={b.y} style={{ '--c': nodeColor(n) } as CSSProperties} />;
+          }))}
+          {SKILL_NODES.map(n => {
+            const p = nodePos(n), rk = rankOf(n.id), reach = reachable(n), status = rk >= n.max ? 'maxed' : rk > 0 ? 'owned' : reach ? 'avail' : 'locked', R = n.keystone ? 33 : n.id === 'root' ? 30 : 26;
+            return <g key={n.id} className={`tn ${status} ${n.keystone ? 'key' : ''} ${selectedSkill === n.id ? 'sel' : ''}`} transform={`translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})`} style={{ '--c': nodeColor(n) } as CSSProperties}
+              tabIndex={0} role="button" aria-label={`${n.name}, nível ${rk} de ${n.max}`} onClick={() => setSelectedSkill(n.id)} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedSkill(n.id); } }}>
+              {n.keystone && <polygon className="tn-halo" points={hexPts(0, 0, R + 7)} />}
+              <polygon className="tn-hex" points={hexPts(0, 0, R)} />
+              <polygon className="tn-inner" points={hexPts(0, 0, R - 6)} />
+              <text className="tn-glyph" y="1" textAnchor="middle" dominantBaseline="central">{n.glyph}</text>
+              {n.id !== 'root' && <text className="tn-rank" y={R + 15} textAnchor="middle">{rk}/{n.max}</text>}
+            </g>;
+          })}
+        </svg>
+        <aside className="tree-detail" style={{ '--c': nodeColor(sel) } as CSSProperties}>
+          <div className="td-top"><span className="td-glyph">{sel.glyph}</span><div><small>{sel.branch === 'root' ? 'ORIGEM' : `${BRANCH_INFO[sel.branch].name.toUpperCase()}${sel.keystone ? ' · NÓ FINAL' : ''}`}</small><strong>{sel.name}</strong></div></div>
+          <p>{sel.description}</p>
+          <div className="td-effect"><small>{sel.id === 'root' ? 'ESTADO' : 'POR NÍVEL'}</small><span>{sel.perRank}</span></div>
+          {sel.id !== 'root' && <div className="rank-track">{Array.from({ length: sel.max }, (_, i) => <i key={i} className={i < selRank ? 'filled' : ''} />)}</div>}
+          {sel.reqs.length > 0 && sel.id !== 'root' && <ul className="td-reqs">{sel.reqs.map(r => <li key={r} className={rankOf(r) >= 1 ? 'ok' : ''}>{rankOf(r) >= 1 ? '✓' : '○'} {SKILL_BY_ID[r].name}</li>)}</ul>}
+          {sel.id !== 'root' && <button type="button" className="upgrade-button" disabled={!canBuy} onClick={() => purchaseUpgrade(sel.id)}>{selRank >= sel.max ? 'NÍVEL MÁXIMO' : !selReach ? 'BLOQUEADO' : progressionHud.skillPoints < 1 ? 'SEM PONTOS' : 'MELHORAR · 1 PONTO'}</button>}
+          <div className="td-totals"><small>SEUS ATRIBUTOS</small>{totals.map(([k, v]) => <div key={k}><span>{k}</span><b>{v}</b></div>)}</div>
+          <button type="button" className="text-btn" onClick={respecTalents}>↺ Redefinir pontos</button>
+        </aside>
+      </div>
+      <button type="button" className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button>
+    </div>;
   };
 
   const toggle = (on: boolean, flip: () => void, label: string) =>
@@ -733,7 +803,7 @@ export default function Game() {
         </div>}
       </div>
       <footer className="title-footer">
-        <span>Prólogo <b>·</b> Protótipo 0.3</span>
+        <span>Prólogo <b>·</b> Protótipo 0.3 <b>·</b> Personagem “Agris” por Vasian-Digital3D (CC BY 4.0)</span>
         <span className={ready ? 'press' : ''}>{ready ? <>Pressione <kbd>Enter</kbd> para começar</> : <><i className="loader" />Despertando o mundo…</>}</span>
       </footer>
     </div>}
@@ -781,8 +851,8 @@ export default function Game() {
           <div className="portrait"><span>✧</span><b className="portrait-level" title="Nível">{progressionHud.level}</b></div>
           <div className="player-meta">
             <div className="player-name"><strong>Chamado</strong><span>Errante das Terras de Avel</span></div>
-            <div className="bar bar-health" aria-label={`Vida ${combatHud.health}`}><i style={{ width: `${combatHud.health}%` }} /><span>VIDA</span><b>{combatHud.health}</b></div>
-            <div className="bar bar-mana" aria-label={`Mana ${combatHud.mana}`}><i style={{ width: `${combatHud.mana / 10}%` }} /><span>MANA</span><b>{combatHud.mana}</b></div>
+            <div className="bar bar-health" aria-label={`Vida ${combatHud.health}`}><i style={{ width: `${Math.min(100, combatHud.health / combatHud.maxHealth * 100)}%` }} /><span>VIDA</span><b>{combatHud.health}</b></div>
+            <div className="bar bar-mana" aria-label={`Mana ${combatHud.mana}`}><i style={{ width: `${Math.min(100, combatHud.mana / combatHud.maxMana * 100)}%` }} /><span>MANA</span><b>{combatHud.mana}</b></div>
             <div className="bar bar-xp" aria-label="Experiência"><i style={{ width: `${Math.min(100, progressionHud.experience / progressionHud.nextLevelXp * 100)}%` }} /><span>XP {progressionHud.experience}/{progressionHud.nextLevelXp}</span></div>
           </div>
         </div>
@@ -809,7 +879,7 @@ export default function Game() {
     {gameError && <div className="game-error"><strong>O mundo não pôde ser carregado</strong><span>{gameError}</span><button type="button" onClick={() => window.location.reload()}>Tentar novamente</button></div>}
 
     {/* ======================= MENUS ======================= */}
-    {playing && anyModal && <div className="modal-backdrop" onClick={closeMenus}><div className={`modal ${(inventoryOpen || skillsOpen) ? 'progression-modal' : ''} ${help ? 'wide-modal' : ''}`} role="dialog" aria-modal="true" onClick={event => event.stopPropagation()}>
+    {playing && anyModal && <div className="modal-backdrop" onClick={closeMenus}><div className={`modal ${inventoryOpen ? 'progression-modal' : ''} ${skillsOpen ? 'tree-modal' : ''} ${help ? 'wide-modal' : ''}`} role="dialog" aria-modal="true" onClick={event => event.stopPropagation()}>
       <button type="button" className="modal-close" onClick={closeMenus} aria-label="Fechar">×</button>
       {paused ? <><span className="modal-kicker">CAMPOS DA AURORA · PAUSA</span><h2>A jornada repousa.</h2>
         {pausePanel === 'main' ? <><p>O Eco ainda aguarda entre as pedras. Respire, ajuste o que precisar e retome quando quiser.</p>
@@ -822,7 +892,7 @@ export default function Game() {
           : <>{pausePanel === 'options' ? optionsPanel() : controlsPanel()}<button type="button" className="text-btn" onClick={() => setPausePanel('main')}>← Voltar</button></>}</>
         : help ? <><span className="modal-kicker">CAMINHOS DO VIAJANTE</span><h2>Um passo de cada vez.</h2><p>Enfrente lobos, bandidos e demônios. A mira central indica o alvo; aproxime-se dos cristais para recolher XP e itens raros.</p>{controlsPanel()}<button type="button" className="continue" onClick={closeMenus}>CONTINUAR A JORNADA <span>→</span></button></>
         : inventoryOpen ? <><span className="modal-kicker">PERTENCES DO VIAJANTE</span><h2>Inventário</h2><p>Recolha os cristais de experiência e os itens deixados pelos inimigos.</p><div className="inventory-grid"><article className="inventory-item"><span className="item-glyph">✧</span><div><strong>Fragmento de Eco</strong><small>Resíduo de energia arcana</small></div><b>{progressionHud.inventory.echoFragment}</b></article><article className="inventory-item"><span className="item-glyph">◇</span><div><strong>Núcleo de sentinela</strong><small>Material deixado pelos Ecos</small></div><b>{progressionHud.inventory.sentinelCore}</b></article>{(Object.keys(LOOT_INFO) as LootItemId[]).map(item => <article className={`inventory-item loot-${LOOT_INFO[item].rarity.toLowerCase()}`} key={item}><span className="item-glyph">{LOOT_INFO[item].rarity === 'Épico' ? '✦' : LOOT_INFO[item].rarity === 'Raro' ? '⬡' : '◇'}</span><div><strong>{LOOT_INFO[item].name}</strong><small>{LOOT_INFO[item].rarity} · {LOOT_INFO[item].source}</small></div><b>{progressionHud.inventory[item]}</b></article>)}</div><div className="inventory-footer">Nível {progressionHud.level} <span>·</span> {progressionHud.experience}/{progressionHud.nextLevelXp} XP <span>·</span> {progressionHud.skillPoints} pontos de habilidade</div><button type="button" className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
-        : skillsOpen ? <><span className="modal-kicker">TALENTOS DO ECO · NÍVEL {progressionHud.level}</span><h2>Árvore de habilidades</h2><p>Derrote Ecos para ganhar XP. Cada nível concede 1 ponto; melhorias podem chegar ao nível {MAX_RANK}.</p><div className="skill-points">PONTOS DISPONÍVEIS <strong>{progressionHud.skillPoints}</strong></div><div className="upgrade-grid">{(['damage', 'size', 'efficiency'] as UpgradeId[]).map(id => <article className="upgrade-card" key={id}><div className="upgrade-heading"><span>{id === 'damage' ? '✦' : id === 'size' ? '⬡' : '◌'}</span><div><strong>{UPGRADE_INFO[id].title}</strong><small>NÍVEL {progressionHud.ranks[id]} / {MAX_RANK}</small></div></div><p>{UPGRADE_INFO[id].description}</p><div className="rank-track">{Array.from({ length: MAX_RANK }, (_, index) => <i key={index} className={index < progressionHud.ranks[id] ? 'filled' : ''} />)}</div><button type="button" className="upgrade-button" disabled={!progressionHud.skillPoints || progressionHud.ranks[id] >= MAX_RANK} onClick={() => purchaseUpgrade(id)}>{progressionHud.ranks[id] >= MAX_RANK ? 'NÍVEL MÁXIMO' : 'MELHORAR · 1 PONTO'}</button></article>)}</div><button type="button" className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
+        : skillsOpen ? skillTree()
         : <><span className="modal-kicker">DIÁRIO DE VIAGEM · 01</span><h2>O Que Permanece</h2><p>Quase mil anos se passaram desde a derrota de Valkhor. A relva tomou os velhos caminhos, e os nomes dos heróis já não são lembrados.</p><p>Um marco de pedra repousa além do prado, coberto de musgo. Talvez ainda guarde uma lembrança.</p><div className="quest-objective"><span>✦</span>{status.discovered ? 'Memória do Marco do Herói despertada' : 'Encontre o Marco do Herói nos campos'}</div></>}
     </div></div>}
   </main>;
