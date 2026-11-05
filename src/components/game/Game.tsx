@@ -1,21 +1,48 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { AmbientAudio } from './audio';
 import { CombatSystem } from './combat';
 import { createHero, type HeroPose } from './hero';
 import { MagicSystem, type SpellId } from './magic';
 import { PlayerProgression, UPGRADE_INFO, LOOT_INFO, MAX_RANK, type LootItemId, type ProgressionSnapshot, type UpgradeId } from './progression';
 import { PlayerMotor, ThirdPersonCamera } from './simulation';
-import { createWorld, setWorldQuality, updateWorld, updateDayCycle, type WorldParts } from './world';
+import { createWorld, setWorldQuality, terrainHeight, updateWorld, updateDayCycle, pondDist, streamDist, POND, type WorldParts } from './world';
 
 type GameStatus = { area: string; discovered: number };
 type Quality = 'Baixa' | 'Média' | 'Alta';
+type Panel = 'main' | 'options' | 'controls';
+type CombatHud = {
+  mana: number; health: number; alive: number; shield: boolean; flying: boolean; blocks: number;
+  cooldowns: Record<SpellId, number>; cdFrac: Record<SpellId, number>;
+};
+/** Quanto a câmera "entra na mira": cheio ao carregar/disparar o Zoltraak. */
+const playingAim = (magic: { charging: boolean; beamActive: boolean; chargeLevel: number }) => magic.beamActive ? 1 : magic.charging ? .45 + magic.chargeLevel * .55 : 0;
+const NO_CD: Record<SpellId, number> = { zoltraak: 0, vollzanbel: 0, judradjim: 0, shield: 0, flight: 0 };
+
+/** Ícones vetoriais das magias e atalhos (herdam a cor do texto). */
+const ICONS: Record<SpellId | 'journal' | 'help', ReactNode> = {
+  zoltraak: <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7.5" cy="12" r="4" fill="currentColor" /><circle cx="7.5" cy="12" r="5.8" fill="none" stroke="currentColor" strokeWidth="1" /><path d="M12.5 10.4h9M12.5 13.6h9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><path d="M18 6.2v1.6M17.2 7h1.6M15.5 16.8v1.4M14.8 17.5h1.4" stroke="currentColor" strokeWidth=".9" strokeLinecap="round" /></svg>,
+  vollzanbel: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5c.8 3.6 5.6 5.6 5.6 11.3a5.6 5.6 0 0 1-11.2 0c0-2.8 1.7-4.7 2.7-6.5.2 1.9 1 2.9 2 3.1-.1-3 -.8-4.9.9-7.9z" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" /><path d="M12 20.5a2.6 2.6 0 0 1-2.6-2.6c0-1.6 1.6-2.4 2.2-4 .9 1.5 3 2.3 3 4a2.6 2.6 0 0 1-2.6 2.6z" fill="currentColor" /></svg>,
+  judradjim: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5 2 5.5 13.2h5.6L9.4 22l9.1-12.4h-5.8L14.6 2z" fill="currentColor" /></svg>,
+  shield: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.4 20.3 7.2v9.6L12 21.6l-8.3-4.8V7.2z" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" /><path d="M12 6.8 16.3 9.3v5.4L12 17.2l-4.3-2.5V9.3z" fill="currentColor" opacity=".55" /></svg>,
+  flight: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 3.5c-8.3.2-13.8 5-15 12.7l-2 4.3 4.2-2c7.6-1.3 12.6-6.8 12.8-15z" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" /><path d="M6.5 17.5 16 8M9 15h4.5M11.5 12.2h3.8" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" /></svg>,
+  journal: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h9.5a3 3 0 0 1 3 3V20H8a3 3 0 0 1-3-3z" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M5 17a3 3 0 0 1 3-3h9.5M9 8h5M9 10.6h3.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /></svg>,
+  help: <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M9.6 9.4a2.5 2.5 0 1 1 3.4 2.3c-.7.3-1 .8-1 1.6v.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /><circle cx="12" cy="16.9" r="1" fill="currentColor" /></svg>,
+};
+const CONTROLS: [string[], string][] = [
+  [['W', 'A', 'S', 'D'], 'Mover'], [['Cursor'], 'Mirar (mouse livre)'], [['Arrastar'], 'Girar a câmera (botão esq./dir.)'], [['Roda'], 'Zoom da câmera'], [['Shift'], 'Alternar Shift Lock'],
+  [['Alt'], 'Correr / voar rápido'], [['Espaço'], 'Pular / subir voando'], [['Ctrl'], 'Descer voando'],
+  [['Q'], 'Zoltraak · segure para carregar'], [['1'], 'Vollzanbel · bola de fogo'], [['2'], 'Judradjim · relâmpago'],
+  [['F'], 'Escudo arcano · segure (−3 mana/s)'], [['R'], 'Voo'], [['Clique dir.'], 'Golpe com o cajado (sem arrastar)'], [['X'], 'Esquiva'], [['T'], 'Guardar / sacar o cajado'], [['V'], 'Postura defensiva'],
+  [['E'], 'Inventário'], [[','], 'Habilidades'], [['G'], 'Ouvir o Marco'], [['J'], 'Diário de viagem'], [['Esc'], 'Pausar'],
+];
 
 export default function Game() {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -28,6 +55,9 @@ export default function Game() {
   const modalFlagsRef = useRef({ help: false, quest: false, inventory: false, skills: false });
   const castSpellRef = useRef<() => void>(() => {});
   const castAbilityRef = useRef<(spell: SpellId) => void>(() => {});
+  const zoltraakRef = useRef({ start: () => {}, release: () => {} });
+  const shieldRef = useRef({ start: () => {}, release: () => {} });
+  const shieldBarRef = useRef<HTMLDivElement>(null);
   const interactRef = useRef<() => void>(() => {});
   const attackRef = useRef<() => void>(() => {});
   const dodgeRef = useRef<() => void>(() => {});
@@ -35,6 +65,17 @@ export default function Game() {
   const compassPinRef = useRef<HTMLSpanElement>(null);
   const touchKnobRef = useRef<HTMLSpanElement>(null);
   const aimReticleRef = useRef<HTMLDivElement>(null);
+  const chargeRef = useRef<HTMLDivElement>(null);
+  const fpsRef = useRef<HTMLDivElement>(null);
+  const shellRef = useRef<HTMLElement>(null);
+  const damageRef = useRef<HTMLDivElement>(null);
+  const titleRef = useRef(true);
+  const hasStartedRef = useRef(false);
+  const qualityRef = useRef<Quality>('Média');
+  const dynamicResRef = useRef(true);
+  const basePixelRatioRef = useRef(1);
+  const applyPixelRatioRef = useRef<() => void>(() => {});
+  const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const touchPointerRef = useRef<number | null>(null);
   const touchMoveRef = useRef({ forward: 0, side: 0 });
   const touchSprintRef = useRef(false);
@@ -42,7 +83,16 @@ export default function Game() {
   const [status, setStatus] = useState<GameStatus>({ area: 'Campos da Aurora', discovered: 0 });
   const [hint, setHint] = useState('');
   const [nearLandmark, setNearLandmark] = useState(false);
-  const [muted, setMuted] = useState(true);
+  const [muted, setMuted] = useState(false);
+  const [screen, setScreen] = useState<'title' | 'playing'>('title');
+  const [titlePanel, setTitlePanel] = useState<Panel>('main');
+  const [pausePanel, setPausePanel] = useState<Panel>('main');
+  const [ready, setReady] = useState(false);
+  const [hasStarted, setHasStarted] = useState(false);
+  const [areaBanner, setAreaBanner] = useState(false);
+  const [dynamicRes, setDynamicRes] = useState(true);
+  const [showFps, setShowFps] = useState(false);
+  const [aimAssist, setAimAssist] = useState(true);
   const [dayLabel, setDayLabel] = useState('06:00');
   const [help, setHelp] = useState(false);
   const [questOpen, setQuestOpen] = useState(false);
@@ -50,12 +100,16 @@ export default function Game() {
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [paused, setPaused] = useState(false);
   const [shiftLocked, setShiftLocked] = useState(false);
-  const [quality, setQuality] = useState<Quality>('Média');
+  // dispositivos modestos começam no Baixa
+  const [quality, setQuality] = useState<Quality>(() => typeof navigator !== 'undefined' && ((navigator.hardwareConcurrency ?? 8) <= 4 || /Mobi|Android/i.test(navigator.userAgent)) ? 'Baixa' : 'Média');
   const [sensitivity, setSensitivity] = useState(5);
   const [gameError, setGameError] = useState('');
-  const [combatHud, setCombatHud] = useState({ mana: 100, health: 100, alive: 7, shield: false, flying: false, blocks: 0, cooldowns: { zoltraak: 0, vollzanbel: 0, judradjim: 0, shield: 0, flight: 0 } });
+  const [combatHud, setCombatHud] = useState<CombatHud>({ mana: 1000, health: 100, alive: 7, shield: false, flying: false, blocks: 0, cooldowns: NO_CD, cdFrac: NO_CD });
   const [progressionHud, setProgressionHud] = useState<ProgressionSnapshot>({ level: 1, experience: 0, nextLevelXp: 100, skillPoints: 0, ranks: { damage: 0, size: 0, efficiency: 0 }, inventory: { echoFragment: 0, sentinelCore: 0, wolfPelt: 0, banditToken: 0, demonAsh: 0, moonFang: 0, ancientSigil: 0, demonHeart: 0 } });
-  uiOpenRef.current = help || questOpen || inventoryOpen || skillsOpen || paused;
+  uiOpenRef.current = help || questOpen || inventoryOpen || skillsOpen || paused || screen === 'title';
+  titleRef.current = screen === 'title';
+  qualityRef.current = quality;
+  dynamicResRef.current = dynamicRes;
   modalFlagsRef.current = { help, quest: questOpen, inventory: inventoryOpen, skills: skillsOpen };
 
   const releaseMouse = useCallback(() => {
@@ -63,10 +117,26 @@ export default function Game() {
     cameraRigRef.current?.setShiftLock(false);
     setShiftLocked(false);
   }, []);
-  const toggleHelp = useCallback(() => { releaseMouse(); setHelp(value => !value); setQuestOpen(false); setInventoryOpen(false); setSkillsOpen(false); }, [releaseMouse]);
-  const toggleQuest = useCallback(() => { releaseMouse(); setQuestOpen(value => !value); setHelp(false); setInventoryOpen(false); setSkillsOpen(false); }, [releaseMouse]);
-  const toggleInventory = useCallback(() => { releaseMouse(); setInventoryOpen(value => !value); setSkillsOpen(false); setHelp(false); setQuestOpen(false); }, [releaseMouse]);
-  const toggleSkills = useCallback(() => { releaseMouse(); setSkillsOpen(value => !value); setInventoryOpen(false); setHelp(false); setQuestOpen(false); }, [releaseMouse]);
+  const toggleHelp = useCallback(() => { audioRef.current?.sfx('ui'); releaseMouse(); setHelp(value => !value); setQuestOpen(false); setInventoryOpen(false); setSkillsOpen(false); }, [releaseMouse]);
+  const toggleQuest = useCallback(() => { audioRef.current?.sfx('ui'); releaseMouse(); setQuestOpen(value => !value); setHelp(false); setInventoryOpen(false); setSkillsOpen(false); }, [releaseMouse]);
+  const toggleInventory = useCallback(() => { audioRef.current?.sfx('ui'); releaseMouse(); setInventoryOpen(value => !value); setSkillsOpen(false); setHelp(false); setQuestOpen(false); }, [releaseMouse]);
+  const toggleSkills = useCallback(() => { audioRef.current?.sfx('ui'); releaseMouse(); setSkillsOpen(value => !value); setInventoryOpen(false); setHelp(false); setQuestOpen(false); }, [releaseMouse]);
+  const startJourney = useCallback(() => {
+    if (!rendererRef.current) return;
+    setScreen('playing'); setTitlePanel('main'); setPaused(false); setPausePanel('main');
+    audioRef.current?.start(); audioRef.current?.sfx('uiStart');
+    if (!hasStartedRef.current) {
+      hasStartedRef.current = true; setHasStarted(true); setAreaBanner(true);
+      if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = setTimeout(() => setAreaBanner(false), 4600);
+    }
+    rendererRef.current.domElement.focus();
+  }, []);
+  const backToTitle = useCallback(() => {
+    releaseMouse(); setPaused(false); setPausePanel('main'); setHelp(false); setQuestOpen(false); setInventoryOpen(false); setSkillsOpen(false);
+    setScreen('title'); setTitlePanel('main');
+  }, [releaseMouse]);
+  const startRef = useRef(startJourney); startRef.current = startJourney;
   const toggleMute = useCallback(() => {
     setMuted(value => { audioRef.current?.setMuted(!value); return !value; });
   }, []);
@@ -105,6 +175,7 @@ export default function Game() {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.autoUpdate = false; // atualizado manualmente (a cada 2 quadros fora do Alta)
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.05;
@@ -130,9 +201,20 @@ export default function Game() {
 
     const world: WorldParts = createWorld(scene);
     qualityTargetsRef.current = { scene, sun, composer, bloom };
+    basePixelRatioRef.current = renderer.getPixelRatio();
+    let resScale = 1;
+    const applyPixelRatio = () => {
+      const pr = basePixelRatioRef.current * resScale;
+      renderer.setPixelRatio(pr); composer.setPixelRatio(pr); resize();
+    };
+    applyPixelRatioRef.current = applyPixelRatio;
     const hero = createHero(scene);
     hero.root.rotation.y = Math.PI;
     hero.root.userData.facing = Math.PI;
+    // corpo esquelético (Xbot, exemplo oficial do three.js / Mixamo); se falhar, fica o corpo procedural
+    let disposed = false;
+    // corpo esquelético (Xbot, exemplo oficial do three.js / Mixamo); se falhar, fica o corpo procedural
+    new GLTFLoader().load('/models/Xbot.glb', gltf => { if (!disposed) hero.attachBody(gltf); }, undefined, () => { /* mantém o corpo procedural */ });
     const motor = new PlayerMotor(hero.root, world.colliders);
     const cameraRig = new ThirdPersonCamera(camera, world);
     cameraRigRef.current = cameraRig;
@@ -140,6 +222,10 @@ export default function Game() {
     const progression = new PlayerProgression();
     progressionRef.current = progression;
     const ambient = new AmbientAudio(); audioRef.current = ambient;
+    // navegadores só liberam áudio após um gesto: a primeira interação (inclusive na tela inicial) liga a trilha
+    const unlockAudio = () => ambient.start();
+    window.addEventListener('pointerdown', unlockAudio, { once: true }); window.addEventListener('keydown', unlockAudio, { once: true });
+    let stepDist = 0, lastLevel = 1, audioTick = 0, daylightNow = 0.4;
     const keys = new Set<string>();
     const spellOrigin = new THREE.Vector3();
     const spellAim = new THREE.Vector3();
@@ -155,31 +241,82 @@ export default function Game() {
     let elapsed = 0, reticleHitUntil = 0;
     const combat = new CombatSystem(scene, amount => progression.recordExperience(amount), item => progression.addItem(item), showHint);
     const magic = new MagicSystem(scene, hero.root, combat, world.blockers, progression, () => { reticleHitUntil = elapsed + .28; });
+    magic.setStaffTip(hero.spellPoint);
+    magic.onSfx = (name, v) => ambient.sfx(name, v);
+    combat.onSfx = (name, v) => ambient.sfx(name, v);
+    // compila todos os shaders durante o carregamento (sem engasgos no primeiro feitiço/primeiro olhar)
+    try { magic.prewarm(renderer, camera); renderer.compile(scene, camera); } catch { /* compilação antecipada é só otimização */ }
     let isNearMarker = false, markerRemembered = false, shiftLockActive = false, castUntil = 0, attackUntil = 0, dodgeUntil = 0, hitUntil = 0, landUntil = 0, lastHealth = combat.health, deathTimer = 0, hudTick = 0, cycleTick = 0;
     const castAbility = (spell: SpellId) => {
-      if (uiOpenRef.current || combat.health <= 0) return;
+      if (uiOpenRef.current || combat.health <= 0 || elapsed < cine.until) return;
+      if (magic.shieldActive && spell !== 'shield' && spell !== 'flight') { showHint('Solte o escudo (F) para usar outra habilidade.'); return; }
       ambient.start();
+      hero.ensureStaff();
       hero.spellPoint.getWorldPosition(spellOrigin);
       cameraRig.getAimPoint(spellAim, combat.targets);
       spellDirection.copy(spellAim).sub(spellOrigin).normalize();
       if (magic.cast(spell, spellOrigin, spellDirection, spellAim)) {
-        castUntil = elapsed + .48;
+        hero.root.userData.castKind = spell;
+        castUntil = elapsed + (spell === 'vollzanbel' ? 1.35 : spell === 'judradjim' ? .95 : spell === 'shield' ? .62 : .48);
+        if (spell !== 'shield' && spell !== 'flight') faceAimUntil = elapsed + (spell === 'judradjim' ? 1 : spell === 'vollzanbel' ? 1.4 : .6);
+        if (spell === 'vollzanbel') startCinematic();
         if (aimReticleRef.current) aimReticleRef.current.classList.add('is-casting');
-        ambient.playCast();
+        if (spell === 'zoltraak') ambient.sfx('cast');
       }
     };
     const castSpell = () => castAbility('zoltraak');
+    // Zoltraak carregável: segurar Q / clique esquerdo carrega; soltar dispara o raio.
+    const aimNow = () => {
+      hero.spellPoint.getWorldPosition(spellOrigin);
+      cameraRig.getAimPoint(spellAim, combat.targets);
+      spellDirection.copy(spellAim).sub(spellOrigin).normalize();
+      magic.setAim(spellOrigin, spellDirection);
+    };
+    let zoltraakFraming = false, faceAimUntil = 0;
+    const shieldBarrier = { center: new THREE.Vector3(), normal: new THREE.Vector3(), half: 1 };
+    // mini-cutscene do Vollzanbel: barras de cinema, nome do feitiço, câmera baixa girando em volta da maga
+    const cine = { start: -99, until: -99 };
+    const startCinematic = () => {
+      cine.start = elapsed; cine.until = elapsed + 1.3;
+      const shell = shellRef.current;
+      if (shell) { shell.classList.remove('cinematic'); void shell.offsetWidth; shell.classList.add('cinematic'); }
+    };
+    const startZoltraak = () => {
+      if (uiOpenRef.current || combat.health <= 0 || magic.shieldActive) return;
+      ambient.start(); hero.ensureStaff(); aimNow();
+      if (magic.beginCharge() && aimReticleRef.current) aimReticleRef.current.classList.add('is-casting');
+    };
+    const releaseZoltraak = () => {
+      if (!magic.charging) return;
+      aimNow();
+      magic.releaseCharge();
+    };
+    zoltraakRef.current = { start: startZoltraak, release: releaseZoltraak };
+    const startShield = () => {
+      if (uiOpenRef.current || combat.health <= 0 || elapsed < cine.until || magic.charging || magic.beamActive) return;
+      ambient.start(); hero.ensureStaff();
+      if (magic.beginShield()) { hero.root.userData.castKind = 'shield'; castUntil = elapsed + .62; }
+      else if (magic.cooldown('shield') > 0) showHint(`Escudo em recarga · ${magic.cooldown('shield').toFixed(1)} s`);
+    };
+    const releaseShield = () => magic.releaseShield();
+    shieldRef.current = { start: startShield, release: releaseShield };
     const performAttack = () => {
-      if (uiOpenRef.current || combat.health <= 0) return;
+      if (uiOpenRef.current || combat.health <= 0 || magic.shieldActive) return;
       const facing = hero.root.userData.facing ?? hero.root.rotation.y;
       const target = hero.root.position.clone().add(new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing)).multiplyScalar(2.15));
       target.y += 1.2;
       if (combat.damageAt(target, 1.25, 30) > 0) reticleHitUntil = elapsed + .28;
       attackUntil = elapsed + .38;
-      ambient.start(); ambient.playCast();
+      ambient.start(); ambient.sfx('swing');
     };
     attackRef.current = performAttack;
-    dodgeRef.current = () => { if (!uiOpenRef.current && combat.health > 0) { const side = Number(keys.has('d')) - Number(keys.has('a')); motor.dodge(cameraRig.yaw, side); dodgeUntil = elapsed + .42; } };
+    dodgeRef.current = () => {
+      if (uiOpenRef.current || combat.health <= 0) return;
+      const fwd = (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0) + touchMoveRef.current.forward;
+      const side = (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0) + touchMoveRef.current.side;
+      const vert = magic.flying ? Number(keys.has(' ')) - Number(keys.has('control')) : 0;
+      if (motor.dodge(cameraRig.yaw, THREE.MathUtils.clamp(fwd, -1, 1), THREE.MathUtils.clamp(side, -1, 1), vert)) { dodgeUntil = elapsed + (magic.flying ? .3 : .42); ambient.sfx('dodge'); }
+    };
     castSpellRef.current = castSpell;
     castAbilityRef.current = castAbility;
     const interactMarker = () => {
@@ -194,7 +331,8 @@ export default function Game() {
     interactRef.current = interactMarker;
     const onKeyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
-      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'shift', 'alt', 'escape', 'h', 'j', 'e', 'g', 'q', '1', '2', 'f', 'r', 'v', 'x', 'control', ','].includes(key)) event.preventDefault();
+      if (titleRef.current) { if (key === 'enter' && !event.repeat) startRef.current(); return; }
+      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'shift', 'alt', 'escape', 'h', 'j', 'e', 'g', 'q', '1', '2', 'f', 'r', 'v', 'x', 't', 'control', ','].includes(key)) event.preventDefault();
       if (event.repeat && ['escape', 'h', 'j', 'e', 'g', 'q', '1', '2', 'f', 'r', 'x', ' ', ','].includes(key)) return;
       if (key === 'escape') {
         keys.clear();
@@ -224,48 +362,69 @@ export default function Game() {
         interactMarker();
         return;
       }
-      if (key === 'q') { castSpell(); return; }
+      if (key === 'q') { startZoltraak(); return; }
       if (key === '1') { castAbility('vollzanbel'); return; }
       if (key === '2') { castAbility('judradjim'); return; }
-      if (key === 'f') { castAbility('shield'); return; }
+      if (key === 'f') { startShield(); return; }
       if (key === 'r') { castAbility('flight'); return; }
       if (key === 'x') { dodgeRef.current(); return; }
+      if (key === 't' && !event.repeat) {
+        if (uiOpenRef.current || combat.health <= 0 || elapsed < cine.until || magic.charging || magic.beamActive || magic.shieldActive) return;
+        showHint((ambient.sfx('staffToggle'), hero.toggleStaff()) ? 'Cajado em mãos.' : 'Cajado guardado nas costas.');
+        return;
+      }
       if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'alt', 'control', 'v'].includes(key)) {
         ambient.start(); keys.add(key);
       }
     };
-    const onKeyUp = (event: KeyboardEvent) => keys.delete(event.key.toLowerCase());
-    const onBlur = () => { keys.clear(); shiftLockActive = false; cameraRig.setShiftLock(false); setShiftLocked(false); setPaused(true); };
+    const onKeyUp = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      keys.delete(key);
+      if (key === 'q') releaseZoltraak();
+      if (key === 'f') releaseShield();
+    };
+    const onBlur = () => { keys.clear(); magic.cancelCharge(); shiftLockActive = false; cameraRig.setShiftLock(false); setShiftLocked(false); setPaused(true); };
     const onVisibility = () => { if (document.visibilityState === 'hidden') { keys.clear(); shiftLockActive = false; cameraRig.setShiftLock(false); setShiftLocked(false); setPaused(true); } };
     const onPointerLock = () => {
       dragging = document.pointerLockElement === renderer.domElement;
       if (!dragging && shiftLockActive) { shiftLockActive = false; cameraRig.setShiftLock(false); setShiftLocked(false); }
     };
+    // Mouse livre (fora do Shift Lock): cursor-mira estilizado, magias miram no cursor,
+    // arrastar com botão esquerdo/direito gira a câmera, clique direito sem arrastar = golpe do cajado.
+    let dragButton = -1, dragMoved = 0;
+    const mouse = { x: 0, y: 0, inside: false };
+    const trackMouse = (event: PointerEvent) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = event.clientX - rect.left; mouse.y = event.clientY - rect.top; mouse.inside = true;
+    };
     const onPointerDown = (event: PointerEvent) => {
       if (uiOpenRef.current) return;
-      if (event.button === 2) { performAttack(); return; }
-      if (event.button !== 0) return;
+      if (event.button !== 0 && event.button !== 2) return;
       ambient.start();
       if (event.pointerType === 'touch') {
         renderer.domElement.setPointerCapture(event.pointerId);
         dragging = true; previousX = event.clientX; previousY = event.clientY;
         return;
       }
-      castSpell();
-      if (renderer.domElement.requestPointerLock) {
-        const lockRequest = renderer.domElement.requestPointerLock();
-        if (lockRequest && typeof lockRequest.catch === 'function') lockRequest.catch(() => { dragging = true; });
-        dragging = true;
-      } else dragging = true;
+      if (document.pointerLockElement === renderer.domElement) { if (event.button === 2) performAttack(); return; }
+      trackMouse(event);
+      renderer.domElement.setPointerCapture(event.pointerId);
+      dragging = true; dragButton = event.button; dragMoved = 0;
       previousX = event.clientX; previousY = event.clientY;
     };
     const onPointerMove = (event: PointerEvent) => {
+      if (event.target === renderer.domElement || dragButton >= 0) trackMouse(event);
       if (!dragging || uiOpenRef.current) return;
+      if (dragButton >= 0) dragMoved += Math.abs(event.clientX - previousX) + Math.abs(event.clientY - previousY);
       const locked = document.pointerLockElement === renderer.domElement;
       cameraRig.rotate(locked ? event.movementX : event.clientX - previousX, locked ? event.movementY : event.clientY - previousY);
       previousX = event.clientX; previousY = event.clientY;
     };
-    const onPointerUp = () => { if (document.pointerLockElement !== renderer.domElement) dragging = false; };
+    const onPointerUp = (event: PointerEvent) => {
+      if (dragButton === 2 && event.button === 2 && dragMoved < 6) performAttack();
+      if (event.button === dragButton) dragButton = -1;
+      if (document.pointerLockElement !== renderer.domElement) dragging = false;
+    };
     const onWheel = (event: WheelEvent) => { event.preventDefault(); cameraRig.zoom(event.deltaY); };
     const onContext = (event: MouseEvent) => event.preventDefault();
     const resize = () => {
@@ -278,20 +437,68 @@ export default function Game() {
     document.addEventListener('visibilitychange', onVisibility); document.addEventListener('pointerlockchange', onPointerLock);
     renderer.domElement.addEventListener('pointerdown', onPointerDown); renderer.domElement.addEventListener('wheel', onWheel, { passive: false }); renderer.domElement.addEventListener('contextmenu', onContext);
 
-    let frame = 0;
+    let frame = 0, frameCount = 0, fpsAcc = 0, fpsFrames = 0, emaMs = 16, resTimer = 0, firstFrame = true;
+    let lastHudKey = '', lastSnapKey = '', lowHealth = false;
+    const camTarget = new THREE.Vector3();
     const animate = () => {
       frame = requestAnimationFrame(animate);
-      const delta = Math.min(.05, clock.getDelta());
+      const rawDelta = clock.getDelta(), delta = Math.min(.05, rawDelta);
+      frameCount++;
+
+      // --- medidor de desempenho + resolução dinâmica (ajusta a escala de pixels pelo tempo de quadro)
+      emaMs += (Math.min(rawDelta, .2) * 1000 - emaMs) * .06; fpsAcc += rawDelta; fpsFrames++;
+      if (fpsAcc >= .5) { if (fpsRef.current) fpsRef.current.textContent = `${Math.round(fpsFrames / fpsAcc)} FPS · ${Math.round(resScale * 100)}% res`; fpsAcc = 0; fpsFrames = 0; }
+      resTimer += rawDelta;
+      if (resTimer > 1.5) {
+        resTimer = 0;
+        const target = !dynamicResRef.current ? 1 : emaMs > 26 ? Math.max(.55, resScale - .1) : emaMs < 19 ? Math.min(1, resScale + .05) : resScale;
+        if (Math.abs(target - resScale) > .001) { resScale = target; applyPixelRatio(); }
+      }
+
+      // --- tela inicial: câmera cinematográfica orbitando o Marco, mundo vivo ao fundo
+      if (titleRef.current) {
+        elapsed += delta;
+        const t = elapsed * .04;
+        camTarget.set(Math.sin(t) * 14.5, 0, -12 + Math.cos(t) * 14.5);
+        camTarget.y = Math.max(terrainHeight(camTarget.x, camTarget.z) + 2.6, 4.4 + Math.sin(elapsed * .17) * .7);
+        camera.position.lerp(camTarget, firstFrame ? 1 : 1 - Math.exp(-delta * 2.5));
+        camera.lookAt(0, 3.1, -12);
+        hero.update(elapsed, delta, 'idle', 0);
+        magic.update(delta, elapsed);
+        updateWorld(world, elapsed);
+        cycleTick += delta;
+        if (cycleTick >= 1 || firstFrame) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); setDayLabel(cycle.label); }
+        if (renderer.shadowMap.enabled && frameCount % 3 === 0) renderer.shadowMap.needsUpdate = true;
+        composer.render();
+        if (firstFrame) { firstFrame = false; setReady(true); }
+        return;
+      }
+      // menus abertos: o mundo fica congelado, então basta redesenhar de vez em quando
+      if (uiOpenRef.current && frameCount % 3 !== 0) return;
       if (!uiOpenRef.current) {
         elapsed += delta;
-        const wasGrounded = motor.grounded;
-        const forward = (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0) + touchMoveRef.current.forward;
-        const side = (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0) + touchMoveRef.current.side;
+        const wasGrounded = motor.grounded, vyBefore = motor.verticalSpeed;
+        const zoltraakActive = combat.health > 0 && (magic.charging || magic.beamActive);
+        motor.speedScale = zoltraakActive ? (magic.beamActive ? .35 : .55) : 1;
+        const inCine = elapsed < cine.until;
+        const forward = inCine ? 0 : (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0) + touchMoveRef.current.forward;
+        const side = inCine ? 0 : (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0) + touchMoveRef.current.side;
         const moving = combat.health > 0 && motor.update(delta, THREE.MathUtils.clamp(forward, -1, 1), THREE.MathUtils.clamp(side, -1, 1), keys.has('alt') || touchSprintRef.current, keys.has(' ') || touchJumpRef.current, cameraRig.yaw, magic.flying, Number(keys.has(' ') || touchJumpRef.current) - Number(keys.has('control')), cameraRig.pitch);
         if (combat.health > 0 && (shiftLockActive || Math.hypot(motor.velocity.x, motor.velocity.z) > .2)) {
           hero.root.userData.facing = shiftLockActive ? cameraRig.yaw + Math.PI : Math.atan2(motor.velocity.x, motor.velocity.z);
         }
+        // enquanto carrega/dispara, a câmera vai para o ombro (raio e mira ficam livres do corpo)
+        if (zoltraakActive !== zoltraakFraming && !shiftLockActive) cameraRig.setShiftLock(zoltraakActive);
+        zoltraakFraming = zoltraakActive;
+        // ao lançar qualquer feitiço de ataque, a heroína vira para onde a mira aponta
+        if (!zoltraakActive && elapsed < faceAimUntil && combat.health > 0) hero.root.userData.facing = Math.atan2(spellAim.x - hero.root.position.x, spellAim.z - hero.root.position.z);
+        if (zoltraakActive) {
+          // mira acompanha a câmera enquanto carrega/dispara; a heroína encara o alvo
+          aimNow();
+          hero.root.userData.facing = Math.atan2(spellAim.x - hero.root.position.x, spellAim.z - hero.root.position.z);
+        }
         if (combat.health <= 0) {
+          magic.cancelCharge();
           deathTimer += delta;
           if (deathTimer >= 2) {
             hero.root.position.set(0, 0, 2);
@@ -302,27 +509,87 @@ export default function Game() {
             deathTimer = 0;
           }
         } else deathTimer = 0;
-        if (!wasGrounded && motor.grounded) landUntil = elapsed + .34;
-        touchJumpRef.current = false;
-        if (combat.health < lastHealth) hitUntil = elapsed + .28;
+        if (!wasGrounded && motor.grounded) { landUntil = elapsed + .34; if (vyBefore < -3) ambient.sfx('land', THREE.MathUtils.clamp(-vyBefore / 14, .3, 1.3)); }
+        if (wasGrounded && !motor.grounded && motor.verticalSpeed > 4) ambient.sfx('jump');
+        if (motor.grounded && !magic.flying && moving) {
+          const sprinting = keys.has('alt') || touchSprintRef.current;
+          stepDist += Math.hypot(motor.velocity.x, motor.velocity.z) * delta;
+          if (stepDist > (sprinting ? 2.2 : 1.55)) { stepDist = 0; ambient.sfx('step', sprinting ? 1.5 : 1); }
+        }
+        audioTick += delta;
+        if (audioTick > .25) {
+          audioTick = 0;
+          const hp = hero.root.position, wd = Math.min(pondDist(hp.x, hp.z) - POND.r * .8, streamDist(hp.x, hp.z) - 1);
+          ambient.setState({ daylight: daylightNow, flying: magic.flying, combat: combat.engaged > 0 && combat.health > 0 ? 1 : 0, water: Math.max(0, Math.min(1, 1 - wd / 22)) });
+        }
+        if (combat.health < lastHealth) {
+          hitUntil = elapsed + .45;
+          const flash = damageRef.current;
+          if (flash) { flash.classList.remove('hit'); void flash.offsetWidth; flash.classList.add('hit'); }
+        }
         lastHealth = combat.health;
         const pose: HeroPose = combat.health <= 0 ? 'defeat' : elapsed < hitUntil ? 'hit' : elapsed < castUntil ? 'cast' : elapsed < attackUntil ? 'attack' : elapsed < dodgeUntil ? 'dodge' : elapsed < landUntil ? 'land' : keys.has('v') ? 'guard' : magic.flying ? 'fly' : !motor.grounded ? (motor.verticalSpeed < -1 ? 'fall' : 'jump') : moving ? (keys.has('alt') || touchSprintRef.current ? 'run' : 'walk') : 'idle';
-        hero.update(elapsed, delta, pose, Math.hypot(motor.velocity.x, motor.velocity.z));
+        const overlay = magic.charging ? { mode: 'charge' as const, power: magic.chargeLevel } : magic.beamActive ? { mode: 'beam' as const, power: magic.beamPower } : magic.shieldActive && elapsed > castUntil && !magic.flying ? { mode: 'shield' as const, power: magic.shieldDurability } : undefined;
+        hero.update(elapsed, delta, pose, Math.hypot(motor.velocity.x, motor.velocity.z), overlay);
+        ambient.setBeam(magic.charging ? 1 : magic.beamActive ? 2 : 0, magic.charging ? magic.chargeLevel : magic.beamPower);
         magic.update(delta, elapsed);
+        combat.barrier = magic.shieldBarrier(shieldBarrier);
         combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to));
         updateWorld(world, elapsed);
         cycleTick += delta;
-        if (cycleTick >= 1) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); setDayLabel(cycle.label); }
+        if (cycleTick >= 1) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); setDayLabel(cycle.label); daylightNow = cycle.daylight; }
         const distanceToMarker = Math.hypot(hero.root.position.x, hero.root.position.z + 12);
         const near = distanceToMarker < 4.6;
         if (near !== isNearMarker) { isNearMarker = near; setNearLandmark(near); }
         hudTick += delta;
-        if (hudTick > .16) { hudTick = 0; setCombatHud({ mana: Math.round(magic.mana), health: combat.health, alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, cooldowns: { zoltraak: magic.cooldown('zoltraak'), vollzanbel: magic.cooldown('vollzanbel'), judradjim: magic.cooldown('judradjim'), shield: magic.cooldown('shield'), flight: magic.cooldown('flight') } }); setProgressionHud(progression.snapshot()); }
+        if (hudTick > .12) {
+          hudTick = 0;
+          // só re-renderiza o React quando algo visível mudou
+          const ids: SpellId[] = ['zoltraak', 'vollzanbel', 'judradjim', 'shield', 'flight'];
+          const cooldowns = {} as Record<SpellId, number>, cdFrac = {} as Record<SpellId, number>;
+          for (const id of ids) { cooldowns[id] = Math.ceil(magic.cooldown(id) * 10) / 10; cdFrac[id] = Math.round(magic.cooldownFraction(id) * 40) / 40; }
+          const hud: CombatHud = { mana: Math.round(magic.mana), health: combat.health, alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, cooldowns, cdFrac };
+          const hudKey = JSON.stringify(hud);
+          if (hudKey !== lastHudKey) { lastHudKey = hudKey; setCombatHud(hud); }
+          const snap = progression.snapshot(), snapKey = JSON.stringify(snap);
+          if (snap.level > lastLevel) ambient.sfx('levelUp'); lastLevel = snap.level;
+          if (snapKey !== lastSnapKey) { lastSnapKey = snapKey; setProgressionHud(snap); }
+        }
+        const low = combat.health > 0 && combat.health <= 30;
+        if (low !== lowHealth) { lowHealth = low; shellRef.current?.classList.toggle('low-health', low); }
       }
+      cameraRig.aim = playingAim(magic);
+      cameraRig.shake = magic.shake;
+      // mira: centro da tela com o ponteiro travado (Shift Lock); senão, segue o cursor
+      const locked = document.pointerLockElement === renderer.domElement;
+      const free = !locked && !titleRef.current && !uiOpenRef.current && mouse.inside;
+      if (free) cameraRig.aimNdc.set(mouse.x / renderer.domElement.clientWidth * 2 - 1, -(mouse.y / renderer.domElement.clientHeight) * 2 + 1);
+      else cameraRig.aimNdc.set(0, 0);
+      shellRef.current?.classList.toggle('free-cursor', free);
+      if (aimReticleRef.current) { aimReticleRef.current.style.left = free ? `${mouse.x}px` : '50%'; aimReticleRef.current.style.top = free ? `${mouse.y}px` : '50%'; }
       cameraRig.update(hero.root, delta);
+      if (elapsed < cine.until) {
+        const k = (elapsed - cine.start) / (cine.until - cine.start), h = hero.root.position, f = hero.root.rotation.y + 2.25 - k * 1.1;
+        const ease = k < .15 ? k / .15 : 1, d = 4.6 - k * .8;
+        camera.position.lerp(new THREE.Vector3(h.x + Math.sin(f) * d, h.y + .7 + k * .5, h.z + Math.cos(f) * d), ease);
+        camera.lookAt(h.x, h.y + 1.9 + k * .2, h.z);
+      } else if (shellRef.current?.classList.contains('cinematic')) shellRef.current.classList.remove('cinematic');
       if (aimReticleRef.current) {
-        aimReticleRef.current.classList.toggle('is-casting', elapsed < castUntil);
+        aimReticleRef.current.classList.toggle('is-casting', elapsed < castUntil || magic.charging || magic.beamActive);
         aimReticleRef.current.classList.toggle('is-hit', elapsed < reticleHitUntil);
+        aimReticleRef.current.classList.toggle('is-locked', cameraRig.aimLocked && (magic.charging || magic.beamActive || elapsed < castUntil));
+      }
+      if (shieldBarRef.current) {
+        const bar = shieldBarRef.current, d = magic.shieldDurability;
+        bar.classList.toggle('on', magic.shieldActive);
+        bar.classList.toggle('low', magic.shieldActive && d < .3);
+        bar.style.setProperty('--d', d.toFixed(3));
+      }
+      if (chargeRef.current) {
+        const lvl = magic.charging ? magic.chargeLevel : 0;
+        chargeRef.current.style.setProperty('--p', lvl.toFixed(3));
+        chargeRef.current.classList.toggle('on', magic.charging);
+        chargeRef.current.classList.toggle('full', lvl >= .999);
       }
       if (compassNeedleRef.current) compassNeedleRef.current.style.transform = `rotate(${-cameraRig.yaw}rad)`;
       if (compassPinRef.current) {
@@ -330,14 +597,17 @@ export default function Game() {
         compassPinRef.current.style.left = `${42 + Math.sin(markerAngle) * 14}px`;
         compassPinRef.current.style.top = `${42 - Math.cos(markerAngle) * 14}px`;
       }
+      if (renderer.shadowMap.enabled && (qualityRef.current === 'Alta' || frameCount % 2 === 0)) renderer.shadowMap.needsUpdate = true;
       composer.render();
     };
     const clock = new THREE.Clock();
     animate();
 
     return () => {
-      cancelAnimationFrame(frame); if (hintTimer) clearTimeout(hintTimer);
-      resizeObserver.disconnect(); window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp); window.removeEventListener('blur', onBlur); window.removeEventListener('pointermove', onPointerMove); window.removeEventListener('pointerup', onPointerUp);
+      disposed = true;
+      cancelAnimationFrame(frame); if (hintTimer) clearTimeout(hintTimer); if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+      applyPixelRatioRef.current = () => {};
+      resizeObserver.disconnect(); window.removeEventListener('pointerdown', unlockAudio); window.removeEventListener('keydown', unlockAudio); window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp); window.removeEventListener('blur', onBlur); window.removeEventListener('pointermove', onPointerMove); window.removeEventListener('pointerup', onPointerUp);
       document.removeEventListener('visibilitychange', onVisibility); document.removeEventListener('pointerlockchange', onPointerLock);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown); renderer.domElement.removeEventListener('wheel', onWheel); renderer.domElement.removeEventListener('contextmenu', onContext);
       if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
@@ -347,6 +617,7 @@ export default function Game() {
       progressionRef.current = null;
       castSpellRef.current = () => {};
       castAbilityRef.current = () => {};
+      zoltraakRef.current = { start: () => {}, release: () => {} };
       interactRef.current = () => {};
       attackRef.current = () => {};
       dodgeRef.current = () => {};
@@ -365,11 +636,11 @@ export default function Game() {
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer) return;
-    const ratio = quality === 'Alta' ? 1.85 : quality === 'Baixa' ? 1 : 1.45;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, ratio));
+    const ratio = quality === 'Alta' ? 1.85 : quality === 'Baixa' ? .85 : 1.3;
+    basePixelRatioRef.current = Math.min(window.devicePixelRatio || 1, ratio);
+    applyPixelRatioRef.current();
     const targets = qualityTargetsRef.current;
-    targets?.composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, ratio));
-    if (targets) targets.bloom.strength = quality === 'Baixa' ? .12 : quality === 'Alta' ? .48 : .3;
+    if (targets) { targets.bloom.enabled = quality !== 'Baixa'; targets.bloom.strength = quality === 'Alta' ? .48 : .3; }
     renderer.shadowMap.enabled = quality !== 'Baixa';
     renderer.shadowMap.needsUpdate = true;
     if (targets) {
@@ -383,59 +654,176 @@ export default function Game() {
   }, [quality]);
 
   useEffect(() => {
+    if (cameraRigRef.current) cameraRigRef.current.aimAssistCone = aimAssist ? .07 : 0;
+  }, [aimAssist]);
+
+  useEffect(() => {
     if (cameraRigRef.current) cameraRigRef.current.sensitivity = .0008 + sensitivity * .0005;
   }, [sensitivity]);
 
-  const closeMenus = () => { setHelp(false); setQuestOpen(false); setInventoryOpen(false); setSkillsOpen(false); setPaused(false); };
+  const closeMenus = () => { setHelp(false); setQuestOpen(false); setInventoryOpen(false); setSkillsOpen(false); setPaused(false); setPausePanel('main'); };
   const purchaseUpgrade = (id: UpgradeId) => {
     if (progressionRef.current?.upgrade(id)) setProgressionHud(progressionRef.current.snapshot());
   };
-  const spellButton = (spell: SpellId, key: string, label: string) => <button className={`hotkey ${combatHud.cooldowns[spell] > 0 ? 'on-cooldown' : ''}`} title={`${label} · ${combatHud.cooldowns[spell] > 0 ? `recarga ${combatHud.cooldowns[spell].toFixed(1)} s` : 'pronto'}`} onClick={() => castAbilityRef.current(spell)}><span className="slot">{key}</span><span className="slot-label">{label}</span>{combatHud.cooldowns[spell] > 0 && <small className="cooldown-label">{combatHud.cooldowns[spell].toFixed(1)}s</small>}</button>;
 
-  return <main className="game-shell">
+  const toggle = (on: boolean, flip: () => void, label: string) =>
+    <button type="button" className={`toggle ${on ? 'on' : ''}`} role="switch" aria-checked={on} aria-label={label} onClick={flip}><i /></button>;
+  const optionsPanel = () => <div className="options">
+    <div className="opt-row"><span>Qualidade gráfica<small>Sombras, bloom, densidade de vegetação</small></span>
+      <div className="segmented" role="radiogroup" aria-label="Qualidade gráfica">{(['Baixa', 'Média', 'Alta'] as Quality[]).map(q => <button type="button" key={q} role="radio" aria-checked={quality === q} className={quality === q ? 'on' : ''} onClick={() => setQuality(q)}>{q}</button>)}</div></div>
+    <div className="opt-row"><span>Sensibilidade do mouse</span><div className="range"><input type="range" min="1" max="10" value={sensitivity} aria-label="Sensibilidade do mouse" onChange={event => setSensitivity(Number(event.target.value))} /><b>{sensitivity}</b></div></div>
+    <div className="opt-row"><span>Assistência de mira<small>A mira puxa levemente para inimigos próximos dela</small></span>{toggle(aimAssist, () => setAimAssist(v => !v), 'Assistência de mira')}</div>
+    <div className="opt-row"><span>Som</span>{toggle(!muted, toggleMute, 'Som')}</div>
+    <div className="opt-row"><span>Resolução dinâmica<small>Reduz a resolução quando o FPS cai</small></span>{toggle(dynamicRes, () => setDynamicRes(v => !v), 'Resolução dinâmica')}</div>
+    <div className="opt-row"><span>Mostrar FPS</span>{toggle(showFps, () => setShowFps(v => !v), 'Mostrar FPS')}</div>
+  </div>;
+  const controlsPanel = () => <div className="controls-grid">{CONTROLS.map(([keys, label]) => <div key={label}><span className="kbds">{keys.map(k => <kbd key={k}>{k}</kbd>)}</span><span>{label}</span></div>)}</div>;
+
+  const COSTS: Record<SpellId, number> = { zoltraak: 10, vollzanbel: 34, judradjim: 27, shield: 20, flight: 12 };
+  const spellSlot = (spell: SpellId, key: string, label: string) => {
+    const cd = combatHud.cooldowns[spell], lacking = combatHud.mana < COSTS[spell];
+    return <button type="button" key={spell} className={`slot-btn ${cd > 0 ? 'cooling' : ''} ${lacking ? 'no-mana' : ''} ${spell === 'zoltraak' ? 'signature' : ''}`}
+      style={{ '--cd': combatHud.cdFrac[spell] } as CSSProperties}
+      title={`${label} · ${COSTS[spell]}${spell === 'zoltraak' ? '+' : ''} mana${cd > 0 ? ` · recarga ${cd.toFixed(1)} s` : ''}`}
+      onClick={() => castAbilityRef.current(spell)}>
+      <span className="slot-face">{ICONS[spell]}{cd > 0 && <span className="slot-cd">{cd.toFixed(1)}</span>}</span>
+      <span className="slot-key">{key}</span>
+      <span className="slot-cost">{COSTS[spell]}{spell === 'zoltraak' ? '+' : ''}</span>
+      <span className="slot-name">{label}</span>
+    </button>;
+  };
+  const playing = screen === 'playing';
+  const anyModal = help || questOpen || inventoryOpen || skillsOpen || paused;
+
+  return <main ref={shellRef} className={`game-shell ${playing ? 'is-playing' : 'is-title'}`}>
     <div className="scene" ref={hostRef} aria-label="Mundo 3D explorável dos Campos da Aurora" />
     <div className="vignette" />
-    {!(help || questOpen || inventoryOpen || skillsOpen || paused) && <div ref={aimReticleRef} className="aim-reticle" aria-hidden="true"><span className="aim-core" /><i className="aim-tick aim-top" /><i className="aim-tick aim-right" /><i className="aim-tick aim-bottom" /><i className="aim-tick aim-left" /></div>}
-    <header className="topbar">
-      <div className="brand"><div className="brand-mark">✦</div><div><div className="eyebrow">UM MUNDO DEPOIS DO FIM</div><div className="brand-name">ECOS <span>DA ERA DOS HERÓIS</span></div></div></div>
-      <div className="region"><span className="region-dot" />{status.area}<div className="region-sub">Oeste · Terras de Avel</div></div>
-      <div className="top-actions"><button className="icon-button" onClick={toggleMute} aria-label={muted ? 'Ativar som' : 'Silenciar'} title={muted ? 'Ativar som' : 'Silenciar'}>{muted ? '◖' : '♫'}</button><button className="icon-button" onClick={toggleInventory} aria-label="Inventário" title="Inventário (E)">E</button><button className="icon-button" onClick={toggleSkills} aria-label="Árvore de habilidades" title="Habilidades (,)">,</button><button className="icon-button" onClick={toggleHelp} aria-label="Ajuda" title="Controles">?</button></div>
-    </header>
-    <section className="quest-card"><div className="quest-kicker"><span className="tiny-star">✦</span> MEMÓRIA ESQUECIDA</div><h1>O Que Permanece</h1><p>Encontre o Marco do Herói e desperte o Eco que repousa nas pedras.</p><div className="quest-progress"><span style={{ width: `${status.discovered * 100}%` }} /></div><div className="quest-count">{status.discovered ? '1' : '0'} <span>/ 1 memória encontrada</span></div></section>
-    <div className="compass"><div className="compass-ring"><span className="compass-n">N</span><span ref={compassNeedleRef} className="compass-needle">◆</span><span ref={compassPinRef} className="compass-pin">✦</span><span className="compass-s">S</span></div><div className="compass-label">CAMPOS DA AURORA</div></div>
-    {shiftLocked && <div className="shift-lock-indicator">SHIFT LOCK <span>ATIVO</span></div>}
-    <div className="touch-controls" aria-label="Controles de toque">
-      <div className="touch-stick" role="application" aria-label="Direcional de movimento" onPointerDown={onTouchStickDown} onPointerMove={onTouchStickMove} onPointerUp={onTouchStickUp} onPointerCancel={onTouchStickUp}><span className="touch-stick-n">N</span><span ref={touchKnobRef} className="touch-knob" /></div>
-      <div className="touch-actions">
-        {nearLandmark && <button className="touch-action touch-interact" onClick={() => interactRef.current()}>Eco · G</button>}
-        <button className="touch-action" onClick={toggleInventory}>Inventário</button>
-        <button className="touch-action" onClick={toggleSkills}>Habilidades</button>
-        <button className="touch-action" onClick={() => attackRef.current()}>Atacar</button>
-        <button className="touch-action" onClick={() => dodgeRef.current()}>Esquiva</button>
-        <button className="touch-action" onClick={() => castSpellRef.current()}>Zoltraak</button>
-        <button className="touch-action" onClick={() => castAbilityRef.current('vollzanbel')}>Fogo</button>
-        <button className="touch-action" onClick={() => castAbilityRef.current('judradjim')}>Raio</button>
-        <button className="touch-action" onClick={() => castAbilityRef.current('shield')}>Escudo</button>
-        <button className="touch-action" onClick={() => castAbilityRef.current('flight')}>Voo</button>
-        <button className="touch-action" onPointerDown={event => { event.preventDefault(); touchJumpRef.current = true; }} onClick={() => { touchJumpRef.current = true; }}>Pular</button>
-        <button className="touch-action touch-sprint" onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); touchSprintRef.current = true; }} onPointerUp={() => { touchSprintRef.current = false; }} onPointerCancel={() => { touchSprintRef.current = false; }}>Correr</button>
-        <button className="touch-action" onClick={() => setPaused(true)}>Menu</button>
+    <div ref={damageRef} className="damage-flash" aria-hidden="true" />
+    <div ref={fpsRef} className="fps-meter" hidden={!showFps} />
+    <div className="cine-bars" aria-hidden="true"><i /><i /></div>
+    <div className="spell-caption" aria-hidden="true"><small>INVOCAÇÃO DAS CHAMAS INFERNAIS</small><strong>Vollzanbel</strong></div>
+
+    {/* ======================= TELA INICIAL ======================= */}
+    {!playing && <div className="title-screen" role="dialog" aria-label="Tela inicial">
+      <div className="title-shade" />
+      <div className="title-motes" aria-hidden="true">{Array.from({ length: 22 }, (_, i) => <i key={i} style={{ '--i': i } as CSSProperties} />)}</div>
+      <svg className="title-sigil" viewBox="0 0 200 200" aria-hidden="true">
+        <circle cx="100" cy="100" r="96" /><circle cx="100" cy="100" r="90" className="thin" /><circle cx="100" cy="100" r="66" />
+        <circle cx="100" cy="100" r="30" className="thin" />
+        <polygon points="100,10 178,145 22,145" /><polygon points="100,190 22,55 178,55" />
+        <g className="ticks">{Array.from({ length: 48 }, (_, i) => <line key={i} x1="100" y1="6" x2="100" y2={i % 4 ? 11 : 15} transform={`rotate(${i * 7.5} 100 100)`} />)}</g>
+      </svg>
+      <div className="title-column">
+        <div className="title-eyebrow"><span />UM MUNDO DEPOIS DO FIM<span /></div>
+        <h1 className="title-logo"><span className="title-ecos">Ecos</span><span className="title-sub">da Era dos Heróis</span></h1>
+        <div className="title-rule" aria-hidden="true"><i />✦<i /></div>
+        {titlePanel === 'main' ? <>
+          <p className="title-quote">Quase mil anos se passaram desde a queda de Valkhor. A relva tomou os velhos caminhos e os nomes dos heróis se perderam — mas a magia ainda se lembra.</p>
+          <nav className="title-menu" aria-label="Menu principal">
+            <button type="button" className="title-btn primary" disabled={!ready} onClick={startJourney}>
+              <span className="tb-mark">✦</span>{ready ? (hasStarted ? 'Continuar jornada' : 'Iniciar jornada') : 'Despertando o mundo…'}<span className="tb-arrow">→</span>
+            </button>
+            <button type="button" className="title-btn" onClick={() => setTitlePanel('options')}><span className="tb-mark">◇</span>Opções</button>
+            <button type="button" className="title-btn" onClick={() => setTitlePanel('controls')}><span className="tb-mark">◇</span>Controles</button>
+          </nav>
+        </> : <div className="title-panel">
+          <h2>{titlePanel === 'options' ? 'Opções' : 'Controles'}</h2>
+          {titlePanel === 'options' ? optionsPanel() : controlsPanel()}
+          <button type="button" className="text-btn" onClick={() => setTitlePanel('main')}>← Voltar</button>
+        </div>}
       </div>
+      <footer className="title-footer">
+        <span>Prólogo <b>·</b> Protótipo 0.3</span>
+        <span className={ready ? 'press' : ''}>{ready ? <>Pressione <kbd>Enter</kbd> para começar</> : <><i className="loader" />Despertando o mundo…</>}</span>
+      </footer>
+    </div>}
+
+    {/* ======================= HUD ======================= */}
+    {playing && !anyModal && <div ref={aimReticleRef} className="aim-reticle" aria-hidden="true">
+      <span className="aim-core" /><i className="aim-tick aim-top" /><i className="aim-tick aim-right" /><i className="aim-tick aim-bottom" /><i className="aim-tick aim-left" />
+      <div ref={chargeRef} className="charge-ring"><span>MÁX</span></div>
+    </div>}
+    {playing && <div ref={shieldBarRef} className="shield-bar" aria-hidden="true"><span>ESCUDO</span><div><i /></div><small>−3 mana/s · solte F para desfazer</small></div>}
+    <div className={`hud ${playing ? '' : 'hud-hidden'}`}>
+      <header className="topbar">
+        <div className="brand"><div className="brand-mark">✦</div><div><div className="eyebrow">UM MUNDO DEPOIS DO FIM</div><div className="brand-name">ECOS <span>DA ERA DOS HERÓIS</span></div></div></div>
+        <div className="region"><span className="region-dot" />{status.area}<div className="region-sub">Oeste · Terras de Avel</div></div>
+        <div className="top-actions">
+          <button type="button" className="icon-button" onClick={toggleMute} aria-label={muted ? 'Ativar som' : 'Silenciar'} title={muted ? 'Ativar som' : 'Silenciar'}>{muted ? '◖' : '♫'}</button>
+          <button type="button" className="icon-button" onClick={toggleInventory} aria-label="Inventário" title="Inventário (E)">E</button>
+          <button type="button" className="icon-button" onClick={toggleSkills} aria-label="Árvore de habilidades" title="Habilidades (,)">✧</button>
+          <button type="button" className="icon-button" onClick={() => { releaseMouse(); setPaused(true); }} aria-label="Menu" title="Menu (Esc)">≡</button>
+        </div>
+      </header>
+      <section className="quest-card"><div className="quest-kicker"><span className="tiny-star">✦</span> MEMÓRIA ESQUECIDA</div><h2>O Que Permanece</h2><p>Encontre o Marco do Herói e desperte o Eco que repousa nas pedras.</p><div className="quest-progress"><span style={{ width: `${status.discovered * 100}%` }} /></div><div className="quest-count">{status.discovered ? '1' : '0'} <span>/ 1 memória encontrada</span></div></section>
+      <div className="compass"><div className="compass-ring"><span className="compass-n">N</span><span ref={compassNeedleRef} className="compass-needle">◆</span><span ref={compassPinRef} className="compass-pin">✦</span><span className="compass-s">S</span></div><div className="compass-label"><span>◷</span> {dayLabel}</div></div>
+      {shiftLocked && <div className="shift-lock-indicator">SHIFT LOCK <span>ATIVO</span></div>}
+      <div className="touch-controls" aria-label="Controles de toque">
+        <div className="touch-stick" role="application" aria-label="Direcional de movimento" onPointerDown={onTouchStickDown} onPointerMove={onTouchStickMove} onPointerUp={onTouchStickUp} onPointerCancel={onTouchStickUp}><span className="touch-stick-n">N</span><span ref={touchKnobRef} className="touch-knob" /></div>
+        <div className="touch-actions">
+          {nearLandmark && <button type="button" className="touch-action touch-interact" onClick={() => interactRef.current()}>Eco · G</button>}
+          <button type="button" className="touch-action" onClick={toggleInventory}>Inventário</button>
+          <button type="button" className="touch-action" onClick={toggleSkills}>Habilidades</button>
+          <button type="button" className="touch-action" onClick={() => attackRef.current()}>Atacar</button>
+          <button type="button" className="touch-action" onClick={() => dodgeRef.current()}>Esquiva</button>
+          <button type="button" className="touch-action touch-signature" onPointerDown={() => zoltraakRef.current.start()} onPointerUp={() => zoltraakRef.current.release()} onPointerCancel={() => zoltraakRef.current.release()} onPointerLeave={() => zoltraakRef.current.release()}>Zoltraak</button>
+          <button type="button" className="touch-action" onClick={() => castAbilityRef.current('vollzanbel')}>Fogo</button>
+          <button type="button" className="touch-action" onClick={() => castAbilityRef.current('judradjim')}>Raio</button>
+          <button type="button" className="touch-action" onPointerDown={() => shieldRef.current.start()} onPointerUp={() => shieldRef.current.release()} onPointerCancel={() => shieldRef.current.release()} onPointerLeave={() => shieldRef.current.release()}>Escudo</button>
+          <button type="button" className="touch-action" onClick={() => castAbilityRef.current('flight')}>Voo</button>
+          <button type="button" className="touch-action" onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); touchJumpRef.current = true; }} onPointerUp={() => { touchJumpRef.current = false; }} onPointerCancel={() => { touchJumpRef.current = false; }}>Pular</button>
+          <button type="button" className="touch-action touch-sprint" onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); touchSprintRef.current = true; }} onPointerUp={() => { touchSprintRef.current = false; }} onPointerCancel={() => { touchSprintRef.current = false; }}>Correr</button>
+          <button type="button" className="touch-action" onClick={() => setPaused(true)}>Menu</button>
+        </div>
+      </div>
+      <div className="bottom-left">
+        <div className="player-card">
+          <div className="portrait"><span>✧</span><b className="portrait-level" title="Nível">{progressionHud.level}</b></div>
+          <div className="player-meta">
+            <div className="player-name"><strong>Chamado</strong><span>Errante das Terras de Avel</span></div>
+            <div className="bar bar-health" aria-label={`Vida ${combatHud.health}`}><i style={{ width: `${combatHud.health}%` }} /><span>VIDA</span><b>{combatHud.health}</b></div>
+            <div className="bar bar-mana" aria-label={`Mana ${combatHud.mana}`}><i style={{ width: `${combatHud.mana / 10}%` }} /><span>MANA</span><b>{combatHud.mana}</b></div>
+            <div className="bar bar-xp" aria-label="Experiência"><i style={{ width: `${Math.min(100, progressionHud.experience / progressionHud.nextLevelXp * 100)}%` }} /><span>XP {progressionHud.experience}/{progressionHud.nextLevelXp}</span></div>
+          </div>
+        </div>
+        <div className="status-line">
+          {progressionHud.skillPoints > 0 && <button type="button" className="pill pill-gold" onClick={toggleSkills}>✦ {progressionHud.skillPoints} {progressionHud.skillPoints === 1 ? 'ponto' : 'pontos'} de habilidade</button>}
+          {combatHud.shield && <span className="pill">⬡ Escudo{combatHud.blocks > 0 ? ` · ${combatHud.blocks} bloqueios` : ''}</span>}
+          {combatHud.flying && <span className="pill">➶ Voo</span>}
+        </div>
+      </div>
+      <div className="bottom-center">
+        {nearLandmark && <div className="interaction"><span className="keycap">G</span><span>Ouvir o Eco do marco</span></div>}
+        <div className="hotbar">
+          {spellSlot('zoltraak', 'Q', 'Zoltraak')}{spellSlot('vollzanbel', '1', 'Vollzanbel')}{spellSlot('judradjim', '2', 'Judradjim')}{spellSlot('shield', 'F', 'Escudo')}{spellSlot('flight', 'R', 'Voo')}
+          <span className="hotbar-sep" aria-hidden="true" />
+          <button type="button" className="slot-btn util" onClick={toggleQuest} title="Diário de viagem (J)"><span className="slot-face">{ICONS.journal}</span><span className="slot-key">J</span><span className="slot-name">Jornada</span></button>
+          <button type="button" className="slot-btn util" onClick={toggleHelp} title="Controles (H)"><span className="slot-face">{ICONS.help}</span><span className="slot-key">H</span><span className="slot-name">Ajuda</span></button>
+        </div>
+      </div>
+      <div className="bottom-right"><div className="enemies-left"><b>{combatHud.alive}</b> ecos hostis nos campos</div></div>
+      {hint && <div className="toast"><span>✦</span>{hint}</div>}
+      {areaBanner && <div className="area-banner" aria-live="polite"><small>OESTE · TERRAS DE AVEL</small><strong>Campos da Aurora</strong><i /></div>}
     </div>
-    <div className="bottom-left"><div className="player-card"><div className="portrait">✧</div><div className="player-meta"><strong>Chamado</strong><span>Errante das Terras de Avel</span><div className="resource-row"><span>VIDA</span><div className="resource-track"><i className="health-fill" style={{ width: `${combatHud.health}%` }} /></div><b>{combatHud.health}</b></div><div className="resource-row"><span>MANA</span><div className="resource-track"><i className="mana-fill" style={{ width: `${combatHud.mana}%` }} /></div><b>{combatHud.mana}</b></div><div className="xp-row"><span>NV {progressionHud.level}</span><div className="resource-track"><i style={{ width: `${Math.min(100, progressionHud.experience / progressionHud.nextLevelXp * 100)}%` }} /></div><b>{progressionHud.experience}/{progressionHud.nextLevelXp}</b></div></div><div className="level">{progressionHud.skillPoints}<small> pontos</small></div></div>{(combatHud.shield || combatHud.flying) && <div className="active-magic">{combatHud.shield ? 'ESCUDO ATIVO' : 'VOO ATIVO'}{combatHud.blocks > 0 && <span> · {combatHud.blocks} bloqueios</span>}</div>}</div>
-    <div className="bottom-center">{nearLandmark && <div className="interaction"><span className="keycap">G</span><span>Ouvir o Eco do marco</span></div>}<div className="hotbar">{spellButton('zoltraak', 'Q', 'Zoltraak')}{spellButton('vollzanbel', '1', 'Vollzanbel')}{spellButton('judradjim', '2', 'Judradjim')}{spellButton('shield', 'F', 'Escudo')}{spellButton('flight', 'R', 'Voo')}<button className="hotkey" onClick={toggleQuest}><span className="slot">J</span><span className="slot-label">Jornada</span></button><button className="hotkey" onClick={toggleHelp}><span className="slot">H</span><span className="slot-label">Ajuda</span></button></div></div>
-    <div className="bottom-right"><div className="world-time"><span>◷</span> {dayLabel}</div><div className="weather">CAMPOS DA AURORA</div></div>
-    {hint && <div className="toast"><span>✦</span>{hint}</div>}
-    {gameError && <div className="game-error"><strong>O mundo não pôde ser carregado</strong><span>{gameError}</span><button onClick={() => window.location.reload()}>Tentar novamente</button></div>}
-    {(help || questOpen || inventoryOpen || skillsOpen || paused) && <div className="modal-backdrop" onClick={closeMenus}><div className={`modal ${(inventoryOpen || skillsOpen) ? 'progression-modal' : ''}`} role="dialog" aria-modal="true" onClick={event => event.stopPropagation()}>
-      <button className="modal-close" onClick={closeMenus} aria-label="Fechar">×</button>
-      {paused ? <><span className="modal-kicker">CAMPOS DA AURORA</span><h2>A jornada repousa.</h2><p>O Eco ainda aguarda. Ajuste a qualidade ou retome a exploração.</p><label className="quality-select">Qualidade gráfica<select value={quality} onChange={event => setQuality(event.target.value as Quality)}><option>Baixa</option><option>Média</option><option>Alta</option></select></label><label className="quality-select sensitivity-control">Sensibilidade do mouse<input type="range" min="1" max="10" value={sensitivity} onChange={event => setSensitivity(Number(event.target.value))} /><span>{sensitivity}</span></label><button className="continue" onClick={closeMenus}>RETOMAR A JORNADA <span>→</span></button></>
-        : help ? <><span className="modal-kicker">CAMINHOS DO VIAJANTE</span><h2>Um passo de cada vez.</h2><p>Enfrente lobos, bandidos e demônios. A mira central indica o alvo; aproxime-se dos cristais para recolher XP e possíveis itens raros.</p><div className="controls-grid"><div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>Mover</span></div><div><kbd>Mouse</kbd><span>Olhar ao redor</span></div><div><kbd>Roda</kbd><span>Zoom da câmera</span></div><div><kbd>Shift</kbd><span>Alternar Shift Lock</span></div><div><kbd>Alt</kbd><span>Correr / voar rápido</span></div><div><kbd>Espaço</kbd><span>Pular / subir voando</span></div><div><kbd>Ctrl</kbd><span>Descer voando</span></div><div><kbd>Q / Clique esq.</kbd><span>Zoltraak · 10 mana</span></div><div><kbd>1</kbd><span>Vollzanbel · 34 mana</span></div><div><kbd>2</kbd><span>Judradjim · 27 mana</span></div><div><kbd>F</kbd><span>Escudo · 20 mana + manutenção</span></div><div><kbd>R</kbd><span>Voo · 12 mana + manutenção</span></div><div><kbd>Clique dir.</kbd><span>Ataque com o cajado</span></div><div><kbd>X</kbd><span>Esquiva</span></div><div><kbd>V</kbd><span>Postura defensiva</span></div><div><kbd>E</kbd><span>Abrir inventário</span></div><div><kbd>,</kbd><span>Árvore de habilidades</span></div><div><kbd>G</kbd><span>Ouvir o Marco</span></div><div><kbd>J</kbd><span>Diário de viagem</span></div><div><kbd>Esc</kbd><span>Pausar e liberar cursor</span></div></div><button className="continue" onClick={closeMenus}>CONTINUAR A JORNADA <span>→</span></button></>
-        : inventoryOpen ? <><span className="modal-kicker">PERTENCES DO VIAJANTE</span><h2>Inventário</h2><p>Recolha os cristais de experiência e os itens deixados pelos inimigos.</p><div className="inventory-grid"><article className="inventory-item"><span className="item-glyph">✧</span><div><strong>Fragmento de Eco</strong><small>Resíduo de energia arcana</small></div><b>{progressionHud.inventory.echoFragment}</b></article><article className="inventory-item"><span className="item-glyph">◇</span><div><strong>Núcleo de sentinela</strong><small>Material deixado pelos Ecos</small></div><b>{progressionHud.inventory.sentinelCore}</b></article>{(Object.keys(LOOT_INFO) as LootItemId[]).map(item => <article className={`inventory-item loot-${LOOT_INFO[item].rarity.toLowerCase()}`} key={item}><span className="item-glyph">{LOOT_INFO[item].rarity === 'Épico' ? '✦' : LOOT_INFO[item].rarity === 'Raro' ? '⬡' : '◇'}</span><div><strong>{LOOT_INFO[item].name}</strong><small>{LOOT_INFO[item].rarity} · {LOOT_INFO[item].source}</small></div><b>{progressionHud.inventory[item]}</b></article>)}</div><div className="inventory-footer">Nível {progressionHud.level} <span>·</span> {progressionHud.experience}/{progressionHud.nextLevelXp} XP <span>·</span> {progressionHud.skillPoints} pontos de habilidade</div><button className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
-        : skillsOpen ? <><span className="modal-kicker">TALENTOS DO ECO · NÍVEL {progressionHud.level}</span><h2>Árvore de habilidades</h2><p>Derrote Ecos para ganhar XP. Cada nível concede 1 ponto; melhorias podem chegar ao nível {MAX_RANK}.</p><div className="skill-points">PONTOS DISPONÍVEIS <strong>{progressionHud.skillPoints}</strong></div><div className="upgrade-grid">{(['damage', 'size', 'efficiency'] as UpgradeId[]).map(id => <article className="upgrade-card" key={id}><div className="upgrade-heading"><span>{id === 'damage' ? '✦' : id === 'size' ? '⬡' : '◌'}</span><div><strong>{UPGRADE_INFO[id].title}</strong><small>NÍVEL {progressionHud.ranks[id]} / {MAX_RANK}</small></div></div><p>{UPGRADE_INFO[id].description}</p><div className="rank-track">{Array.from({ length: MAX_RANK }, (_, index) => <i key={index} className={index < progressionHud.ranks[id] ? 'filled' : ''} />)}</div><button className="upgrade-button" disabled={!progressionHud.skillPoints || progressionHud.ranks[id] >= MAX_RANK} onClick={() => purchaseUpgrade(id)}>{progressionHud.ranks[id] >= MAX_RANK ? 'NÍVEL MÁXIMO' : 'MELHORAR · 1 PONTO'}</button></article>)}</div><button className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
+
+    {gameError && <div className="game-error"><strong>O mundo não pôde ser carregado</strong><span>{gameError}</span><button type="button" onClick={() => window.location.reload()}>Tentar novamente</button></div>}
+
+    {/* ======================= MENUS ======================= */}
+    {playing && anyModal && <div className="modal-backdrop" onClick={closeMenus}><div className={`modal ${(inventoryOpen || skillsOpen) ? 'progression-modal' : ''} ${help ? 'wide-modal' : ''}`} role="dialog" aria-modal="true" onClick={event => event.stopPropagation()}>
+      <button type="button" className="modal-close" onClick={closeMenus} aria-label="Fechar">×</button>
+      {paused ? <><span className="modal-kicker">CAMPOS DA AURORA · PAUSA</span><h2>A jornada repousa.</h2>
+        {pausePanel === 'main' ? <><p>O Eco ainda aguarda entre as pedras. Respire, ajuste o que precisar e retome quando quiser.</p>
+          <div className="pause-menu">
+            <button type="button" className="continue" onClick={closeMenus}>RETOMAR A JORNADA <span>→</span></button>
+            <button type="button" className="menu-line" onClick={() => setPausePanel('options')}>Opções</button>
+            <button type="button" className="menu-line" onClick={() => setPausePanel('controls')}>Controles</button>
+            <button type="button" className="menu-line" onClick={backToTitle}>Voltar à tela inicial</button>
+          </div></>
+          : <>{pausePanel === 'options' ? optionsPanel() : controlsPanel()}<button type="button" className="text-btn" onClick={() => setPausePanel('main')}>← Voltar</button></>}</>
+        : help ? <><span className="modal-kicker">CAMINHOS DO VIAJANTE</span><h2>Um passo de cada vez.</h2><p>Enfrente lobos, bandidos e demônios. A mira central indica o alvo; aproxime-se dos cristais para recolher XP e itens raros.</p>{controlsPanel()}<button type="button" className="continue" onClick={closeMenus}>CONTINUAR A JORNADA <span>→</span></button></>
+        : inventoryOpen ? <><span className="modal-kicker">PERTENCES DO VIAJANTE</span><h2>Inventário</h2><p>Recolha os cristais de experiência e os itens deixados pelos inimigos.</p><div className="inventory-grid"><article className="inventory-item"><span className="item-glyph">✧</span><div><strong>Fragmento de Eco</strong><small>Resíduo de energia arcana</small></div><b>{progressionHud.inventory.echoFragment}</b></article><article className="inventory-item"><span className="item-glyph">◇</span><div><strong>Núcleo de sentinela</strong><small>Material deixado pelos Ecos</small></div><b>{progressionHud.inventory.sentinelCore}</b></article>{(Object.keys(LOOT_INFO) as LootItemId[]).map(item => <article className={`inventory-item loot-${LOOT_INFO[item].rarity.toLowerCase()}`} key={item}><span className="item-glyph">{LOOT_INFO[item].rarity === 'Épico' ? '✦' : LOOT_INFO[item].rarity === 'Raro' ? '⬡' : '◇'}</span><div><strong>{LOOT_INFO[item].name}</strong><small>{LOOT_INFO[item].rarity} · {LOOT_INFO[item].source}</small></div><b>{progressionHud.inventory[item]}</b></article>)}</div><div className="inventory-footer">Nível {progressionHud.level} <span>·</span> {progressionHud.experience}/{progressionHud.nextLevelXp} XP <span>·</span> {progressionHud.skillPoints} pontos de habilidade</div><button type="button" className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
+        : skillsOpen ? <><span className="modal-kicker">TALENTOS DO ECO · NÍVEL {progressionHud.level}</span><h2>Árvore de habilidades</h2><p>Derrote Ecos para ganhar XP. Cada nível concede 1 ponto; melhorias podem chegar ao nível {MAX_RANK}.</p><div className="skill-points">PONTOS DISPONÍVEIS <strong>{progressionHud.skillPoints}</strong></div><div className="upgrade-grid">{(['damage', 'size', 'efficiency'] as UpgradeId[]).map(id => <article className="upgrade-card" key={id}><div className="upgrade-heading"><span>{id === 'damage' ? '✦' : id === 'size' ? '⬡' : '◌'}</span><div><strong>{UPGRADE_INFO[id].title}</strong><small>NÍVEL {progressionHud.ranks[id]} / {MAX_RANK}</small></div></div><p>{UPGRADE_INFO[id].description}</p><div className="rank-track">{Array.from({ length: MAX_RANK }, (_, index) => <i key={index} className={index < progressionHud.ranks[id] ? 'filled' : ''} />)}</div><button type="button" className="upgrade-button" disabled={!progressionHud.skillPoints || progressionHud.ranks[id] >= MAX_RANK} onClick={() => purchaseUpgrade(id)}>{progressionHud.ranks[id] >= MAX_RANK ? 'NÍVEL MÁXIMO' : 'MELHORAR · 1 PONTO'}</button></article>)}</div><button type="button" className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
         : <><span className="modal-kicker">DIÁRIO DE VIAGEM · 01</span><h2>O Que Permanece</h2><p>Quase mil anos se passaram desde a derrota de Valkhor. A relva tomou os velhos caminhos, e os nomes dos heróis já não são lembrados.</p><p>Um marco de pedra repousa além do prado, coberto de musgo. Talvez ainda guarde uma lembrança.</p><div className="quest-objective"><span>✦</span>{status.discovered ? 'Memória do Marco do Herói despertada' : 'Encontre o Marco do Herói nos campos'}</div></>}
     </div></div>}
-    {paused && <div className="pause-stamp">PAUSADO</div>}
-    <div className="build-stamp">PRÓLOGO <span>·</span> PROTÓTIPO 0.2</div>
   </main>;
 }

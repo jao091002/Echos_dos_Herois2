@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { terrainHeight } from './world';
+import type { SfxName } from './audio';
 import type { LootItemId } from './progression';
 
 export type MobKind = 'wolf' | 'bandit' | 'demon';
@@ -158,6 +159,8 @@ const SPAWNS: Spawn[] = [
   { kind: 'demon', x: -2.5, z: -52 }, { kind: 'demon', x: 11, z: -60 },
 ];
 
+/** Diferença de altura máxima (m) para um golpe corpo-a-corpo alcançar o jogador. */
+const MELEE_HEIGHT = 2.1;
 const MOB_STATS: Record<MobKind, { hp: number; xp: number; speed: number; range: number; damage: number; cadence: number; radius: number }> = {
   wolf: { hp: 72, xp: 28, speed: 3.2, range: 1.35, damage: 5, cadence: 1.8, radius: .8 },
   bandit: { hp: 120, xp: 46, speed: 2.2, range: 2.1, damage: 9, cadence: 2.4, radius: .72 },
@@ -281,8 +284,15 @@ export class CombatSystem {
   private rings: { mesh: THREE.Mesh; material: THREE.MeshBasicMaterial; age: number; life: number; size: number }[] = [];
   private ringCursor = 0;
   private fxRoot = new THREE.Group();
+  /** Quantos inimigos vivos estão perseguindo o jogador (para a trilha de combate). */
+  get engaged() { let n = 0; for (const m of this.mobs) if (m.aggro && m.health > 0) n++; return n; }
   private tmpA = new THREE.Vector3();
   private tmpB = new THREE.Vector3();
+  private segment = new THREE.Line3();
+  /** Efeitos sonoros (ligado pelo jogo ao motor de áudio). */
+  onSfx: (name: SfxName, v?: number) => void = () => {};
+  /** Barreira física (escudo) que os inimigos não atravessam; atualizada pelo jogo a cada quadro. */
+  barrier: { center: THREE.Vector3; normal: THREE.Vector3; half: number } | null = null;
   private flinchPose = newPose();
 
   constructor(private scene: THREE.Scene, private onExperience: (amount: number) => void = () => { }, private onItem: (item: LootItemId) => void = () => { }, private onPickup: (message: string) => void = () => { }) {
@@ -326,23 +336,48 @@ export class CombatSystem {
       const stats = MOB_STATS[mob.kind];
       this.tmpA.set(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? .7 : 1.15), mob.root.position.z);
       if (this.tmpA.distanceTo(point) > radius + stats.radius) continue;
-      mob.health = Math.max(0, mob.health - damage); mob.hitFlash = .18; count++;
+      this.applyHit(mob, point, damage, 1); count++;
+    }
+    return count;
+  }
+
+  /**
+   * Dano ao longo de um segmento (raios contínuos). Cada inimigo é atingido no máximo uma vez por chamada;
+   * knock escala o empurrão (raios aplicam vários "ticks" pequenos). onHit recebe o ponto de contato no raio.
+   */
+  damageSegment(from: THREE.Vector3, to: THREE.Vector3, radius: number, damage: number, knock = .35, onHit?: (point: THREE.Vector3) => void) {
+    let count = 0;
+    const seg = this.segment.set(from, to);
+    for (const mob of this.mobs) {
+      if (mob.health <= 0) continue;
+      const stats = MOB_STATS[mob.kind];
+      this.tmpA.set(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? .7 : 1.15), mob.root.position.z);
+      const contact = seg.closestPointToPoint(this.tmpA, true, this.tmpB);
+      if (contact.distanceTo(this.tmpA) > radius + stats.radius) continue;
+      onHit?.(contact);
+      this.applyHit(mob, contact, damage, knock); count++;
+    }
+    return count;
+  }
+
+  private applyHit(mob: Mob, point: THREE.Vector3, damage: number, knock: number) {
+    {
+      mob.health = Math.max(0, mob.health - damage); mob.hitFlash = .18; this.onSfx('hitEnemy', damage / 60);
       const pushX = mob.root.position.x - point.x, pushZ = mob.root.position.z - point.z;
       const pushLength = Math.hypot(pushX, pushZ);
       if (pushLength > .001) {
-        const force = 3.2 + Math.min(damage, 44) * .075;
+        const force = (3.2 + Math.min(damage, 44) * .075) * knock;
         mob.knockback.x += pushX / pushLength * force;
         mob.knockback.z += pushZ / pushLength * force;
       } else {
-        mob.knockback.x += Math.sin(mob.root.rotation.y) * 3.2;
-        mob.knockback.z += Math.cos(mob.root.rotation.y) * 3.2;
+        mob.knockback.x += Math.sin(mob.root.rotation.y) * 3.2 * knock;
+        mob.knockback.z += Math.cos(mob.root.rotation.y) * 3.2 * knock;
       }
       mob.root.scale.setScalar(1.05);
       this.particles.emit(this.tmpA, mob.kind === 'demon' ? '#ff7a5a' : '#ffe2a8', 6 + Math.min(8, Math.floor(damage / 6)), 3.2, 1.8, .4, 1);
       if (mob.health === 0) this.defeat(mob);
       else this.reactToHit(mob, damage);
     }
-    return count;
   }
 
   update(delta: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
@@ -363,6 +398,7 @@ export class CombatSystem {
       drop.root.rotation.y += dt * 1.3;
       drop.root.position.y = terrainHeight(drop.root.position.x, drop.root.position.z) + .48 + Math.sin(drop.age * 3.5) * .12;
       if (Math.hypot(drop.root.position.x - player.x, drop.root.position.z - player.z) < 1.55) {
+        this.onSfx('pickup');
         if (drop.kind === 'experience') { this.onExperience(drop.value); this.onPickup(`+${drop.value} XP`); }
         else { this.onItem(drop.kind); this.onPickup(`Item encontrado: ${LOOT_NAMES[drop.kind]}`); }
         this.removeDrop(drop, index);
@@ -458,6 +494,18 @@ export class CombatSystem {
     }
 
     // --- terrain follow + body tilt to the slope
+    // escudo sólido: empurra o inimigo para fora da muralha e anula o avanço contra ela
+    const bar = this.barrier;
+    if (bar) {
+      const r = MOB_STATS[mob.kind].radius * .8, dx = pos.x - bar.center.x, dz = pos.z - bar.center.z;
+      const depth = dx * bar.normal.x + dz * bar.normal.z, lat = -dx * bar.normal.z + dz * bar.normal.x;
+      if (Math.abs(lat) < bar.half + r * .5 && depth > -1.2 && depth < r) {
+        const push = r - depth;
+        pos.x += bar.normal.x * push; pos.z += bar.normal.z * push;
+        const into = mob.knockback.x * bar.normal.x + mob.knockback.z * bar.normal.z;
+        if (into < 0) { mob.knockback.x -= bar.normal.x * into; mob.knockback.z -= bar.normal.z * into; }
+      }
+    }
     pos.y = terrainHeight(pos.x, pos.z) + mob.air;
     const hF = terrainHeight(pos.x + sy * .7, pos.z + cy * .7), hB = terrainHeight(pos.x - sy * .7, pos.z - cy * .7);
     mob.slope = damp(mob.slope, clamp(-Math.atan2(hF - hB, 1.4), -.4, .4) * (mob.kind === 'wolf' ? .9 : .35), 8, dt);
@@ -478,7 +526,7 @@ export class CombatSystem {
     // --- attack state machine
     mob.guard = damp(mob.guard, mob.aggro && !def && mob.stagger <= 0 ? 1 : 0, 6, dt);
     if (!def) {
-      if (mob.aggro && distance <= stats.range && mob.attackTimer <= 0 && mob.stagger <= .05 && Math.abs(angleDelta) < .55) this.beginAttack(mob);
+      if (mob.aggro && distance <= stats.range && player.y - pos.y < MELEE_HEIGHT && mob.attackTimer <= 0 && mob.stagger <= .05 && Math.abs(angleDelta) < .55) this.beginAttack(mob);
     } else {
       if (!mob.attackHit && progress >= def.hitAt) { mob.attackHit = true; this.resolveStrike(mob, def, player, block); }
       if (progress >= 1) { mob.attack = null; mob.attackAge = 0; }
@@ -501,6 +549,7 @@ export class CombatSystem {
     const stats = MOB_STATS[mob.kind];
     const id: AttackId = mob.kind === 'wolf' ? 'bite' : mob.kind === 'bandit' ? (Math.random() < .5 ? 'overhead' : 'slash') : (Math.random() < .35 ? 'slam' : 'swipe');
     const def = ATTACKS[id];
+    this.onSfx(mob.kind === 'wolf' ? 'wolfAttack' : mob.kind === 'bandit' ? 'banditAttack' : 'demonAttack');
     mob.attack = def; mob.attackAge = 0; mob.attackHit = false; mob.lungeU = 0;
     mob.attackTimer = stats.cadence * (.85 + Math.random() * .3);
     const arc = mob.arc;
@@ -522,10 +571,11 @@ export class CombatSystem {
       this.particles.emit(this.tmpA, '#b9a98a', 16, 3.4, 1.6, .7, 1.7);
     }
     if (dist > range || (!def.aoe && facing < .25)) return;
+    if (player.y - root.position.y > MELEE_HEIGHT + (def.aoe ? .4 : 0)) return; // fora do alcance vertical (voando/pulando alto)
     this.tmpA.set(player.x, player.y + .9, player.z);
     this.tmpB.set(root.position.x, root.position.y + 1, root.position.z);
     if (block(this.tmpA, this.tmpB)) return;
-    this.health = Math.max(0, this.health - stats.damage * def.damage);
+    this.health = Math.max(0, this.health - stats.damage * def.damage); this.onSfx('hurt');
     this.tmpA.set(player.x, player.y + 1, player.z);
     this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
@@ -996,6 +1046,7 @@ export class CombatSystem {
    *  Death, drops, respawn, effects
    * ------------------------------------------------------------------ */
   private defeat(mob: Mob) {
+    this.onSfx('enemyDie');
     mob.root.visible = true;
     mob.deathAge = 0; mob.deathSide = Math.random() < .5 ? 1 : -1;
     mob.attack = null; mob.attackAge = 0; mob.stagger = 0;

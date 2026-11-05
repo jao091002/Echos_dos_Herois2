@@ -10,8 +10,17 @@ export class PlayerMotor {
   private readonly desired = new THREE.Vector3();
   private readonly dodgeVelocity = new THREE.Vector3();
   private dodgeTimer = 0;
+  private dodgeCooldown = 0;
   private readonly radius = .62;
+  // sensação de controle: tolerância de pulo ("coyote time"), pulo armazenado e altura variável
+  private coyote = 0;
+  private jumpBuffer = 0;
+  private jumpWasHeld = false;
+  private jumpCut = false;
+  static readonly DODGE_TIME = .3;
 
+  /** Multiplicador de velocidade (ex.: andar devagar enquanto carrega/dispara magia). */
+  speedScale = 1;
   constructor(private root: THREE.Group, private colliders: WorldCollider[]) {}
 
   reset() {
@@ -19,19 +28,27 @@ export class PlayerMotor {
     this.verticalSpeed = 0;
     this.grounded = true;
     this.dodgeTimer = 0;
+    this.dodgeCooldown = 0;
     this.dodgeVelocity.set(0, 0, 0);
   }
 
-  dodge(facingYaw: number, side: number) {
-    const angle = side === 0 ? facingYaw + Math.PI : facingYaw + (side > 0 ? Math.PI / 2 : -Math.PI / 2);
-    this.dodgeVelocity.set(Math.sin(angle) * 11, 0, Math.cos(angle) * 11);
-    this.dodgeTimer = .24;
+  get dodging() { return this.dodgeTimer > 0; }
+
+  /** Esquiva na direção do input (relativa à câmera); sem input = passo para trás. Retorna false em recarga. */
+  dodge(cameraYaw: number, forward: number, side: number, vertical = 0) {
+    if (this.dodgeCooldown > 0 || this.dodgeTimer > 0) return false;
+    let x = -Math.sin(cameraYaw) * forward + Math.cos(cameraYaw) * side, z = -Math.cos(cameraYaw) * forward - Math.sin(cameraYaw) * side;
+    if (Math.hypot(x, z) < .01) { x = Math.sin(cameraYaw); z = Math.cos(cameraYaw); }
+    const l = Math.hypot(x, z);
+    this.dodgeVelocity.set(x / l * 14, vertical * 9, z / l * 14);
+    this.dodgeTimer = PlayerMotor.DODGE_TIME; this.dodgeCooldown = .55;
+    return true;
   }
 
   update(delta: number, moveForward: number, moveSide: number, sprint: boolean, jump: boolean, facingYaw: number, flight = false, verticalInput = 0, cameraPitch = 0) {
     const dt = Math.min(delta, .05);
     const inputLength = Math.hypot(moveForward, moveSide);
-    const speed = flight ? (sprint ? 13 : 8) : (sprint ? 8.2 : 5.4);
+    const speed = (flight ? (sprint ? 13 : 8) : (sprint ? 8.2 : 5.4)) * this.speedScale;
     let moving = inputLength > .01;
 
     if (inputLength > 0) {
@@ -43,47 +60,91 @@ export class PlayerMotor {
     } else this.direction.set(0, 0, 0);
 
     if (flight) {
-      const forwardLift = -moveForward * Math.sin(cameraPitch) * (sprint ? 7.6 : 5.2);
-      this.desired.set(this.direction.x * speed, verticalInput * speed + forwardLift, this.direction.z * speed);
-      this.velocity.lerp(this.desired, 1 - Math.exp(-dt * 5));
+      // voo: segue a inclinação da câmera ao avançar, acelera com inércia, freia mais rápido, sobe/desce com Espaço/Ctrl
+      const forwardLift = -moveForward * Math.sin(cameraPitch) * speed * .95;
+      const vertical = verticalInput * speed * .8 + forwardLift;
+      this.desired.set(this.direction.x * speed, vertical, this.direction.z * speed);
+      const accelerating = this.desired.lengthSq() > this.velocity.lengthSq();
+      const rate = this.dodgeTimer > 0 ? 0 : accelerating ? 4.2 : moving || verticalInput ? 6.5 : 3.2; // parar = desliza e flutua
+      this.velocity.lerp(this.desired, 1 - Math.exp(-dt * rate));
+      if (this.dodgeTimer > 0) {
+        this.dodgeTimer = Math.max(0, this.dodgeTimer - dt);
+        const k = .5 + .9 * (this.dodgeTimer / PlayerMotor.DODGE_TIME);
+        this.velocity.set(this.dodgeVelocity.x * k, this.dodgeVelocity.y * k, this.dodgeVelocity.z * k);
+        moving = true;
+      }
+      this.dodgeCooldown = Math.max(0, this.dodgeCooldown - dt);
       this.root.position.addScaledVector(this.velocity, dt);
-      this.root.position.y = Math.max(terrainHeight(this.root.position.x, this.root.position.z) + .2, this.root.position.y);
+      const ground = terrainHeight(this.root.position.x, this.root.position.z);
+      // perto do chão ainda colide com árvores, pedras e construções (antes atravessava tudo voando)
+      if (this.root.position.y - ground < 5.5) for (const collider of this.colliders) {
+        const dx = this.root.position.x - collider.x, dz = this.root.position.z - collider.z, min = this.radius + collider.radius, d2 = dx * dx + dz * dz;
+        if (d2 < min * min) {
+          const d = Math.sqrt(d2) || .001, nx = dx / d, nz = dz / d;
+          this.root.position.x = collider.x + nx * min; this.root.position.z = collider.z + nz * min;
+          const into = this.velocity.x * nx + this.velocity.z * nz;
+          if (into < 0) { this.velocity.x -= nx * into; this.velocity.z -= nz * into; }
+        }
+      }
+      if (this.root.position.y < ground + .2) { this.root.position.y = ground + .2; if (this.velocity.y < 0) this.velocity.y = 0; }
+      if (this.root.position.y > ground + 60) { this.root.position.y = ground + 60; if (this.velocity.y > 0) this.velocity.y = 0; }
       this.verticalSpeed = this.velocity.y;
-      this.grounded = this.root.position.y <= terrainHeight(this.root.position.x, this.root.position.z) + .21;
-      return moving;
+      this.grounded = this.root.position.y <= ground + .21;
+      return moving || Math.abs(this.velocity.y) > .5;
     }
 
-    if (jump && this.grounded) {
-      this.verticalSpeed = 8.2;
-      this.grounded = false;
+    // pulo: aceita o aperto até 0,13 s antes de tocar o chão e até 0,12 s depois de sair da borda
+    const pressed = jump && !this.jumpWasHeld; this.jumpWasHeld = jump;
+    this.jumpBuffer = pressed ? .13 : Math.max(0, this.jumpBuffer - dt);
+    this.coyote = this.grounded ? .12 : Math.max(0, this.coyote - dt);
+    this.dodgeCooldown = Math.max(0, this.dodgeCooldown - dt);
+    if (this.jumpBuffer > 0 && this.coyote > 0) {
+      this.verticalSpeed = 8.6; this.grounded = false; this.coyote = 0; this.jumpBuffer = 0; this.jumpCut = false;
     }
-    this.verticalSpeed -= 22 * dt;
-    const acceleration = moving ? 14 : 18;
-    this.velocity.x = THREE.MathUtils.damp(this.velocity.x, this.direction.x * speed, acceleration, dt);
-    this.velocity.z = THREE.MathUtils.damp(this.velocity.z, this.direction.z * speed, acceleration, dt);
+    // soltar o botão cedo corta a subida (pulo curto); a queda é mais pesada que a subida
+    if (!jump && this.verticalSpeed > 2 && !this.jumpCut && !this.grounded) { this.verticalSpeed *= .5; this.jumpCut = true; }
+    this.verticalSpeed -= (this.verticalSpeed > 0 ? 22 : 31) * dt;
+    this.verticalSpeed = Math.max(this.verticalSpeed, -38);
+
+    // aceleração: rápida no chão, inversão de direção ainda mais rápida, controle reduzido no ar
+    const tx = this.direction.x * speed, tz = this.direction.z * speed;
+    const reversing = moving && this.velocity.x * tx + this.velocity.z * tz < 0;
+    const acceleration = !this.grounded ? 5.5 : reversing ? 26 : moving ? 16 : 20;
+    this.velocity.x = THREE.MathUtils.damp(this.velocity.x, tx, acceleration, dt);
+    this.velocity.z = THREE.MathUtils.damp(this.velocity.z, tz, acceleration, dt);
 
     if (this.dodgeTimer > 0) {
       this.dodgeTimer = Math.max(0, this.dodgeTimer - dt);
-      this.velocity.x = this.dodgeVelocity.x;
-      this.velocity.z = this.dodgeVelocity.z;
+      const k = .45 + .55 * (this.dodgeTimer / PlayerMotor.DODGE_TIME); // arranque forte que desacelera
+      this.velocity.x = this.dodgeVelocity.x * k;
+      this.velocity.z = this.dodgeVelocity.z * k;
       moving = true;
     }
 
-    this.root.position.x += this.velocity.x * dt;
-    this.root.position.z += this.velocity.z * dt;
-    for (const collider of this.colliders) {
-      const dx = this.root.position.x - collider.x;
-      const dz = this.root.position.z - collider.z;
-      const minDistance = this.radius + collider.radius;
-      const distanceSq = dx * dx + dz * dz;
-      if (distanceSq < minDistance * minDistance) {
-        const distance = Math.sqrt(distanceSq) || .001;
-        this.root.position.x = collider.x + dx / distance * minDistance;
-        this.root.position.z = collider.z + dz / distance * minDistance;
+    // sub-passos + duas passadas de colisão: desliza pelos obstáculos sem atravessar nem travar
+    const steps = Math.max(1, Math.ceil(Math.hypot(this.velocity.x, this.velocity.z) * dt / .25));
+    for (let st = 0; st < steps; st++) {
+      this.root.position.x += this.velocity.x * dt / steps;
+      this.root.position.z += this.velocity.z * dt / steps;
+      for (let pass = 0; pass < 2; pass++) for (const collider of this.colliders) {
+        const dx = this.root.position.x - collider.x;
+        const dz = this.root.position.z - collider.z;
+        const minDistance = this.radius + collider.radius;
+        const distanceSq = dx * dx + dz * dz;
+        if (distanceSq < minDistance * minDistance) {
+          const distance = Math.sqrt(distanceSq) || .001, nx = dx / distance, nz = dz / distance;
+          this.root.position.x = collider.x + nx * minDistance;
+          this.root.position.z = collider.z + nz * minDistance;
+          const into = this.velocity.x * nx + this.velocity.z * nz; // tira só a parte que empurra contra o obstáculo
+          if (into < 0) { this.velocity.x -= nx * into; this.velocity.z -= nz * into; }
+        }
       }
     }
 
     this.root.position.y += this.verticalSpeed * dt;
+    // desce rampas sem "quicar": se estava no chão e o solo está logo abaixo, gruda nele
+    const below = terrainHeight(this.root.position.x, this.root.position.z);
+    if (this.grounded && this.verticalSpeed <= 0 && this.root.position.y - below < .35) this.root.position.y = below;
     const ground = terrainHeight(this.root.position.x, this.root.position.z);
     if (this.root.position.y <= ground) {
       this.root.position.y = ground;
@@ -112,7 +173,20 @@ export class ThirdPersonCamera {
   lockedScreenY = -.5;
   lockBlendSharpness = 9;
 
-  minPitch = -.12;
+  /** 0..1: aproxima a câmera e fecha o FOV para mirar (carregando/disparando o Zoltraak). */
+  aim = 0;
+  /** 0..1 de tremor pedido pelas magias. */
+  shake = 0;
+  /** Assistência de mira: cone (rad) em que a mira "puxa" para o inimigo mais perto do centro. 0 desliga. */
+  aimAssistCone = .07;
+  /** true quando o último getAimPoint travou em um inimigo. */
+  aimLocked = false;
+  baseFov = 49;
+
+  /** Ponto de mira na tela em coordenadas normalizadas (0,0 = centro). No modo mouse livre segue o cursor. */
+  readonly aimNdc = new THREE.Vector2(0, 0);
+
+  minPitch = -.42;
   maxPitch = .72;
   followSharpness = 12;
   collisionReleaseSharpness = 7;
@@ -129,6 +203,13 @@ export class ThirdPersonCamera {
   private collisionTimer = Infinity; // forces a raycast on the first frame
   private lockBlend = 0;
   private shiftLocked = false;
+  private aimBlend = 0;
+  private smoothY = NaN;
+  private shakeTime = 0;
+  private readonly tmpV = new THREE.Vector3();
+  private readonly tmpDir = new THREE.Vector3();
+  private readonly losRay = new THREE.Raycaster();
+  private readonly losHits: THREE.Intersection[] = [];
 
   private readonly raycaster = new THREE.Raycaster();
   private readonly target = new THREE.Vector3();
@@ -169,11 +250,17 @@ export class ThirdPersonCamera {
     // Smooth 0..1 blend so toggling Shift Lock glides instead of snapping.
     const blend = this.lockBlend = THREE.MathUtils.damp(this.lockBlend, this.shiftLocked ? 1 : 0, this.lockBlendSharpness, delta);
 
-    this.target.set(root.position.x, root.position.y + this.targetHeight, root.position.z);
+    const aim = this.aimBlend = THREE.MathUtils.damp(this.aimBlend, this.aim, 10, delta);
+    // altura do alvo suavizada: pulos não sacodem a câmera, quedas longas ainda acompanham
+    const rootY = root.position.y;
+    if (Number.isNaN(this.smoothY) || Math.abs(rootY - this.smoothY) > 4) this.smoothY = rootY;
+    else this.smoothY = THREE.MathUtils.damp(this.smoothY, rootY, rootY < this.smoothY ? 14 : 7, delta);
+    this.target.set(root.position.x, this.smoothY + this.targetHeight, root.position.z);
     this.right.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
 
-    const horizontal = Math.cos(this.pitch) * this.distance;
-    this.offset.set(Math.sin(this.yaw) * horizontal, Math.sin(this.pitch) * this.distance + .3, Math.cos(this.yaw) * horizontal);
+    const dist = this.distance * (1 - .38 * aim);
+    const horizontal = Math.cos(this.pitch) * dist;
+    this.offset.set(Math.sin(this.yaw) * horizontal, Math.sin(this.pitch) * dist + .3, Math.cos(this.yaw) * horizontal);
     this.offset.addScaledVector(this.right, THREE.MathUtils.lerp(this.shoulderOffset, this.shiftLockShoulderOffset, blend));
     const fullDistance = this.offset.length();
 
@@ -214,6 +301,15 @@ export class ThirdPersonCamera {
       this.look.addScaledVector(this.up, -this.lockedScreenY * halfH * blend);
     }
     this.camera.lookAt(this.look);
+
+    // FOV fecha ao mirar; tremor curto e amortecido
+    const fov = this.baseFov - 7 * aim;
+    if (Math.abs(this.camera.fov - fov) > .01) { this.camera.fov = fov; this.camera.updateProjectionMatrix(); }
+    if (this.shake > .001) {
+      this.shakeTime += delta;
+      const a = this.shake * this.shake * .05, t = this.shakeTime * 38;
+      this.camera.rotateX(Math.sin(t) * a); this.camera.rotateY(Math.sin(t * 1.31 + 1.7) * a * .8); this.camera.rotateZ(Math.sin(t * .77) * a * .5);
+    }
   }
 
   getAimPoint(out: THREE.Vector3, extraTargets: THREE.Object3D[] = []) {
@@ -229,19 +325,46 @@ export class ThirdPersonCamera {
       targets = this.aimScratch;
     }
 
-    this.raycaster.setFromCamera(this.screenCenter, this.camera);
+    this.raycaster.setFromCamera(this.aimNdc, this.camera);
     this.raycaster.near = .1;
     this.raycaster.far = this.aimRange;
     this.aimHits.length = 0;
     this.raycaster.intersectObjects(targets, true, this.aimHits);
 
+    let hitDistance = this.aimRange, found = false;
     for (let i = 0; i < this.aimHits.length; i++) {
       const hit = this.aimHits[i];
       const isLocallyFaded = hit.object.name === 'forest-trunks' || hit.object.name === 'field-stones';
       if (isLocallyFaded && hit.distance < 4.6) continue;
-      return out.copy(hit.point);
+      out.copy(hit.point); hitDistance = hit.distance; found = true;
+      break;
     }
-    this.raycaster.ray.at(this.aimRange, out);
+    if (!found) this.raycaster.ray.at(this.aimRange, out);
+
+    // assistência de mira: inimigo visível num cone estreito em volta da mira (mais largo de perto)
+    this.aimLocked = false;
+    if (this.aimAssistCone > 0 && extraTargets.length) {
+      const ray = this.raycaster.ray;
+      let best: THREE.Object3D | null = null, bestScore = Infinity;
+      for (const t of extraTargets) {
+        if (!t.visible || (t.parent && !t.parent.visible)) continue;
+        t.getWorldPosition(this.tmpV);
+        const toT = this.tmpV.sub(ray.origin), d = toT.length();
+        if (d < 1.5 || d > this.aimRange) continue;
+        const ang = Math.acos(THREE.MathUtils.clamp(toT.dot(ray.direction) / d, -1, 1));
+        const cone = this.aimAssistCone * (1 + 6 / d);
+        if (ang < cone && ang / cone < bestScore) { bestScore = ang / cone; best = t; }
+      }
+      if (best) {
+        best.getWorldPosition(this.tmpV);
+        const d = this.tmpV.distanceTo(ray.origin);
+        this.losRay.set(ray.origin, this.tmpDir.copy(this.tmpV).sub(ray.origin).normalize()); this.losRay.near = .1; this.losRay.far = Math.max(.2, d - .8);
+        this.losHits.length = 0;
+        this.losRay.intersectObjects(this.aimObjects, true, this.losHits);
+        const blocked = this.losHits.some(h => !((h.object.name === 'forest-trunks' || h.object.name === 'field-stones') && h.distance < 4.6));
+        if (!blocked && d <= hitDistance + 2) { out.copy(this.tmpV); this.aimLocked = true; }
+      }
+    }
     return out;
   }
 }
