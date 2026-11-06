@@ -10700,18 +10700,62 @@ class ThirdPersonCamera {
 "use strict";
 
 __turbopack_context__.s([
+    "CLEARINGS",
+    ()=>CLEARINGS,
+    "POND",
+    ()=>POND,
+    "STREAM",
+    ()=>STREAM,
+    "STREAM_BANK",
+    ()=>STREAM_BANK,
+    "TIME",
+    ()=>TIME,
+    "WATER_Y",
+    ()=>WATER_Y,
     "createWorld",
     ()=>createWorld,
+    "fbm",
+    ()=>fbm,
+    "glowTexture",
+    ()=>glowTexture,
+    "h3",
+    ()=>h3,
+    "inClearing",
+    ()=>inClearing,
+    "nearPath",
+    ()=>nearPath,
+    "patch",
+    ()=>patch,
+    "pathX",
+    ()=>pathX,
+    "pondDist",
+    ()=>pondDist,
+    "seeded",
+    ()=>seeded,
     "setWorldQuality",
     ()=>setWorldQuality,
+    "stoneify",
+    ()=>stoneify,
+    "streamDist",
+    ()=>streamDist,
+    "streamInfo",
+    ()=>streamInfo,
     "terrainHeight",
     ()=>terrainHeight,
     "updateDayCycle",
     ()=>updateDayCycle,
     "updateWorld",
-    ()=>updateWorld
+    ()=>updateWorld,
+    "vnoise",
+    ()=>vnoise
 ]);
 var __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$three$2f$build$2f$three$2e$core$2e$js__$5b$app$2d$ssr$5d$__$28$ecmascript$29$__ = __turbopack_context__.i("[project]/node_modules/three/build/three.core.js [app-ssr] (ecmascript)");
+(()=>{
+    const e = new Error("Cannot find module './world-props'");
+    e.code = 'MODULE_NOT_FOUND';
+    throw e;
+})();
+;
 ;
 const { smoothstep, lerp } = __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$three$2f$build$2f$three$2e$core$2e$js__$5b$app$2d$ssr$5d$__$28$ecmascript$29$__["MathUtils"];
 const TIME = {
@@ -10753,6 +10797,11 @@ const BLOOMS = [
     '#b9a6e0',
     '#f6c86a'
 ];
+const BIRCH = [
+    '#8fa860',
+    '#a2b56a',
+    '#7f9c55'
+];
 const ROCKS = [
     '#8a8b7e',
     '#7b7d72',
@@ -10760,7 +10809,7 @@ const ROCKS = [
     '#6f7768',
     '#847a6a'
 ];
-/* ───────────── ruído e utilidades ───────────── */ function seeded(n) {
+function seeded(n) {
     const v = Math.sin(n * 127.1 + 311.7) * 43758.5453;
     return v - Math.floor(v);
 }
@@ -10794,16 +10843,127 @@ function nearPath(x, z, pad) {
 function pondDist(x, z) {
     return Math.hypot(x - POND.x, z - POND.z);
 }
-function terrainHeight(x, z) {
+/* riacho que desce das montanhas a oeste até o lago */ const STREAM_KEYS = [
+    [
+        -104,
+        -64
+    ],
+    [
+        -86,
+        -52
+    ],
+    [
+        -72,
+        -40
+    ],
+    [
+        -61,
+        -27
+    ],
+    [
+        -53,
+        -15
+    ],
+    [
+        -45,
+        -4
+    ],
+    [
+        -38,
+        5
+    ],
+    [
+        -31,
+        11
+    ],
+    [
+        -26,
+        15
+    ]
+];
+const STREAM = new __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$three$2f$build$2f$three$2e$core$2e$js__$5b$app$2d$ssr$5d$__$28$ecmascript$29$__["SplineCurve"](STREAM_KEYS.map(([x, z])=>new __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$three$2f$build$2f$three$2e$core$2e$js__$5b$app$2d$ssr$5d$__$28$ecmascript$29$__["Vector2"](x, z))).getSpacedPoints(110);
+const STREAM_BANK = (()=>{
+    const out = [];
+    let prev = Infinity;
+    for (const p of STREAM){
+        prev = Math.min(prev, baseHeight(p.x, p.y) * .6 + .2);
+        out.push(Math.max(prev, WATER_Y + .42));
+    }
+    return out;
+})();
+const streamHit = {
+    d: Infinity,
+    bank: 0,
+    i: 0
+};
+function streamInfo(x, z) {
+    streamHit.d = Infinity;
+    if (x > -12 || z > 32 || z < -80) return streamHit;
+    let best = Infinity, bi = 0, bt = 0;
+    for(let i = 0; i < STREAM.length - 1; i++){
+        const a = STREAM[i], b = STREAM[i + 1], abx = b.x - a.x, abz = b.y - a.y;
+        const t = Math.max(0, Math.min(1, ((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz)));
+        const dx = x - a.x - abx * t, dz = z - a.y - abz * t, d = dx * dx + dz * dz;
+        if (d < best) {
+            best = d;
+            bi = i;
+            bt = t;
+        }
+    }
+    streamHit.d = Math.sqrt(best);
+    streamHit.i = bi + bt;
+    streamHit.bank = lerp(STREAM_BANK[bi], STREAM_BANK[bi + 1], bt);
+    return streamHit;
+}
+function streamDist(x, z) {
+    return streamInfo(x, z).d;
+}
+const CLEARINGS = [
+    {
+        x: 19,
+        z: 0,
+        r: 9.5
+    },
+    {
+        x: -19,
+        z: -45,
+        r: 7
+    },
+    {
+        x: 42,
+        z: -46,
+        r: 7.5
+    },
+    {
+        x: 3,
+        z: 8.5,
+        r: 1.6
+    }
+];
+function inClearing(x, z, pad = 0) {
+    return CLEARINGS.some((c)=>Math.hypot(x - c.x, z - c.z) < c.r + pad);
+}
+function baseHeight(x, z) {
     const meadowFade = smoothstep(Math.hypot(x * .72, z + 1) - 12, 0, 24);
     const edge = 1 - smoothstep(Math.hypot(x, z), 92, 124);
     const broad = Math.max(0, fbm(x * .021 + 4.3, z * .021 - 2.7) - .36) * 13;
     const detail = (fbm(x * .11 + 19, z * .11 + 7, 3) - .5) * .7;
-    const h = (broad + detail) * meadowFade * edge;
+    return (broad + detail) * meadowFade * edge;
+}
+function terrainHeight(x, z) {
+    let h = baseHeight(x, z);
+    const st = streamInfo(x, z);
+    if (st.d < 16) {
+        h = lerp(h, st.bank, 1 - smoothstep(st.d, 3.4, 16)); // vale suave até a margem
+        h -= (1 - smoothstep(st.d, 1, 3.7)) * .95; // leito
+    }
+    for (const c of CLEARINGS){
+        const k = 1 - smoothstep(Math.hypot(x - c.x, z - c.z), c.r * .55, c.r * 1.2);
+        if (k > 0) h = lerp(h, h * .25 + .05, k);
+    }
     const p = 1 - smoothstep(pondDist(x, z), POND.r * .45, POND.r * 1.7);
     return lerp(h, -1.05, p * p * (3 - 2 * p));
 }
-/* ───────────── geometria procedural ───────────── */ // Pedra lascada: deslocamento determinístico por posição (sem rachaduras) + cor por vértice + musgo no topo.
 function stoneify(g, amp, color, moss = 0) {
     g.computeBoundingBox();
     const top = g.boundingBox.max.y, span = Math.max(.01, top - g.boundingBox.min.y);
@@ -10933,7 +11093,7 @@ function glowTexture() {
     t.colorSpace = __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$three$2f$build$2f$three$2e$core$2e$js__$5b$app$2d$ssr$5d$__$28$ecmascript$29$__["SRGBColorSpace"];
     return t;
 }
-/* ───────────── materiais com vento / fade de câmera ───────────── */ function patch(material, key, o = {}) {
+function patch(material, key, o = {}) {
     const fade = !!o.fade;
     if (fade) material.alphaHash = true;
     material.onBeforeCompile = (shader)=>{
@@ -11438,15 +11598,16 @@ function createWorld(scene) {
         const a = seeded(i + 3) * Math.PI * 2, rad = 16 + seeded(i + 90) * 54;
         const x = Math.cos(a) * rad, z = Math.sin(a) * rad;
         if (Math.abs(x) < 12 && z > -22 && z < 12) continue;
-        if (pondDist(x, z) < POND.r * 1.9) continue;
+        if (pondDist(x, z) < POND.r * 1.9 || inClearing(x, z, 2) || streamDist(x, z) < 4.5) continue;
         if (fbm(x * .045 + 9, z * .045 + 3) < .42 && seeded(i + 2000) > .18) continue;
-        const y = terrainHeight(x, z), sc = .78 + seeded(i + 14) * .74, pine = y > 1.4 || seeded(i + 700) > .58, tw = sc * (pine ? .8 : 1);
+        const y = terrainHeight(x, z), sc = .78 + seeded(i + 14) * .74, pine = y > 1.4 || seeded(i + 700) > .58;
+        const birch = !pine && seeded(i + 1300) > .7, tw = sc * (pine ? .8 : birch ? .62 : 1);
         temp.position.set(x, y + 2.05 * sc, z);
         temp.scale.set(tw, 4.1 * sc, tw);
         temp.rotation.set(0, seeded(i + 500) * Math.PI, 0);
         temp.updateMatrix();
         trunks.setMatrixAt(nt, temp.matrix);
-        trunks.setColorAt(nt, tmpColor.set('#6e5038').offsetHSL(0, 0, (seeded(i + 60) - .5) * .07));
+        trunks.setColorAt(nt, tmpColor.set(birch ? '#d8d2c2' : pine ? '#5a4232' : '#6e5038').offsetHSL(0, 0, (seeded(i + 60) - .5) * .07));
         if (pine) {
             tierShapes.forEach(([ty, r, hs], k)=>{
                 temp.position.set(x, y + ty * sc, z);
@@ -11464,7 +11625,7 @@ function createWorld(scene) {
                 temp.rotation.set(0, seeded(i + layer * 19) * 6.28, 0);
                 temp.updateMatrix();
                 crowns.setMatrixAt(nc, temp.matrix);
-                crowns.setColorAt(nc++, tmpColor.set(FOLIAGE[(i + layer) % FOLIAGE.length]).offsetHSL((seeded(i + 4) - .5) * .02, 0, layer * .012 + (seeded(i + layer) - .5) * .04));
+                crowns.setColorAt(nc++, tmpColor.set(birch ? BIRCH[(i + layer) % BIRCH.length] : FOLIAGE[(i + layer) % FOLIAGE.length]).offsetHSL((seeded(i + 4) - .5) * .02, 0, layer * .012 + (seeded(i + layer) - .5) * .04));
             });
         }
         colliders.push({
@@ -11520,7 +11681,7 @@ function createWorld(scene) {
     };
     for(let i = 0; i < 70; i++){
         const x = (seeded(300 + i) - .5) * 100, z = (seeded(500 + i) - .5) * 92;
-        if (Math.abs(x) < 6 && z > -18 && z < 7 || pondDist(x, z) < POND.r * 1.0) continue;
+        if (Math.abs(x) < 6 && z > -18 && z < 7 || pondDist(x, z) < POND.r * 1.0 || inClearing(x, z, 1) || streamDist(x, z) < 3.5) continue;
         placeRock(x, z, .32 + seeded(700 + i) * .9, 900 + i);
     }
     for(let i = 0; i < 24; i++){
@@ -11552,7 +11713,7 @@ function createWorld(scene) {
     let nb = 0;
     for(let i = 0; i < 80; i++){
         const x = (seeded(7000 + i) - .5) * 110, z = (seeded(7100 + i) - .5) * 100;
-        if (Math.abs(x) < 8 && z > -22 && z < 12 || pondDist(x, z) < POND.r * 1.2 || terrainHeight(x, z) > 3) continue;
+        if (Math.abs(x) < 8 && z > -22 && z < 12 || pondDist(x, z) < POND.r * 1.2 || terrainHeight(x, z) > 3 || inClearing(x, z, .5) || streamDist(x, z) < 3.5) continue;
         const s = .45 + seeded(7200 + i) * .65;
         temp.position.set(x, terrainHeight(x, z) + s * .35, z);
         temp.scale.set(s * 1.2, s * .8, s);
@@ -11586,7 +11747,7 @@ function createWorld(scene) {
     let ng = 0;
     for(let i = 0; i < 6000; i++){
         const a = seeded(1200 + i) * 6.283, d = Math.sqrt(seeded(1600 + i)) * 44, x = Math.cos(a) * d, z = Math.sin(a) * d - 4;
-        if (nearPath(x, z, .5) || Math.hypot(x, z + 12) < 3.6 || pondDist(x, z) < POND.r * 1.15) continue;
+        if (nearPath(x, z, .5) || Math.hypot(x, z + 12) < 3.6 || pondDist(x, z) < POND.r * 1.15 || streamDist(x, z) < 2.6 || inClearing(x, z, -2.5)) continue;
         const s = .62 + seeded(1900 + i) * .8;
         temp.position.set(x, terrainHeight(x, z), z);
         temp.scale.set(s, s * (.8 + seeded(i + 2) * .6), s);
@@ -11788,6 +11949,8 @@ function createWorld(scene) {
         z: -12,
         radius: 3
     });
+    const props = createProps(scene, stoneMat, colliders, blockers);
+    props.scalable.forEach(keepMax);
     const env = {
         grass,
         grassMaterial,
@@ -11812,7 +11975,8 @@ function createWorld(scene) {
         glyphMaterial: L.glyphMaterial,
         ringMaterial: L.ringMaterial,
         stoneLight: L.stoneLight,
-        glow: 1
+        glow: 1,
+        props
     };
     scene.userData.environment = env;
     moveFliers(env, 0);
@@ -11852,6 +12016,7 @@ function setWorldQuality(scene, quality) {
     const f = quality === 'Baixa' ? .35 : quality === 'Média' ? .68 : 1;
     for (const m of env.scalable)m.count = Math.max(1, Math.floor(m.userData.maxInstances * f));
     env.motes.geometry.setDrawRange(0, Math.floor(env.motes.userData.max * f));
+    env.props.quality = f;
 }
 function updateWorld(parts, time) {
     TIME.value = time;
@@ -11868,6 +12033,7 @@ function updateWorld(parts, time) {
     env.glyphMaterial.emissiveIntensity = env.glow * pulse;
     env.ringMaterial.opacity = (.06 + .1 * env.glow) * (.8 + Math.sin(time * 1.2) * .2);
     moveFliers(env, time);
+    updateProps(env.props, time, Math.min(1, Math.max(0, (env.glow - .45) / 1.7)));
 }
 /* ───────────── ciclo dia/noite ───────────── */ const cycleSky = new __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$three$2f$build$2f$three$2e$core$2e$js__$5b$app$2d$ssr$5d$__$28$ecmascript$29$__["Color"]();
 const cycleDawn = new __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$three$2f$build$2f$three$2e$core$2e$js__$5b$app$2d$ssr$5d$__$28$ecmascript$29$__["Color"]('#e6ac91');
