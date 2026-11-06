@@ -1,6 +1,0 @@
-{
-  "version": 3,
-  "sources": [],
-  "sections": [
-    {"offset": {"line": 1, "column": 0}, "map": {"version":3,"sources":["turbopack:///[project]/src/app/globals.css"],"sourcesContent":["@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600;700&family=Cormorant+Garamond:ital,wght@0,500;1,400;1,500&family=DM+Sans:wght@400;500;600;700&display=swap');\n@import './game-ui.css';\n\n:root {\n  --ink: #f1eee2;\n  --ink-soft: #d6d2c2;\n  --muted: #aeb0a2;\n  --gold: #dcc893;\n  --gold-bright: #f1dfa6;\n  --gold-deep: #a98f55;\n  --panel: rgba(17, 23, 21, .74);\n  --panel-solid: rgba(22, 29, 26, .97);\n  --line: rgba(236, 226, 196, .18);\n  --line-strong: rgba(226, 208, 156, .45);\n  --health: #d08a78;\n  --health-deep: #8f4b42;\n  --mana: #8fc4c0;\n  --mana-deep: #3f6f73;\n  --serif: 'Cinzel', serif;\n  --story: 'Cormorant Garamond', Georgia, serif;\n  --sans: 'DM Sans', system-ui, sans-serif;\n  --ease: cubic-bezier(.2, .7, .2, 1);\n}\n\n* { box-sizing: border-box }\nhtml, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #1a211e; color: var(--ink); font-family: var(--sans) }\nbutton { font: inherit; color: inherit }\n"],"names":[],"mappings":"AAGA;;;;;;;;;;;;;;;;;;;;;AAqBA;;;;AACA;;;;;;;;;;AACA"}}]
-}
