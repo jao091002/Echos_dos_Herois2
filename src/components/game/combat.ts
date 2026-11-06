@@ -153,7 +153,15 @@ type Mob = {
   vel: THREE.Vector2; prev: THREE.Vector2; vf: number; vs: number;
   pose: Pose; mats: MatEntry[]; eyes: MatEntry[]; arc: ArcFx | null;
 };
-type Drop = { root: THREE.Group; kind: 'experience' | LootItemId; age: number; value: number; materials: THREE.Material[] };
+type Drop = { root: THREE.Group; kind: 'experience' | LootItemId; age: number; value: number; materials: THREE.Material[]; color: string };
+/**
+ * Luzes pontuais com contagem FIXA: no three.js o número de luzes faz parte da chave do shader, então criar/esconder
+ * uma luz (drop novo, mob morto ou renascendo) recompila TODOS os materiais iluminados — engasgos de vários segundos.
+ * Os drops dividem um conjunto fixo de luzes (as mais próximas da heroína recebem luz); mobs mantêm a sua luz sempre
+ * na cena, apenas apagada enquanto estão escondidos.
+ */
+const DROP_LIGHTS = 3;
+type FillLight = { light: THREE.PointLight; mob: THREE.Object3D; base: number; offset: THREE.Vector3 };
 type Spawn = { kind: MobKind; x: number; z: number };
 
 const SPAWNS: Spawn[] = [
@@ -272,6 +280,10 @@ export class CombatSystem {
   private drops: Drop[] = [];
   private root = new THREE.Group();
   private dropRoot = new THREE.Group();
+  private lightRoot = new THREE.Group();
+  private fills: FillLight[] = [];
+  private dropLights: THREE.PointLight[] = [];
+  private dropOrder: Drop[] = [];
   private geometries: THREE.BufferGeometry[] = [];
   private materials: THREE.Material[] = [];
   private sphere: THREE.SphereGeometry;
@@ -298,6 +310,8 @@ export class CombatSystem {
   private segment = new THREE.Line3();
   /** Efeitos sonoros (ligado pelo jogo ao motor de áudio). */
   onSfx: (name: SfxName, v?: number) => void = () => {};
+  /** Chamado a cada inimigo derrotado (missões contam abates por tipo). */
+  onKill: (kind: MobKind) => void = () => {};
   /** Barreira física (escudo) que os inimigos não atravessam; atualizada pelo jogo a cada quadro. */
   barrier: { center: THREE.Vector3; normal: THREE.Vector3; half: number } | null = null;
   private flinchPose = newPose();
@@ -305,6 +319,8 @@ export class CombatSystem {
   constructor(private scene: THREE.Scene, private onExperience: (amount: number) => void = () => { }, private onItem: (item: LootItemId) => void = () => { }, private onPickup: (message: string) => void = () => { }) {
     this.root.name = 'hostile-mobs'; scene.add(this.root);
     this.dropRoot.name = 'mob-drops'; scene.add(this.dropRoot);
+    this.lightRoot.name = 'mob-lights'; scene.add(this.lightRoot);
+    for (let i = 0; i < DROP_LIGHTS; i++) { const l = new THREE.PointLight('#ffffff', 0, 3); this.lightRoot.add(l); this.dropLights.push(l); }
     this.fxRoot.name = 'mob-fx'; scene.add(this.fxRoot);
     this.sphere = this.geometry(new THREE.SphereGeometry(1, 18, 12));
     this.unitCapsule = this.geometry(new THREE.CapsuleGeometry(.5, 1, 6, 12)); // radius .5, total height 2
@@ -498,6 +514,8 @@ export class CombatSystem {
   }
 
   get alive() { return this.mobs.filter(mob => mob.health > 0).length; }
+  /** Contadores para o painel de desempenho. */
+  perfStats() { return { inimigos: this.alive, drops: this.drops.length }; }
 
   respawnPlayer() { this.health = this.maxHealth; }
 
@@ -577,6 +595,18 @@ export class CombatSystem {
       }
     }
 
+    // luzes de contagem fixa (ver DROP_LIGHTS)
+    for (const f of this.fills) {
+      const on = f.mob.visible; f.light.intensity = on ? f.base : 0;
+      if (on) f.mob.localToWorld(f.light.position.copy(f.offset));
+    }
+    const order = this.dropOrder; order.length = 0; order.push(...this.drops);
+    if (order.length > DROP_LIGHTS) order.sort((a, b) => a.root.position.distanceToSquared(player) - b.root.position.distanceToSquared(player));
+    for (let i = 0; i < DROP_LIGHTS; i++) {
+      const l = this.dropLights[i], d = order[i];
+      if (!d) { l.intensity = 0; continue; }
+      l.intensity = .45; l.color.set(d.color); l.position.copy(d.root.position);
+    }
     this.particles.update(dt);
     for (const ring of this.rings) {
       if (!ring.mesh.visible) continue;
@@ -590,7 +620,8 @@ export class CombatSystem {
 
   dispose() {
     this.disposed = true;
-    this.root.removeFromParent(); this.dropRoot.removeFromParent(); this.fxRoot.removeFromParent();
+    this.root.removeFromParent(); this.dropRoot.removeFromParent(); this.fxRoot.removeFromParent(); this.lightRoot.removeFromParent();
+    this.lightRoot.traverse(o => { if ((o as THREE.PointLight).isPointLight) (o as THREE.PointLight).dispose(); });
     this.particles.mesh.dispose();
     this.geometries.forEach(geometry => geometry.dispose());
     this.materials.forEach(material => material.dispose());
@@ -942,6 +973,9 @@ export class CombatSystem {
     const root = new THREE.Group(); root.name = `${spawn.kind}-mob`; root.rotation.order = 'YXZ';
     root.position.set(spawn.x, terrainHeight(spawn.x, spawn.z), spawn.z); this.root.add(root);
     const rig = spawn.kind === 'wolf' ? this.buildWolf(root) : this.buildHumanoid(root, spawn.kind);
+    for (const light of root.children.filter(c => (c as THREE.PointLight).isPointLight) as THREE.PointLight[]) {
+      this.fills.push({ light, mob: root, base: light.intensity, offset: light.position.clone() }); this.lightRoot.add(light);
+    }
     this.targets.push(rig.target);
 
     const seen = new Set<THREE.MeshStandardMaterial>(), mats: MatEntry[] = [], eyes: MatEntry[] = [];
@@ -1221,6 +1255,7 @@ export class CombatSystem {
    * ------------------------------------------------------------------ */
   private defeat(mob: Mob) {
     this.onSfx('enemyDie');
+    this.onKill(mob.kind);
     mob.root.visible = true;
     mob.deathAge = 0; mob.deathSide = Math.random() < .5 ? 1 : -1;
     mob.attack = null; mob.attackAge = 0; mob.stagger = 0;
@@ -1258,8 +1293,7 @@ export class CombatSystem {
     this.materials.push(ringMat);
     temporaryMaterials.push(ringMat);
     const ring = new THREE.Mesh(this.ringGeometry, ringMat); ring.rotation.x = Math.PI / 2; root.add(ring);
-    const light = new THREE.PointLight(kind === 'experience' ? '#93c5a2' : LOOT[kind].color, .45, 3); root.add(light);
-    this.drops.push({ root, kind, age: Math.random() * 4, value, materials: temporaryMaterials });
+    this.drops.push({ root, kind, age: Math.random() * 4, value, materials: temporaryMaterials, color: kind === 'experience' ? '#93c5a2' : LOOT[kind].color });
   }
 
   private removeDrop(drop: Drop, index: number) {

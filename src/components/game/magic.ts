@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { terrainHeight } from './world';
 import type { SfxName } from './audio';
 import type { CombatSystem } from './combat';
@@ -332,12 +331,50 @@ function starburstTexture(seed: number): THREE.CanvasTexture {
 const INNER: Record<SigilStyle, SigilStyle> = { rune: 'arc', sun: 'rune', arc: 'rune', wind: 'rune' };
 
 /** Disposes geometry/material of an object tree, skipping anything flagged userData.keep (shared resources). */
+/*
+ * Guardião de programas de shader. No three.js um programa compilado é apagado quando o ÚLTIMO material que o usa
+ * recebe dispose(); como cada efeito de magia cria e descarta seus materiais, o feitiço seguinte recompilava tudo
+ * (engasgos de centenas de ms). O primeiro material de cada variante nunca é descartado: o programa fica vivo.
+ */
+const keptPrograms = new Map<string, THREE.Material>();
+function programKey(m: THREE.Material) {
+  const sm = m as THREE.ShaderMaterial, mm = m as THREE.MeshBasicMaterial & { fog?: boolean };
+  return [m.type, sm.isShaderMaterial ? `${sm.vertexShader}§${sm.fragmentShader}` : '', !!mm.map, m.side, m.toneMapped, m.vertexColors, m.alphaTest > 0, m.premultipliedAlpha, mm.fog].join('|');
+}
+let keeperRenderer: THREE.WebGLRenderer | null = null;
+/** Só vale guardar um material que já tem programa compilado (senão o "real" seria o último dono e o apagaria). */
+const compiled = (m: THREE.Material) => !!keeperRenderer && !!(keeperRenderer.properties.get(m) as { currentProgram?: unknown }).currentProgram;
+/*
+ * Pool de materiais dos efeitos. Material novo custa CPU no primeiro desenho (o three monta parâmetros e a chave
+ * do programa); com dezenas de efeitos por feitiço isso aparecia no topo do perfil. Materiais das fábricas
+ * (basic, fresnel, lança, fogo, raio, vazio, brilho) voltam para cá ao fim do efeito e são reaproveitados,
+ * redefinidos exatamente com os valores da fábrica.
+ */
+const matPool = new Map<string, THREE.Material[]>();
+const POOL_CAP = 64;
+function pooled<T extends THREE.Material>(kind: string, make: () => T, reset: (m: T) => void): T {
+  const m = matPool.get(kind)?.pop() as T | undefined;
+  if (m) { m.userData.inPool = false; reset(m); return m; }
+  const n = make(); n.userData.pool = kind; return n;
+}
+function retire(m: THREE.Material) {
+  if (m.userData.keep || m.userData.inPool) return;
+  const kind = m.userData.pool as string | undefined;
+  if (kind) {
+    let list = matPool.get(kind); if (!list) matPool.set(kind, list = []);
+    if (list.length < POOL_CAP) { m.userData.inPool = true; list.push(m); return; }
+  }
+  const k = programKey(m), kept = keptPrograms.get(k);
+  if (kept === m) return;
+  if (!kept && compiled(m)) { keptPrograms.set(k, m); return; }
+  m.dispose();
+}
 function disposeTree(o: THREE.Object3D) {
   o.traverse(c => {
     const m = c as THREE.Mesh;
     if (m.geometry && !(c instanceof THREE.Sprite) && !m.geometry.userData.keep) m.geometry.dispose();
     const mat = m.material as THREE.Material | THREE.Material[] | undefined;
-    if (mat) (Array.isArray(mat) ? mat : [mat]).forEach(x => { if (!x.userData.keep) x.dispose(); });
+    if (mat) (Array.isArray(mat) ? mat : [mat]).forEach(retire);
   });
 }
 
@@ -362,6 +399,8 @@ class Particles {
     this.points = new THREE.Points(geo, mat); this.points.frustumCulled = false; this.points.renderOrder = additive ? 10 : 9;
   }
   setScale(v: number) { this.uniforms.uScale.value = v; }
+  get count() { return this.n; }
+  clear() { this.n = 0; this.points.geometry.setDrawRange(0, 0); }
   emit(x: number, y: number, z: number, o: Emit) {
     if (this.n >= this.cap) return;
     const d = this.d, i = this.n++ * PS, c1 = o.c1 ?? o.c0;
@@ -434,6 +473,7 @@ export class MagicSystem {
   private readonly lastPos = new THREE.Vector3(); private readonly vel = new THREE.Vector3(); private acc = 0; private petalAcc = 0;
   // scratch
   private readonly collisionRay = new THREE.Raycaster(); private readonly box = new THREE.Box3();
+  private readonly bT = new THREE.Vector3(); private readonly bN = new THREE.Vector3(); private readonly bB = new THREE.Vector3();
   private readonly tA = new THREE.Vector3(); private readonly tB = new THREE.Vector3(); private readonly tC = new THREE.Vector3(); private readonly tN = new THREE.Vector3();
 
   constructor(private scene: THREE.Scene, private player: THREE.Group, private combat: CombatSystem, private blockers: THREE.Object3D[], private progression: PlayerProgression, private onConfirmedHit: () => void = () => {}) {
@@ -482,6 +522,16 @@ export class MagicSystem {
 
   /* ---------------- Zoltraak: carregar (segurar) e disparar (soltar) ---------------- */
   get charging() { return !!this.charge; }
+  /** Só para benchmark: zera recargas e enche a mana. */
+  debugRecharge() { for (const id of Object.keys(this.cooldowns) as SpellId[]) this.cooldowns[id] = 0; this.mana = this.maxMana; }
+  /** Contadores para o painel de desempenho. */
+  perfStats() {
+    return {
+      'partículas': this.fx.count + this.soft.count, efeitos: this.effects.length, 'projéteis': this.projectiles.length,
+      'luzes de magia': this.lights.filter(s => s.active).length,
+      'magias ativas': this.effects.length + this.projectiles.length + (this.charge ? 1 : 0) + (this.beam ? 1 : 0) + (this.shieldActive ? 1 : 0) + (this.flying ? 1 : 0),
+    };
+  }
   get chargeLevel() { return this.charge ? this.charge.level : 0; }
   get beamActive() { return !!this.beam; }
   get beamPower() { return this.beam ? this.beam.level : 0; }
@@ -493,7 +543,7 @@ export class MagicSystem {
     const g = new THREE.Group(); g.name = 'zoltraak-charge';
     const coreMat = this.voidMaterial(), core = new THREE.Mesh(this.geo.sphere, coreMat);
     const rim = new THREE.Mesh(this.geo.sphere, this.fresnelMaterial(C.starW, 3, 1.7, 1));
-    const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex.glow, color: C.starB, transparent: true, opacity: .4, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+    const glow = new THREE.Sprite(this.pSprite('s545', { map: this.tex.glow, color: C.starB, transparent: true, opacity: .4, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
     const sigilA = new THREE.Mesh(this.geo.plane, this.basic(C.starW, 0, this.tex.rune)), sigilB = new THREE.Mesh(this.geo.plane, this.basic(C.starB, 0, this.tex.arc));
     sigilA.position.z = -.12; sigilB.position.z = -.1;
     g.add(sigilA, sigilB, glow, rim, core);
@@ -526,13 +576,42 @@ export class MagicSystem {
   /** Optional: tell the system the drawing-buffer height (px, including pixel ratio) and camera FOV so particle sizes stay physically consistent. */
   setViewport(heightPx: number, fovDeg: number) { const s = heightPx / (2 * Math.tan(THREE.MathUtils.degToRad(fovDeg) / 2)); this.fx.setScale(s); this.soft.setScale(s); }
 
-  /** Optional: call once after creating the system so every spell shader is compiled up-front (no hitch on the first cast). */
-  prewarm(renderer: THREE.WebGLRenderer, camera: THREE.Camera) {
-    const holder = new THREE.Group(); holder.position.set(0, -9999, 0);
-    const mats: THREE.Material[] = [this.fireMaterial(), this.fresnelMaterial(C.fire, 2, 1, 1), this.lanceMaterial(C.paleGold, C.gold, 1), this.basic(C.gold, 1, this.tex.rune)];
+  /**
+   * Compila antes todos os shaders das magias (sem engasgo no primeiro feitiço).
+   * target: o render target onde a cena é desenhada (o do pós-processamento). O three gera variantes diferentes
+   * de shader para canvas e para render target (tone mapping / espaço de cor), então é preciso compilar para o certo.
+   */
+  prewarm(renderer: THREE.WebGLRenderer, camera: THREE.Camera, target: THREE.WebGLRenderTarget | null = null) {
+    const prevTarget = renderer.getRenderTarget(); renderer.setRenderTarget(target);
+    // executa de verdade cada efeito longe da vista (sem som, sem alvos por perto) e compila tudo o que ele cria
+    // ao longo da animação; os materiais vão para o guardião, então os programas nunca são apagados
+    keeperRenderer = renderer;
+    const sfx = this.onSfx, hit = this.onConfirmedHit, manaBefore = this.mana, cds = { ...this.cooldowns };
+    this.onSfx = () => {}; this.onConfirmedHit = () => {};
+    const far = new THREE.Vector3(0, -500, 0), far2 = new THREE.Vector3(0, -500, 6);
+    const holder = new THREE.Group(); holder.position.copy(far);
+    const mats: THREE.Material[] = [this.fireMaterial(), this.fresnelMaterial(C.fire, 2, 1, 1), this.lanceMaterial(C.paleGold, C.gold, 1), this.basic(C.gold, 1, this.tex.rune), this.basic(C.gold, 1), this.beamMaterial(C.gold, 1, 1, 1), this.voidMaterial(true)];
     mats.forEach(m => holder.add(new THREE.Mesh(this.geo.sphere, m)));
-    holder.add(new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex.glow, blending: THREE.AdditiveBlending })));
-    this.scene.add(holder); renderer.compile(this.scene, camera); this.scene.remove(holder); mats.forEach(m => m.dispose());
+    this.scene.add(holder);
+    try {
+      this.flash(far, C.gold, 1, 1); this.shock(far, UP, C.gold, 1, 1); this.dome(far, C.gold, 1, 1);
+      for (const st of ['rune', 'sun', 'arc', 'wind'] as SigilStyle[]) this.sigil(far, UP, st, C.gold, 1, 1);
+      this.zoltraakImpact(far, UP, 1); this.fireExplosion(far, UP, 1);
+      this.muzzleFx('zoltraak', far, FWD); this.muzzleFx('vollzanbel', far, FWD);
+      this.spawnProjectile('zoltraak', far, FWD, far2); this.spawnProjectile('vollzanbel', far, FWD, far2);
+      this.lightningFx(far, far2, 1); this.vollzanbelFx(far2.clone(), 1);
+      renderer.compile(this.scene, camera);
+      for (let i = 1; i <= 50; i++) { renderer.compile(this.root, camera, this.scene); this.update(.05, i * .05); }
+    } finally {
+      this.scene.remove(holder); mats.forEach(retire);
+      this.projectiles.forEach(p => { p.object.removeFromParent(); disposeTree(p.object); this.releaseLight(p.light); }); this.projectiles = [];
+      this.effects.forEach(e => { e.object.removeFromParent(); disposeTree(e.object); }); this.effects = [];
+      this.lights.forEach(sl => this.releaseLight(sl));
+      this.fx.clear(); this.soft.clear(); this.shake = 0;
+      this.mana = manaBefore; Object.assign(this.cooldowns, cds);
+      this.onSfx = sfx; this.onConfirmedHit = hit;
+      renderer.setRenderTarget(prevTarget);
+    }
   }
 
   cast(id: SpellId, origin: Vec3, direction: Vec3, target: Vec3) {
@@ -605,6 +684,8 @@ export class MagicSystem {
     disposeTree(this.shieldRoot); disposeTree(this.aura); this.shieldGround.removeFromParent(); disposeTree(this.shieldGround);
     this.fx.dispose(); this.soft.dispose();
     this.lights.forEach(s => s.light.dispose());
+    keptPrograms.forEach(m => m.dispose()); keptPrograms.clear(); keeperRenderer = null;
+    matPool.forEach(list => list.forEach(m => m.dispose())); matPool.clear();
     Object.values(this.geo).forEach(g => g.dispose()); Object.values(this.tex).forEach(t => t.dispose()); this.starTex.forEach(t => t.dispose());
   }
 
@@ -616,11 +697,17 @@ export class MagicSystem {
     const g = new THREE.CylinderGeometry(1, 1, 1, 28, 12, true); g.translate(0, .5, 0); g.rotateX(Math.PI / 2); return g;
   }
   private beamMaterial(color: THREE.Color, power: number, alpha: number, flow: number) {
+    return pooled('beam', () => this.newBeamMaterial(color, power, alpha, flow), m => { const u = m.uniforms; u.uTime.value = 0; u.uLen.value = 1; u.uAlpha.value = alpha; u.uPower.value = power; u.uFlow.value = flow; u.uColor.value.copy(color); });
+  }
+  private newBeamMaterial(color: THREE.Color, power: number, alpha: number, flow: number) {
     return new THREE.ShaderMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, vertexShader: BEAM_VS, fragmentShader: BEAM_FS,
       uniforms: { uTime: { value: 0 }, uLen: { value: 1 }, uAlpha: { value: alpha }, uPower: { value: power }, uFlow: { value: flow }, uColor: { value: color.clone() } } });
   }
   /** axial=true para o cilindro do raio; false para orbes (esferas). */
   private voidMaterial(axial = false) {
+    return pooled('void', () => this.newVoidMaterial(axial), m => { const u = m.uniforms; u.uTime.value = 0; u.uLen.value = 1; u.uAxial.value = axial ? 1 : 0; });
+  }
+  private newVoidMaterial(axial: boolean) {
     return new THREE.ShaderMaterial({ vertexShader: BEAM_VS, fragmentShader: VOID_FS, uniforms: { uTime: { value: 0 }, uLen: { value: 1 }, uAxial: { value: axial ? 1 : 0 } } });
   }
   /** Base ortonormal perpendicular a d (para espalhar partículas em volta do raio). */
@@ -689,7 +776,7 @@ export class MagicSystem {
     const tip = new THREE.Group();
     const tCore = new THREE.Mesh(this.geo.sphere, orbMat), tRim = new THREE.Mesh(this.geo.sphere, this.fresnelMaterial(C.starW, 2.6, 1.8, 1));
     tCore.scale.setScalar(1.15); tRim.scale.setScalar(1.6);
-    const tipGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex.glow, color: C.starB, transparent: true, opacity: .8, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+    const tipGlow = new THREE.Sprite(this.pSprite('s778', { map: this.tex.glow, color: C.starB, transparent: true, opacity: .8, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
     tip.add(tipGlow, tRim, tCore);
     this.root.add(g, muzzle, tip);
     const ticks = Math.ceil(life / .1);
@@ -805,15 +892,34 @@ export class MagicSystem {
     const g = new THREE.LatheGeometry(prof, 20); g.rotateX(Math.PI / 2); return g;
   }
   private basic(color: THREE.ColorRepresentation, opacity = 1, map: THREE.Texture | null = null) {
+    return pooled(map ? 'basic-map' : 'basic', () => this.newBasic(color, opacity, map), m => { m.color.set(color); m.opacity = opacity; m.map = map; });
+  }
+  /** Sprite/material básico do pool: cada ponto de chamada tem seu tipo e é redefinido com os mesmos parâmetros. */
+  private pSprite(kind: string, params: THREE.SpriteMaterialParameters) {
+    return pooled(kind, () => new THREE.SpriteMaterial(params), m => m.setValues({ opacity: 1, rotation: 0, ...params }));
+  }
+  private pBasic(kind: string, params: THREE.MeshBasicMaterialParameters) {
+    return pooled(kind, () => new THREE.MeshBasicMaterial(params), m => m.setValues({ opacity: 1, ...params }));
+  }
+  private newBasic(color: THREE.ColorRepresentation, opacity: number, map: THREE.Texture | null) {
     return new THREE.MeshBasicMaterial({ color, map, transparent: true, opacity, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, toneMapped: false });
   }
   private lanceMaterial(a: THREE.Color, b: THREE.Color, gain: number) {
+    return pooled('lance', () => this.newLanceMaterial(a, b, gain), m => { const u = m.uniforms; u.uTime.value = 0; u.uGain.value = gain; u.uA.value.copy(a); u.uB.value.copy(b); });
+  }
+  private newLanceMaterial(a: THREE.Color, b: THREE.Color, gain: number) {
     return new THREE.ShaderMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, vertexShader: LANCE_VS, fragmentShader: LANCE_FS, uniforms: { uTime: { value: 0 }, uGain: { value: gain }, uA: { value: a.clone() }, uB: { value: b.clone() } } });
   }
   private fresnelMaterial(color: THREE.Color, power: number, gain: number, alpha: number) {
+    return pooled('fresnel', () => this.newFresnelMaterial(color, power, gain, alpha), m => { const u = m.uniforms; u.uColor.value.copy(color); u.uPower.value = power; u.uGain.value = gain; u.uAlpha.value = alpha; });
+  }
+  private newFresnelMaterial(color: THREE.Color, power: number, gain: number, alpha: number) {
     return new THREE.ShaderMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, vertexShader: FRESNEL_VS, fragmentShader: FRESNEL_FS, uniforms: { uColor: { value: color.clone() }, uPower: { value: power }, uGain: { value: gain }, uAlpha: { value: alpha } } });
   }
   private fireMaterial() {
+    return pooled('fire', () => this.newFireMaterial(), m => { const u = m.uniforms; u.uT.value = 0; u.uTime.value = 0; u.uSeed.value = Math.random() * 40; });
+  }
+  private newFireMaterial() {
     return new THREE.ShaderMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, vertexShader: FIRE_VS, fragmentShader: FIRE_FS, uniforms: { uT: { value: 0 }, uTime: { value: 0 }, uSeed: { value: Math.random() * 40 } } });
   }
   private addEffect(object: THREE.Object3D, life: number, step: (t: number, dt: number) => void = () => { }) {
@@ -838,7 +944,7 @@ export class MagicSystem {
 
   /** Soft additive billboard flash. */
   private flash(pos: Vec3, color: THREE.Color, size: number, life: number) {
-    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex.glow, color, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+    const s = new THREE.Sprite(pooled('flash', () => new THREE.SpriteMaterial({ map: this.tex.glow, color, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }), m => { m.color.copy(color); m.opacity = 1; m.rotation = 0; }));
     s.position.copy(pos);
     this.addEffect(s, life, t => { s.scale.setScalar(Math.max(.01, size * (.4 + .9 * easeOutCubic(t)))); (s.material as THREE.SpriteMaterial).opacity = (1 - t) * (1 - t); });
   }
@@ -874,7 +980,7 @@ export class MagicSystem {
   private spawnProjectile(kind: 'zoltraak' | 'vollzanbel', origin: Vec3, dir: Vec3, target: Vec3) {
     const fire = kind === 'vollzanbel', size = this.progression.sizeMultiplier(), speed = fire ? 13 : 34;
     const g = new THREE.Group(); g.name = kind; g.position.copy(origin).addScaledVector(dir, .5); g.quaternion.setFromUnitVectors(FWD, dir); g.scale.setScalar(size);
-    const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex.glow, color: fire ? C.fire : C.gold, transparent: true, opacity: fire ? .6 : .55, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+    const halo = new THREE.Sprite(this.pSprite('s975', { map: this.tex.glow, color: fire ? C.fire : C.gold, transparent: true, opacity: fire ? .6 : .55, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
     halo.scale.setScalar(fire ? 3.6 : 1.8);
     const p: Projectile = {
       object: g, dir: dir.clone(), velocity: dir.clone().multiplyScalar(speed), speed, age: 0, kind, target: target.clone(), light: null, times: [], rings: [], spins: [], halo,
@@ -1030,12 +1136,39 @@ export class MagicSystem {
     return pts;
   }
 
-  /** Caminho em zigue-zague com quinas vivas (segmentos retos). */
-  private boltTube(pts: Vec3[], r: number) {
-    const path = new THREE.CurvePath<THREE.Vector3>();
-    for (let i = 0; i < pts.length - 1; i++) path.add(new THREE.LineCurve3(pts[i], pts[i + 1]));
-    const g = new THREE.TubeGeometry(path, Math.max(2, (pts.length - 1) * 2), r, 5, false);
-    g.deleteAttribute('uv'); return g;
+  /**
+   * Todos os raios de uma descarga num único tubo poligonal (5 lados, quinas vivas: um anel em cada vértice do
+   * zigue-zague, com a orientação transportada ao longo do caminho). Escreve direto no buffer — sem curvas,
+   * sem cálculo de comprimento de arco, sem fundir dezenas de geometrias — e sem normais (material não iluminado).
+   */
+  private boltGeometry(paths: { pts: Vec3[]; r: number }[], scale: number) {
+    const RAD = 5;
+    let verts = 0, tris = 0;
+    for (const p of paths) { verts += p.pts.length * RAD; tris += (p.pts.length - 1) * RAD * 2; }
+    const pos = new Float32Array(verts * 3), idx = verts > 65535 ? new Uint32Array(tris * 3) : new Uint16Array(tris * 3);
+    const t = this.bT, n = this.bN, b = this.bB;
+    let v = 0, k = 0;
+    for (const { pts, r: r0 } of paths) {
+      const r = r0 * scale, last = pts.length - 1, base = v / 3;
+      for (let i = 0; i <= last; i++) {
+        t.subVectors(pts[Math.min(i + 1, last)], pts[Math.max(i - 1, 0)]); if (t.lengthSq() < 1e-12) t.set(0, 0, 1); t.normalize();
+        if (i === 0) { n.set(0, 1, 0); if (Math.abs(t.y) > .9) n.set(1, 0, 0); }
+        n.addScaledVector(t, -n.dot(t)); if (n.lengthSq() < 1e-8) n.set(t.z, 0, -t.x); n.normalize(); b.crossVectors(t, n);
+        const p = pts[i];
+        for (let j = 0; j < RAD; j++) {
+          const a = j / RAD * TAU, c = Math.cos(a) * r, sn = Math.sin(a) * r;
+          pos[v++] = p.x + n.x * c + b.x * sn; pos[v++] = p.y + n.y * c + b.y * sn; pos[v++] = p.z + n.z * c + b.z * sn;
+        }
+      }
+      for (let i = 0; i < last; i++) for (let j = 0; j < RAD; j++) {
+        const a0 = base + i * RAD + j, a1 = base + i * RAD + (j + 1) % RAD;
+        idx[k++] = a0; idx[k++] = a0 + RAD; idx[k++] = a1; idx[k++] = a1; idx[k++] = a0 + RAD; idx[k++] = a1 + RAD;
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setIndex(new THREE.BufferAttribute(idx, 1));
+    g.computeBoundingSphere();
+    return g;
   }
 
   /**
@@ -1046,8 +1179,8 @@ export class MagicSystem {
   private buildStrike(from: Vec3, to: Vec3, size: number) {
     const R = 4.4 * size, dir = this.tC.copy(to).sub(from), len = Math.max(1, dir.length()); dir.normalize();
     this.basis(dir);
-    const e1 = this.e1.clone(), e2 = this.e2.clone(), core: THREE.BufferGeometry[] = [], glow: THREE.BufferGeometry[] = [];
-    const add = (pts: Vec3[], r: number) => { core.push(this.boltTube(pts, r)); glow.push(this.boltTube(pts, r * 3.4)); };
+    const e1 = this.e1.clone(), e2 = this.e2.clone(), paths: { pts: Vec3[]; r: number }[] = [];
+    const add = (pts: Vec3[], r: number) => { paths.push({ pts, r }); };
     const lateral = (k: number) => { const a = Math.random() * TAU; return e1.clone().multiplyScalar(Math.cos(a) * k).addScaledVector(e2, Math.sin(a) * k); };
     const mains: Vec3[][] = [];
     const nMain = 4 + Math.round(size * 2);
@@ -1075,13 +1208,12 @@ export class MagicSystem {
       for (let k = 0; k <= 8; k++) { const u = k / 8, x = to.x + Math.cos(a) * rad * u + rr(-.25, .25) * u, z = to.z + Math.sin(a) * rad * u + rr(-.25, .25) * u; pts.push(new THREE.Vector3(x, terrainHeight(x, z) + .08 + Math.random() * .08, z)); }
       add(pts, .022 * size);
     }
-    const coreMat = new THREE.MeshBasicMaterial({ color: '#f1e0ff', transparent: true, opacity: 1, depthWrite: false, toneMapped: false });
+    const coreMat = this.pBasic('b1203', { color: '#f1e0ff', transparent: true, opacity: 1, depthWrite: false, toneMapped: false });
     const glowMat = this.basic(C.boltGlow, .4);
     const group = new THREE.Group();
-    const cm = mergeGeometries(core), gm = mergeGeometries(glow);
-    core.forEach(g => g.dispose()); glow.forEach(g => g.dispose());
-    if (gm) group.add(new THREE.Mesh(gm, glowMat));
-    if (cm) { const m = new THREE.Mesh(cm, coreMat); m.renderOrder = 11; group.add(m); }
+    const cm = this.boltGeometry(paths, 1), gm = this.boltGeometry(paths, 3.4);
+    group.add(new THREE.Mesh(gm, glowMat));
+    { const m = new THREE.Mesh(cm, coreMat); m.renderOrder = 11; group.add(m); }
     return { group, coreMat, glowMat, mains };
   }
 
@@ -1100,9 +1232,9 @@ export class MagicSystem {
     const orbMat = this.voidMaterial(), orb = new THREE.Mesh(this.geo.sphere, orbMat); orb.scale.setScalar(.001); eye.add(orb);
     const ringMat = this.basic(C.bolt, 0), ring = new THREE.Mesh(new THREE.TorusGeometry(1, .09, 8, 40), ringMat); eye.add(ring);
     const ring2Mat = this.basic(C.boltGlow, 0), ring2 = new THREE.Mesh(new THREE.TorusGeometry(1.45, .035, 6, 48), ring2Mat); eye.add(ring2);
-    const burstMat = new THREE.SpriteMaterial({ map: this.starTex[0], color: '#efdcff', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+    const burstMat = this.pSprite('s1227', { map: this.starTex[0], color: '#efdcff', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
     const burst = new THREE.Sprite(burstMat); root.add(burst);
-    const hitMat = new THREE.SpriteMaterial({ map: this.starTex[1], color: '#dcc2ff', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+    const hitMat = this.pSprite('s1229', { map: this.starTex[1], color: '#dcc2ff', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
     const hitBurst = new THREE.Sprite(hitMat); hitBurst.position.copy(target).addScaledVector(UP, .8); root.add(hitBurst);
     const tipLight = this.flashLight(from, C.boltGlow, 3, LIFE, 9, true);
     let strike: ReturnType<MagicSystem['buildStrike']> | null = null, next = 0, struck = false, acc = 0;
@@ -1194,12 +1326,12 @@ export class MagicSystem {
     const to = target.clone(); to.y = Math.max(to.y, terrainHeight(to.x, to.z) + .6);
     const root = new THREE.Group(), mass = new THREE.Group(); root.add(mass);
     // núcleo branco quase puro (acima de 1 para o bloom estourar)
-    const coreMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(4, 3.8, 3.2), toneMapped: false });
+    const coreMat = this.pBasic('b1321', { color: new THREE.Color(4, 3.8, 3.2), toneMapped: false });
     const core = new THREE.Mesh(this.geo.sphere, coreMat); mass.add(core);
     // camadas de fogo turbulento (dourado → laranja) e casca brilhante
     const layers = [0, 1, 2].map(i => { const m = this.fireMaterial(); m.uniforms.uT.value = .28 + i * .14; const mesh = new THREE.Mesh(this.geo.sphere, m); mass.add(mesh); return { mesh, m, k: 1.35 + i * .45 }; });
     const shellMat = this.fresnelMaterial(C.fire, 3, .6, 1), shell = new THREE.Mesh(this.geo.sphere, shellMat); shell.visible = false; mass.add(shell);
-    const haloMat = new THREE.SpriteMaterial({ map: this.tex.glow, color: C.fireHot, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+    const haloMat = this.pSprite('s1326', { map: this.tex.glow, color: C.fireHot, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
     const halo = new THREE.Sprite(haloMat); mass.add(halo);
     let light: LightSlot | null = null, exploded = false, acc = 0, started = false;
     const start = new THREE.Vector3(), pos = new THREE.Vector3(), dir = new THREE.Vector3();
@@ -1250,7 +1382,7 @@ export class MagicSystem {
         if (this.combat.damageAt(to, R * 1.2, 110 * this.progression.damageMultiplier()) > 0) this.onConfirmedHit();
         this.fireExplosion(to.clone(), UP.clone(), R);
         // centro branco ofuscante que se expande e some
-        const flashMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(5, 4.6, 3.8), transparent: true, depthWrite: false, toneMapped: false });
+        const flashMat = this.pBasic('b1377', { color: new THREE.Color(5, 4.6, 3.8), transparent: true, depthWrite: false, toneMapped: false });
         const flashBall = new THREE.Mesh(this.geo.sphere, flashMat); flashBall.position.copy(to);
         this.addEffect(flashBall, .4, u => { flashBall.scale.setScalar(R * (.15 + .45 * easeOutCubic(u))); flashMat.opacity = (1 - u) * (1 - u) * (1 - u); });
         this.flash(to, C.fireHot, R * 2.4, .3);

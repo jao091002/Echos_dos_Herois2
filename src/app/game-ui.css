@@ -24,6 +24,7 @@
 @keyframes hit-flash { from { opacity: 1 } to { opacity: 0 } }
 
 .fps-meter { position: absolute; z-index: 9; left: 50%; top: 8px; transform: translateX(-50%); padding: 3px 9px; border: 1px solid var(--line); background: rgba(10, 14, 12, .6); font: 500 10px var(--sans); letter-spacing: .08em; color: #cfe3c8; pointer-events: none }
+.perf-panel { position: absolute; z-index: 30; right: 10px; top: 10px; margin: 0; padding: 8px 11px; min-width: 250px; border: 1px solid var(--line); background: rgba(8, 12, 10, .82); font: 500 11px/1.5 ui-monospace, Consolas, monospace; color: #d6ead0; white-space: pre; pointer-events: none }
 
 /* =========================== TELA INICIAL =========================== */
 .title-screen { position: absolute; inset: 0; z-index: 8; display: flex; align-items: center; animation: fade-in 1.2s var(--ease) }
@@ -501,4 +502,36 @@
   .tree-svg { max-height: 48vh }
   .tree-detail { max-height: none }
   .tree-modal { padding: 20px 16px }
+}
+
+/* ---- missão secundária (Aldren) e diálogo com NPC */
+.quest-card-side { top: 262px; border-left-color: rgba(167, 190, 176, .7) }
+.quest-card-side.is-ready { border-left-color: var(--gold-bright); box-shadow: 0 0 24px rgba(240, 210, 130, .12) }
+.npc-dialog { position: absolute; inset: 0; z-index: 6; display: flex; align-items: flex-end; justify-content: center; padding: 16px 16px clamp(110px, 17vh, 150px); background: linear-gradient(180deg, transparent 35%, rgba(8, 11, 10, .6)); animation: fade-in .25s ease }
+.npc-dialog-box {
+  position: relative; width: min(620px, 100%); max-height: calc(100dvh - 140px); overflow: auto; padding: 22px 28px 20px;
+  background: linear-gradient(150deg, rgba(34, 43, 38, .96), rgba(20, 27, 24, .97)); border: 1px solid var(--line-strong);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .45), inset 0 0 0 4px rgba(14, 19, 17, .6), inset 0 0 0 5px rgba(226, 208, 156, .12);
+  animation: rise .35s var(--ease) both
+}
+.npc-dialog-box p { margin: 0 0 9px; font: 400 16px/1.55 var(--story); color: #d6d3c6 }
+.npc-dialog-box p b { color: var(--gold-bright); font-weight: 600 }
+.npc-speaker { display: flex; align-items: center; gap: 12px; margin-bottom: 12px }
+.npc-speaker strong { display: block; font: 500 19px var(--serif); letter-spacing: .05em; color: #f4eedd }
+.npc-speaker small { font: 500 10px var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--muted) }
+.npc-badge { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line-strong); color: var(--gold); font-size: 14px }
+.npc-reward { margin-top: 12px; padding: 10px 13px; border: 1px solid rgba(227, 209, 154, .28); font: 500 12px var(--serif); color: #e4d8b2 }
+.npc-reward span { margin-right: 10px; font: 600 9px var(--sans); letter-spacing: .2em; color: var(--gold) }
+.npc-actions { display: flex; flex-direction: column; gap: 4px }
+.npc-actions .continue { margin-top: 16px }
+@media (max-width: 700px) {
+  .quest-card-side { top: 240px }
+  .npc-dialog-box { padding: 18px 18px 16px }
+  .npc-dialog-box p { font-size: 14px }
+}
+@media (max-height: 620px) {
+  .npc-dialog { padding-bottom: 12px }
+  .npc-dialog-box { max-height: calc(100dvh - 24px); padding: 14px 18px 12px }
+  .npc-dialog-box p { font-size: 14px; margin-bottom: 6px }
+  .npc-actions .continue { margin-top: 10px }
 }

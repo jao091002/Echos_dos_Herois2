@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -13,6 +13,12 @@ import { createHero, type HeroPose } from './hero';
 import { MagicSystem, type SpellId } from './magic';
 import { PlayerProgression, LOOT_INFO, SKILL_NODES, SKILL_BY_ID, BRANCH_INFO, type LootItemId, type ProgressionSnapshot, type SkillNode } from './progression';
 import { PlayerMotor, ThirdPersonCamera } from './simulation';
+import { PerfMonitor } from './perf-monitor';
+import { QuestGiver, type QuestStage } from './npc';
+
+/** Missão do Aldren: abater lobos perto do caminho do marco. */
+const WOLF_QUEST_GOAL = 3;
+type WolfQuest = { stage: QuestStage; kills: number; reward: number };
 import { createWorld, setWorldQuality, terrainHeight, updateWorld, updateDayCycle, pondDist, streamDist, POND, type WorldParts } from './world';
 
 type GameStatus = { area: string; discovered: number };
@@ -44,6 +50,45 @@ const CONTROLS: [string[], string][] = [
   [['E'], 'Inventário'], [[','], 'Habilidades'], [['G'], 'Ouvir o Marco'], [['J'], 'Diário de viagem'], [['Esc'], 'Pausar'],
 ];
 
+type HudStore = { get: () => CombatHud; set: (v: CombatHud) => void; subscribe: (l: () => void) => () => void };
+function createHudStore(initial: CombatHud): HudStore {
+  let value = initial; const listeners = new Set<() => void>();
+  return { get: () => value, set: v => { value = v; listeners.forEach(l => l()); }, subscribe: l => { listeners.add(l); return () => { listeners.delete(l); }; } };
+}
+const useHud = (store: HudStore) => useSyncExternalStore(store.subscribe, store.get, store.get);
+const COSTS: Record<SpellId, number> = { zoltraak: 10, vollzanbel: 34, judradjim: 27, shield: 20, flight: 12 };
+const SLOTS: [SpellId, string, string][] = [['zoltraak', 'Q', 'Zoltraak'], ['vollzanbel', '1', 'Vollzanbel'], ['judradjim', '2', 'Judradjim'], ['shield', 'F', 'Escudo'], ['flight', 'R', 'Voo']];
+function HudBars({ store }: { store: HudStore }) {
+  const h = useHud(store);
+  return <>
+    <div className="bar bar-health" aria-label={`Vida ${h.health}`}><i style={{ width: `${Math.min(100, h.health / h.maxHealth * 100)}%` }} /><span>VIDA</span><b>{h.health}</b></div>
+    <div className="bar bar-mana" aria-label={`Mana ${h.mana}`}><i style={{ width: `${Math.min(100, h.mana / h.maxMana * 100)}%` }} /><span>MANA</span><b>{h.mana}</b></div>
+  </>;
+}
+function HudPills({ store }: { store: HudStore }) {
+  const h = useHud(store);
+  return <>
+    {h.shield && <span className="pill">⬡ Escudo{h.blocks > 0 ? ` · ${h.blocks} bloqueios` : ''}</span>}
+    {h.flying && <span className="pill">➶ Voo</span>}
+  </>;
+}
+function EnemiesLeft({ store }: { store: HudStore }) {
+  const h = useHud(store);
+  return <div className="enemies-left"><b>{h.alive}</b> ecos hostis nos campos</div>;
+}
+function SpellSlot({ store, spell, hotkey, label, cast }: { store: HudStore; spell: SpellId; hotkey: string; label: string; cast: { current: (spell: SpellId) => void } }) {
+  const h = useHud(store), cd = h.cooldowns[spell], lacking = h.mana < COSTS[spell];
+  return <button type="button" className={`slot-btn ${cd > 0 ? 'cooling' : ''} ${lacking ? 'no-mana' : ''} ${spell === 'zoltraak' ? 'signature' : ''}`}
+    style={{ '--cd': h.cdFrac[spell] } as CSSProperties}
+    title={`${label} · ${COSTS[spell]}${spell === 'zoltraak' ? '+' : ''} mana${cd > 0 ? ` · recarga ${cd.toFixed(1)} s` : ''}`}
+    onClick={() => cast.current(spell)}>
+    <span className="slot-face">{ICONS[spell]}{cd > 0 && <span className="slot-cd">{cd.toFixed(1)}</span>}</span>
+    <span className="slot-key">{hotkey}</span>
+    <span className="slot-cost">{COSTS[spell]}{spell === 'zoltraak' ? '+' : ''}</span>
+    <span className="slot-name">{label}</span>
+  </button>;
+}
+
 export default function Game() {
   const hostRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -59,6 +104,9 @@ export default function Game() {
   const shieldRef = useRef({ start: () => {}, release: () => {} });
   const shieldBarRef = useRef<HTMLDivElement>(null);
   const interactRef = useRef<() => void>(() => {});
+  // diálogo com o NPC: ações expostas pelo efeito do jogo (aceitar / entregar / fechar)
+  const npcActionsRef = useRef({ accept: () => {}, turnIn: () => {}, close: () => {} });
+  const npcDialogRef = useRef(false);
   const attackRef = useRef<() => void>(() => {});
   const dodgeRef = useRef<() => void>(() => {});
   const compassNeedleRef = useRef<HTMLSpanElement>(null);
@@ -67,6 +115,7 @@ export default function Game() {
   const aimReticleRef = useRef<HTMLDivElement>(null);
   const chargeRef = useRef<HTMLDivElement>(null);
   const fpsRef = useRef<HTMLDivElement>(null);
+  const perfPanelRef = useRef<HTMLPreElement>(null);
   const shellRef = useRef<HTMLElement>(null);
   const damageRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef(true);
@@ -104,9 +153,17 @@ export default function Game() {
   const [quality, setQuality] = useState<Quality>(() => typeof navigator !== 'undefined' && ((navigator.hardwareConcurrency ?? 8) <= 4 || /Mobi|Android/i.test(navigator.userAgent)) ? 'Baixa' : 'Média');
   const [sensitivity, setSensitivity] = useState(5);
   const [gameError, setGameError] = useState('');
-  const [combatHud, setCombatHud] = useState<CombatHud>({ mana: 1000, maxMana: 1000, health: 100, maxHealth: 100, alive: 7, shield: false, flying: false, blocks: 0, cooldowns: NO_CD, cdFrac: NO_CD });
+  // HUD de combate (mana, vida, recargas) num store próprio: muda várias vezes por segundo em combate e só os
+  // componentes do HUD re-renderizam — antes o componente inteiro do jogo (menus, árvore etc.) era refeito a cada mudança
+  const hudStoreRef = useRef<HudStore | null>(null);
+  if (!hudStoreRef.current) hudStoreRef.current = createHudStore({ mana: 1000, maxMana: 1000, health: 100, maxHealth: 100, alive: 7, shield: false, flying: false, blocks: 0, cooldowns: NO_CD, cdFrac: NO_CD });
+  const hudStore = hudStoreRef.current;
   const [progressionHud, setProgressionHud] = useState<ProgressionSnapshot>({ level: 1, experience: 0, nextLevelXp: 100, skillPoints: 0, ranks: { root: 1 }, stats: new PlayerProgression().stats, inventory: { echoFragment: 0, sentinelCore: 0, wolfPelt: 0, banditToken: 0, demonAsh: 0, moonFang: 0, ancientSigil: 0, demonHeart: 0 } });
-  uiOpenRef.current = help || questOpen || inventoryOpen || skillsOpen || paused || screen === 'title';
+  const [npcDialog, setNpcDialog] = useState(false);
+  const [nearNpc, setNearNpc] = useState(false);
+  const [wolfQuest, setWolfQuest] = useState<WolfQuest>({ stage: 'available', kills: 0, reward: 0 });
+  npcDialogRef.current = npcDialog;
+  uiOpenRef.current = help || questOpen || inventoryOpen || skillsOpen || paused || npcDialog || screen === 'title';
   titleRef.current = screen === 'title';
   qualityRef.current = quality;
   dynamicResRef.current = dynamicRes;
@@ -182,6 +239,7 @@ export default function Game() {
     renderer.domElement.setAttribute('aria-label', 'Explorar os Campos da Aurora. WASD move, clique e arraste para olhar.');
     renderer.domElement.tabIndex = 0;
     host.appendChild(renderer.domElement);
+    const perf = new PerfMonitor(renderer);
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#a8b7a7');
@@ -247,8 +305,67 @@ export default function Game() {
     magic.setStaffTip(hero.spellPoint);
     magic.onSfx = (name, v) => ambient.sfx(name, v);
     combat.onSfx = (name, v) => ambient.sfx(name, v);
+
+    /* ---- NPC Aldren e a missão dos lobos (ao lado do caminho, à esquerda do ponto de partida) */
+    const npc = new QuestGiver(scene, -3.4, -1.6, Math.atan2(0 - -3.4, 2 - -1.6), world.colliders);
+    npc.load();
+    const quest: WolfQuest = { stage: 'available', kills: 0, reward: 0 };
+    const publishQuest = () => setWolfQuest({ ...quest });
+    let isNearNpc = false;
+    /** XP que leva exatamente a 2 níveis acima do atual (o que falta para o próximo + o nível seguinte inteiro). */
+    const twoLevelXp = () => (progression.nextLevelXp - progression.experience) + (100 + progression.level * 50);
+    combat.onKill = kind => {
+      if (kind !== 'wolf' || quest.stage !== 'active') return;
+      quest.kills = Math.min(WOLF_QUEST_GOAL, quest.kills + 1);
+      if (quest.kills >= WOLF_QUEST_GOAL) {
+        quest.stage = 'ready'; npc.setStage('ready');
+        showHint(`Lobos abatidos ${quest.kills}/${WOLF_QUEST_GOAL} · volte até ${npc.name}`);
+        ambient.sfx('ui');
+      } else showHint(`Lobos abatidos ${quest.kills}/${WOLF_QUEST_GOAL}`);
+      publishQuest();
+    };
+    const talkToNpc = () => {
+      if (!isNearNpc || uiOpenRef.current || combat.health <= 0) return;
+      if (magic.flying) { showHint(`Pouse para falar com ${npc.name}.`); return; }
+      ambient.start(); ambient.sfx('ui');
+      keys.clear();
+      if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
+      shiftLockActive = false; cameraRig.setShiftLock(false); setShiftLocked(false);
+      // a heroína vira para o NPC
+      hero.root.userData.facing = Math.atan2(npc.position.x - hero.root.position.x, npc.position.z - hero.root.position.z);
+      if (quest.stage === 'ready') quest.reward = twoLevelXp();
+      publishQuest();
+      npc.setTalking(true);
+      setNpcDialog(true);
+    };
+    npcActionsRef.current = {
+      accept: () => {
+        if (quest.stage !== 'available') return;
+        quest.stage = 'active'; quest.kills = 0; npc.setStage('active'); publishQuest();
+        setNpcDialog(false); npc.setTalking(false); npc.play('point');
+        ambient.sfx('ui');
+        showHint(`Missão aceita · abata ${WOLF_QUEST_GOAL} lobos na mata ao norte`);
+      },
+      turnIn: () => {
+        if (quest.stage !== 'ready') return;
+        const reward = twoLevelXp(), before = progression.level;
+        progression.recordExperience(reward);
+        quest.stage = 'done'; quest.reward = reward; npc.setStage('done'); publishQuest();
+        setNpcDialog(false); npc.setTalking(false); npc.play('cheer');
+        showHint(`Missão concluída · +${reward} XP · nível ${before} → ${progression.level}`);
+      },
+      close: () => { setNpcDialog(false); npc.setTalking(false); },
+    };
     // compila todos os shaders durante o carregamento (sem engasgos no primeiro feitiço/primeiro olhar)
-    try { magic.prewarm(renderer, camera); renderer.compile(scene, camera); } catch { /* compilação antecipada é só otimização */ }
+    // compila os shaders já para o render target do pós-processamento (onde a cena é desenhada de fato):
+    // compilar para o canvas gera outra variante (tone mapping/espaço de cor) e o jogo recompilaria tudo ao jogar
+    const precompile = (async: boolean) => {
+      const prev = renderer.getRenderTarget(); renderer.setRenderTarget(composer.readBuffer);
+      try { if (async) renderer.compileAsync(scene, camera).catch(() => {}); else renderer.compile(scene, camera); } finally { renderer.setRenderTarget(prev); }
+    };
+    try { magic.prewarm(renderer, camera, composer.readBuffer); precompile(false); } catch { /* compilação antecipada é só otimização */ }
+    // modelos GLB chegam depois: quando todos terminarem, compila seus materiais em segundo plano (sem engasgo na 1ª aparição)
+    THREE.DefaultLoadingManager.onLoad = () => { if (!disposed) precompile(true); };
     let isNearMarker = false, markerRemembered = false, shiftLockActive = false, castUntil = 0, attackUntil = 0, dodgeUntil = 0, hitUntil = 0, landUntil = 0, lastHealth = combat.health, deathTimer = 0, hudTick = 0, cycleTick = 0;
     const castAbility = (spell: SpellId) => {
       if (uiOpenRef.current || combat.health <= 0 || elapsed < cine.until) return;
@@ -322,6 +439,31 @@ export default function Game() {
     };
     castSpellRef.current = castSpell;
     castAbilityRef.current = castAbility;
+    // painel de desempenho: contadores dos sistemas + luzes pontuais realmente visíveis (cada uma pesa em todo material iluminado)
+    const countPointLights = () => { let n = 0; scene.traverseVisible(o => { if ((o as THREE.PointLight).isPointLight) n++; }); return n; };
+    perf.setExtra(() => ({ ...magic.perfStats(), ...combat.perfStats(), 'luzes pontuais': countPointLights() }));
+    if (process.env.NODE_ENV !== 'production') {
+      // ganchos de benchmark (só em desenvolvimento): cenários reproduzíveis sem depender de teclado/mouse
+      const at = new THREE.Vector3(), from = new THREE.Vector3(), dir = new THREE.Vector3();
+      (window as unknown as { __ecos?: unknown }).__ecos = {
+        perf, scene, start: () => startRef.current(),
+        teleport: (x: number, z: number, yaw?: number) => { hero.root.position.set(x, terrainHeight(x, z), z); motor.reset(); if (yaw !== undefined) cameraRig.yaw = yaw; },
+        spin: (dy: number) => { cameraRig.yaw += dy; },
+        recharge: () => magic.debugRecharge(),
+        cast: (spell: SpellId, tx: number, tz: number) => {
+          hero.ensureStaff(); hero.spellPoint.getWorldPosition(from);
+          at.set(tx, terrainHeight(tx, tz) + 1, tz); dir.copy(at).sub(from).normalize();
+          const ok = magic.cast(spell, from, dir, at); if (ok) { hero.root.userData.castKind = spell; castUntil = elapsed + .5; }
+          return ok;
+        },
+        hurt: (x: number, z: number, r: number, dmg: number) => combat.damageAt(at.set(x, terrainHeight(x, z) + 1, z), r, dmg),
+        heal: () => combat.heal(9999),
+        pointLights: countPointLights,
+        quest: () => ({ ...quest, level: progression.level, xp: progression.experience, next: progression.nextLevelXp }),
+        questKill: () => combat.onKill('wolf'),
+        npcTalk: () => { isNearNpc = true; talkToNpc(); },
+      };
+    }
     const interactMarker = () => {
       if (!isNearMarker || uiOpenRef.current) return;
       ambient.start();
@@ -331,14 +473,20 @@ export default function Game() {
         showHint('O Marco do Herói despertou uma lembrança.');
       } else showHint('O Eco repousa por um instante entre as pedras.');
     };
-    interactRef.current = interactMarker;
+    interactRef.current = () => { if (isNearNpc) talkToNpc(); else interactMarker(); };
     const onKeyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
+      if (key === 'f3') { // painel de desempenho (desenvolvedor)
+        event.preventDefault(); const panel = perfPanelRef.current;
+        if (panel) { panel.hidden = !panel.hidden; perf.attachPanel(panel.hidden ? null : panel); }
+        return;
+      }
       if (titleRef.current) { if (key === 'enter' && !event.repeat) startRef.current(); return; }
       if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'shift', 'alt', 'escape', 'h', 'j', 'e', 'g', 'q', '1', '2', 'f', 'r', 'v', 'x', 't', 'control', ','].includes(key)) event.preventDefault();
       if (event.repeat && ['escape', 'h', 'j', 'e', 'g', 'q', '1', '2', 'f', 'r', 'x', ' ', ','].includes(key)) return;
       if (key === 'escape') {
         keys.clear();
+        if (npcDialogRef.current) { npcActionsRef.current.close(); return; }
         if (modalFlagsRef.current.help || modalFlagsRef.current.quest || modalFlagsRef.current.inventory || modalFlagsRef.current.skills) { setHelp(false); setQuestOpen(false); setInventoryOpen(false); setSkillsOpen(false); }
         else if (document.pointerLockElement === renderer.domElement) { document.exitPointerLock(); setPaused(true); }
         else setPaused(value => !value);
@@ -361,6 +509,7 @@ export default function Game() {
       if (key === 'j') { releaseMouse(); setQuestOpen(value => !value); return; }
       if (key === 'e') { toggleInventory(); return; }
       if (key === ',') { toggleSkills(); return; }
+      if (key === 'g' && isNearNpc && !uiOpenRef.current) { talkToNpc(); return; }
       if (key === 'g' && isNearMarker && !uiOpenRef.current) {
         interactMarker();
         return;
@@ -443,8 +592,12 @@ export default function Game() {
     let frame = 0, frameCount = 0, fpsAcc = 0, fpsFrames = 0, emaMs = 16, resTimer = 0, firstFrame = true;
     let lastHudKey = '', lastSnapKey = '', lowHealth = false;
     const camTarget = new THREE.Vector3();
+    const draw = () => composer.render();
     const animate = () => {
       frame = requestAnimationFrame(animate);
+      perf.begin(); step(); perf.end();
+    };
+    const step = () => {
       const rawDelta = clock.getDelta(), delta = Math.min(.05, rawDelta);
       frameCount++;
 
@@ -467,17 +620,23 @@ export default function Game() {
         camera.position.lerp(camTarget, firstFrame ? 1 : 1 - Math.exp(-delta * 2.5));
         camera.lookAt(0, 3.1, -12);
         hero.update(elapsed, delta, 'idle', 0);
+        npc.update(delta, elapsed, hero.root.position);
         magic.update(delta, elapsed);
         updateWorld(world, elapsed);
         cycleTick += delta;
         if (cycleTick >= 1 || firstFrame) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); setDayLabel(cycle.label); }
         if (renderer.shadowMap.enabled && frameCount % 3 === 0) renderer.shadowMap.needsUpdate = true;
-        composer.render();
+        perf.render(draw);
         if (firstFrame) { firstFrame = false; setReady(true); }
         return;
       }
       // menus abertos: o mundo fica congelado, então basta redesenhar de vez em quando
-      if (uiOpenRef.current && frameCount % 3 !== 0) return;
+      if (npcDialogRef.current) {
+        elapsed += delta;
+        hero.update(elapsed, delta, 'idle', 0);
+        npc.update(delta, elapsed, hero.root.position);
+      }
+      if (uiOpenRef.current && !npcDialogRef.current && frameCount % 3 !== 0) return;
       if (!uiOpenRef.current) {
         elapsed += delta;
         const wasGrounded = motor.grounded, vyBefore = motor.verticalSpeed;
@@ -536,6 +695,8 @@ export default function Game() {
           if (flash) { flash.classList.remove('hit'); void flash.offsetWidth; flash.classList.add('hit'); }
         }
         lastHealth = combat.health;
+        // pose de locomoção "por baixo" de ações de parte superior (magia em movimento/voo mantém pernas e inclinação)
+        hero.root.userData.locoPose = magic.flying ? 'fly' : !motor.grounded ? 'fall' : moving ? (keys.has('alt') || touchSprintRef.current ? 'run' : 'walk') : 'idle';
         const pose: HeroPose = combat.health <= 0 ? 'defeat' : elapsed < hitUntil ? 'hit' : elapsed < castUntil ? 'cast' : elapsed < attackUntil ? 'attack' : elapsed < dodgeUntil ? 'dodge' : elapsed < landUntil ? 'land' : keys.has('v') ? 'guard' : magic.flying ? 'fly' : !motor.grounded ? (motor.verticalSpeed < -1 ? 'fall' : 'jump') : moving ? (keys.has('alt') || touchSprintRef.current ? 'run' : 'walk') : 'idle';
         const overlay = magic.charging ? { mode: 'charge' as const, power: magic.chargeLevel } : magic.beamActive ? { mode: 'beam' as const, power: magic.beamPower } : magic.shieldActive && elapsed > castUntil && !magic.flying ? { mode: 'shield' as const, power: magic.shieldDurability } : undefined;
         hero.update(elapsed, delta, pose, Math.hypot(motor.velocity.x, motor.velocity.z), overlay);
@@ -543,12 +704,15 @@ export default function Game() {
         magic.update(delta, elapsed);
         combat.barrier = magic.shieldBarrier(shieldBarrier);
         combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to));
+        npc.update(delta, elapsed, hero.root.position);
         updateWorld(world, elapsed);
         cycleTick += delta;
         if (cycleTick >= 1) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); setDayLabel(cycle.label); daylightNow = cycle.daylight; }
         const distanceToMarker = Math.hypot(hero.root.position.x, hero.root.position.z + 12);
         const near = distanceToMarker < 4.6;
         if (near !== isNearMarker) { isNearMarker = near; setNearLandmark(near); }
+        const nearN = combat.health > 0 && Math.hypot(hero.root.position.x - npc.position.x, hero.root.position.z - npc.position.z) < 3.3 && Math.abs(hero.root.position.y - npc.position.y) < 2.5;
+        if (nearN !== isNearNpc) { isNearNpc = nearN; setNearNpc(nearN); }
         hudTick += delta;
         if (hudTick > .12) {
           hudTick = 0;
@@ -558,7 +722,7 @@ export default function Game() {
           for (const id of ids) { cooldowns[id] = Math.ceil(magic.cooldown(id) * 10) / 10; cdFrac[id] = Math.round(magic.cooldownFraction(id) * 40) / 40; }
           const hud: CombatHud = { mana: Math.round(magic.mana), maxMana: Math.round(magic.maxMana), health: Math.round(combat.health), maxHealth: Math.round(combat.maxHealth), alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, cooldowns, cdFrac };
           const hudKey = JSON.stringify(hud);
-          if (hudKey !== lastHudKey) { lastHudKey = hudKey; setCombatHud(hud); }
+          if (hudKey !== lastHudKey) { lastHudKey = hudKey; hudStore.set(hud); }
           const snap = progression.snapshot(), snapKey = JSON.stringify(snap);
           if (snap.level > lastLevel) ambient.sfx('levelUp'); lastLevel = snap.level;
           if (snapKey !== lastSnapKey) { lastSnapKey = snapKey; setProgressionHud(snap); }
@@ -606,19 +770,21 @@ export default function Game() {
         compassPinRef.current.style.top = `${42 - Math.cos(markerAngle) * 14}px`;
       }
       if (renderer.shadowMap.enabled && (qualityRef.current === 'Alta' || frameCount % 2 === 0)) renderer.shadowMap.needsUpdate = true;
-      composer.render();
+      perf.render(draw);
     };
     const clock = new THREE.Clock();
     animate();
 
     return () => {
       disposed = true;
+      THREE.DefaultLoadingManager.onLoad = () => {};
       cancelAnimationFrame(frame); if (hintTimer) clearTimeout(hintTimer); if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
       applyPixelRatioRef.current = () => {};
       resizeObserver.disconnect(); window.removeEventListener('pointerdown', unlockAudio); window.removeEventListener('keydown', unlockAudio); window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp); window.removeEventListener('blur', onBlur); window.removeEventListener('pointermove', onPointerMove); window.removeEventListener('pointerup', onPointerUp);
       document.removeEventListener('visibilitychange', onVisibility); document.removeEventListener('pointerlockchange', onPointerLock);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown); renderer.domElement.removeEventListener('wheel', onWheel); renderer.domElement.removeEventListener('contextmenu', onContext);
       if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
+      perf.dispose(); if (typeof window !== 'undefined') delete (window as unknown as { __ecos?: unknown }).__ecos;
       magic.dispose(); combat.dispose(); ambient.dispose(); composer.dispose(); audioRef.current = null; rendererRef.current = null;
       qualityTargetsRef.current = null;
       cameraRigRef.current = null;
@@ -627,6 +793,8 @@ export default function Game() {
       castAbilityRef.current = () => {};
       zoltraakRef.current = { start: () => {}, release: () => {} };
       interactRef.current = () => {};
+      npc.dispose();
+      npcActionsRef.current = { accept: () => {}, turnIn: () => {}, close: () => {} };
       attackRef.current = () => {};
       dodgeRef.current = () => {};
       const geometries = new Set<THREE.BufferGeometry>(), materials = new Set<THREE.Material>(), textures = new Set<THREE.Texture>(scene.userData.gameTextures ?? []);
@@ -749,19 +917,6 @@ export default function Game() {
   </div>;
   const controlsPanel = () => <div className="controls-grid">{CONTROLS.map(([keys, label]) => <div key={label}><span className="kbds">{keys.map(k => <kbd key={k}>{k}</kbd>)}</span><span>{label}</span></div>)}</div>;
 
-  const COSTS: Record<SpellId, number> = { zoltraak: 10, vollzanbel: 34, judradjim: 27, shield: 20, flight: 12 };
-  const spellSlot = (spell: SpellId, key: string, label: string) => {
-    const cd = combatHud.cooldowns[spell], lacking = combatHud.mana < COSTS[spell];
-    return <button type="button" key={spell} className={`slot-btn ${cd > 0 ? 'cooling' : ''} ${lacking ? 'no-mana' : ''} ${spell === 'zoltraak' ? 'signature' : ''}`}
-      style={{ '--cd': combatHud.cdFrac[spell] } as CSSProperties}
-      title={`${label} · ${COSTS[spell]}${spell === 'zoltraak' ? '+' : ''} mana${cd > 0 ? ` · recarga ${cd.toFixed(1)} s` : ''}`}
-      onClick={() => castAbilityRef.current(spell)}>
-      <span className="slot-face">{ICONS[spell]}{cd > 0 && <span className="slot-cd">{cd.toFixed(1)}</span>}</span>
-      <span className="slot-key">{key}</span>
-      <span className="slot-cost">{COSTS[spell]}{spell === 'zoltraak' ? '+' : ''}</span>
-      <span className="slot-name">{label}</span>
-    </button>;
-  };
   const playing = screen === 'playing';
   const anyModal = help || questOpen || inventoryOpen || skillsOpen || paused;
 
@@ -770,6 +925,7 @@ export default function Game() {
     <div className="vignette" />
     <div ref={damageRef} className="damage-flash" aria-hidden="true" />
     <div ref={fpsRef} className="fps-meter" hidden={!showFps} />
+    <pre ref={perfPanelRef} className="perf-panel" hidden />
     <div className="cine-bars" aria-hidden="true"><i /><i /></div>
     <div className="spell-caption" aria-hidden="true"><small>INVOCAÇÃO DAS CHAMAS INFERNAIS</small><strong>Vollzanbel</strong></div>
 
@@ -826,12 +982,14 @@ export default function Game() {
         </div>
       </header>
       <section className="quest-card"><div className="quest-kicker"><span className="tiny-star">✦</span> MEMÓRIA ESQUECIDA</div><h2>O Que Permanece</h2><p>Encontre o Marco do Herói e desperte o Eco que repousa nas pedras.</p><div className="quest-progress"><span style={{ width: `${status.discovered * 100}%` }} /></div><div className="quest-count">{status.discovered ? '1' : '0'} <span>/ 1 memória encontrada</span></div></section>
+      {(wolfQuest.stage === 'active' || wolfQuest.stage === 'ready') && <section className={`quest-card quest-card-side ${wolfQuest.stage === 'ready' ? 'is-ready' : ''}`}><div className="quest-kicker"><span className="tiny-star">✦</span> PEDIDO DE ALDREN</div><h2>Uivos no Caminho</h2><p>{wolfQuest.stage === 'ready' ? 'Os lobos foram afastados. Volte até Aldren, perto do ponto de partida.' : 'Abata lobos na mata ao norte do caminho do marco.'}</p><div className="quest-progress"><span style={{ width: `${wolfQuest.kills / WOLF_QUEST_GOAL * 100}%` }} /></div><div className="quest-count">{wolfQuest.kills} <span>/ {WOLF_QUEST_GOAL} lobos abatidos</span></div></section>}
       <div className="compass"><div className="compass-ring"><span className="compass-n">N</span><span ref={compassNeedleRef} className="compass-needle">◆</span><span ref={compassPinRef} className="compass-pin">✦</span><span className="compass-s">S</span></div><div className="compass-label"><span>◷</span> {dayLabel}</div></div>
       {shiftLocked && <div className="shift-lock-indicator">SHIFT LOCK <span>ATIVO</span></div>}
       <div className="touch-controls" aria-label="Controles de toque">
         <div className="touch-stick" role="application" aria-label="Direcional de movimento" onPointerDown={onTouchStickDown} onPointerMove={onTouchStickMove} onPointerUp={onTouchStickUp} onPointerCancel={onTouchStickUp}><span className="touch-stick-n">N</span><span ref={touchKnobRef} className="touch-knob" /></div>
         <div className="touch-actions">
-          {nearLandmark && <button type="button" className="touch-action touch-interact" onClick={() => interactRef.current()}>Eco · G</button>}
+          {nearNpc ? <button type="button" className="touch-action touch-interact" onClick={() => interactRef.current()}>Falar · G</button>
+            : nearLandmark && <button type="button" className="touch-action touch-interact" onClick={() => interactRef.current()}>Eco · G</button>}
           <button type="button" className="touch-action" onClick={toggleInventory}>Inventário</button>
           <button type="button" className="touch-action" onClick={toggleSkills}>Habilidades</button>
           <button type="button" className="touch-action" onClick={() => attackRef.current()}>Atacar</button>
@@ -851,30 +1009,54 @@ export default function Game() {
           <div className="portrait"><span>✧</span><b className="portrait-level" title="Nível">{progressionHud.level}</b></div>
           <div className="player-meta">
             <div className="player-name"><strong>Chamado</strong><span>Errante das Terras de Avel</span></div>
-            <div className="bar bar-health" aria-label={`Vida ${combatHud.health}`}><i style={{ width: `${Math.min(100, combatHud.health / combatHud.maxHealth * 100)}%` }} /><span>VIDA</span><b>{combatHud.health}</b></div>
-            <div className="bar bar-mana" aria-label={`Mana ${combatHud.mana}`}><i style={{ width: `${Math.min(100, combatHud.mana / combatHud.maxMana * 100)}%` }} /><span>MANA</span><b>{combatHud.mana}</b></div>
+            <HudBars store={hudStore} />
             <div className="bar bar-xp" aria-label="Experiência"><i style={{ width: `${Math.min(100, progressionHud.experience / progressionHud.nextLevelXp * 100)}%` }} /><span>XP {progressionHud.experience}/{progressionHud.nextLevelXp}</span></div>
           </div>
         </div>
         <div className="status-line">
           {progressionHud.skillPoints > 0 && <button type="button" className="pill pill-gold" onClick={toggleSkills}>✦ {progressionHud.skillPoints} {progressionHud.skillPoints === 1 ? 'ponto' : 'pontos'} de habilidade</button>}
-          {combatHud.shield && <span className="pill">⬡ Escudo{combatHud.blocks > 0 ? ` · ${combatHud.blocks} bloqueios` : ''}</span>}
-          {combatHud.flying && <span className="pill">➶ Voo</span>}
+          <HudPills store={hudStore} />
         </div>
       </div>
       <div className="bottom-center">
-        {nearLandmark && <div className="interaction"><span className="keycap">G</span><span>Ouvir o Eco do marco</span></div>}
+        {nearNpc && !npcDialog ? <div className="interaction"><span className="keycap">G</span><span>Falar com Aldren{wolfQuest.stage === 'ready' ? ' · entregar missão' : ''}</span></div>
+          : nearLandmark && <div className="interaction"><span className="keycap">G</span><span>Ouvir o Eco do marco</span></div>}
         <div className="hotbar">
-          {spellSlot('zoltraak', 'Q', 'Zoltraak')}{spellSlot('vollzanbel', '1', 'Vollzanbel')}{spellSlot('judradjim', '2', 'Judradjim')}{spellSlot('shield', 'F', 'Escudo')}{spellSlot('flight', 'R', 'Voo')}
+          {SLOTS.map(([spell, key, label]) => <SpellSlot key={spell} store={hudStore} spell={spell} hotkey={key} label={label} cast={castAbilityRef} />)}
           <span className="hotbar-sep" aria-hidden="true" />
           <button type="button" className="slot-btn util" onClick={toggleQuest} title="Diário de viagem (J)"><span className="slot-face">{ICONS.journal}</span><span className="slot-key">J</span><span className="slot-name">Jornada</span></button>
           <button type="button" className="slot-btn util" onClick={toggleHelp} title="Controles (H)"><span className="slot-face">{ICONS.help}</span><span className="slot-key">H</span><span className="slot-name">Ajuda</span></button>
         </div>
       </div>
-      <div className="bottom-right"><div className="enemies-left"><b>{combatHud.alive}</b> ecos hostis nos campos</div></div>
+      <div className="bottom-right"><EnemiesLeft store={hudStore} /></div>
       {hint && <div className="toast"><span>✦</span>{hint}</div>}
       {areaBanner && <div className="area-banner" aria-live="polite"><small>OESTE · TERRAS DE AVEL</small><strong>Campos da Aurora</strong><i /></div>}
     </div>
+
+    {/* ======================= DIÁLOGO COM NPC ======================= */}
+    {playing && npcDialog && <div className="npc-dialog" role="dialog" aria-modal="true" aria-label="Conversa com Aldren">
+      <div className="npc-dialog-box">
+        <div className="npc-speaker"><span className="npc-badge">✦</span><div><strong>Aldren</strong><small>Pastor dos Campos da Aurora</small></div></div>
+        {wolfQuest.stage === 'available' ? <>
+          <p>Ei, viajante! Espere um instante. Os lobos desceram da mata e rondam o caminho do marco. Esta semana já levaram duas das minhas ovelhas, e eu não tenho mais pernas para enfrentá-los.</p>
+          <p>Se você abater <b>{WOLF_QUEST_GOAL} lobos</b>, divido com você tudo o que aprendi andando por estes campos. Para alguém no começo da jornada, isso vale muito.</p>
+          <div className="npc-reward"><span>RECOMPENSA</span>Experiência para subir 2 níveis</div>
+          <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.accept()}>ACEITAR MISSÃO <span>→</span></button><button type="button" className="menu-line" onClick={() => npcActionsRef.current.close()}>Agora não</button></div>
+        </> : wolfQuest.stage === 'active' ? <>
+          <p>Ainda ouço os uivos lá do norte, perto das árvores além do marco. Cuidado: eles atacam em bando e mordem rápido.</p>
+          <div className="npc-reward"><span>PROGRESSO</span>{wolfQuest.kills} / {WOLF_QUEST_GOAL} lobos abatidos</div>
+          <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.close()}>ESTOU A CAMINHO <span>→</span></button></div>
+        </> : wolfQuest.stage === 'ready' ? <>
+          <p>Os uivos pararam... Você conseguiu! Faz muito tempo que alguém não protegia estes campos como os heróis de antigamente.</p>
+          <p>Tome. Não é ouro, mas é o que um velho pastor tem de mais valioso: o que aprendi em uma vida inteira.</p>
+          <div className="npc-reward"><span>RECOMPENSA</span>+{wolfQuest.reward} XP · nível {progressionHud.level} → {progressionHud.level + 2}</div>
+          <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.turnIn()}>RECEBER RECOMPENSA <span>→</span></button></div>
+        </> : <>
+          <p>Os campos estão mais tranquilos graças a você. As ovelhas voltaram a pastar perto do marco. Que o vento esteja a seu favor, viajante.</p>
+          <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.close()}>ATÉ LOGO <span>→</span></button></div>
+        </>}
+      </div>
+    </div>}
 
     {gameError && <div className="game-error"><strong>O mundo não pôde ser carregado</strong><span>{gameError}</span><button type="button" onClick={() => window.location.reload()}>Tentar novamente</button></div>}
 
@@ -893,7 +1075,7 @@ export default function Game() {
         : help ? <><span className="modal-kicker">CAMINHOS DO VIAJANTE</span><h2>Um passo de cada vez.</h2><p>Enfrente lobos, bandidos e demônios. A mira central indica o alvo; aproxime-se dos cristais para recolher XP e itens raros.</p>{controlsPanel()}<button type="button" className="continue" onClick={closeMenus}>CONTINUAR A JORNADA <span>→</span></button></>
         : inventoryOpen ? <><span className="modal-kicker">PERTENCES DO VIAJANTE</span><h2>Inventário</h2><p>Recolha os cristais de experiência e os itens deixados pelos inimigos.</p><div className="inventory-grid"><article className="inventory-item"><span className="item-glyph">✧</span><div><strong>Fragmento de Eco</strong><small>Resíduo de energia arcana</small></div><b>{progressionHud.inventory.echoFragment}</b></article><article className="inventory-item"><span className="item-glyph">◇</span><div><strong>Núcleo de sentinela</strong><small>Material deixado pelos Ecos</small></div><b>{progressionHud.inventory.sentinelCore}</b></article>{(Object.keys(LOOT_INFO) as LootItemId[]).map(item => <article className={`inventory-item loot-${LOOT_INFO[item].rarity.toLowerCase()}`} key={item}><span className="item-glyph">{LOOT_INFO[item].rarity === 'Épico' ? '✦' : LOOT_INFO[item].rarity === 'Raro' ? '⬡' : '◇'}</span><div><strong>{LOOT_INFO[item].name}</strong><small>{LOOT_INFO[item].rarity} · {LOOT_INFO[item].source}</small></div><b>{progressionHud.inventory[item]}</b></article>)}</div><div className="inventory-footer">Nível {progressionHud.level} <span>·</span> {progressionHud.experience}/{progressionHud.nextLevelXp} XP <span>·</span> {progressionHud.skillPoints} pontos de habilidade</div><button type="button" className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
         : skillsOpen ? skillTree()
-        : <><span className="modal-kicker">DIÁRIO DE VIAGEM · 01</span><h2>O Que Permanece</h2><p>Quase mil anos se passaram desde a derrota de Valkhor. A relva tomou os velhos caminhos, e os nomes dos heróis já não são lembrados.</p><p>Um marco de pedra repousa além do prado, coberto de musgo. Talvez ainda guarde uma lembrança.</p><div className="quest-objective"><span>✦</span>{status.discovered ? 'Memória do Marco do Herói despertada' : 'Encontre o Marco do Herói nos campos'}</div></>}
+        : <><span className="modal-kicker">DIÁRIO DE VIAGEM · 01</span><h2>O Que Permanece</h2><p>Quase mil anos se passaram desde a derrota de Valkhor. A relva tomou os velhos caminhos, e os nomes dos heróis já não são lembrados.</p><p>Um marco de pedra repousa além do prado, coberto de musgo. Talvez ainda guarde uma lembrança.</p><div className="quest-objective"><span>✦</span>{status.discovered ? 'Memória do Marco do Herói despertada' : 'Encontre o Marco do Herói nos campos'}</div>{wolfQuest.stage !== 'available' && <div className="quest-objective"><span>{wolfQuest.stage === 'done' ? '✓' : '✦'}</span>{wolfQuest.stage === 'done' ? `Uivos no Caminho · concluída (+${wolfQuest.reward} XP)` : wolfQuest.stage === 'ready' ? 'Uivos no Caminho · fale com Aldren para receber a recompensa' : `Uivos no Caminho · ${wolfQuest.kills}/${WOLF_QUEST_GOAL} lobos abatidos`}</div>}</>}
     </div></div>}
   </main>;
 }

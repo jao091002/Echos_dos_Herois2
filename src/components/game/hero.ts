@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { terrainHeight } from './world';
+import { createStaffMaterials, HEAD_V0, HEAD_V_LEN, VEIN_COLORS } from './staff-material';
 
 /* ============================================================================
  *  HERO — rig articulado procedural (Frieren-like)
@@ -111,6 +112,11 @@ const JOINT_K: Record<JointName, number> = {
   pelvis: 1, spine: 0.9, chest: 0.85, neck: 0.7, head: 0.55,
   armL: 1, armR: 1, elbowL: 0.9, elbowR: 0.9, wristL: 0.6, wristR: 0.6,
   hipL: 1, hipR: 1, kneeL: 1, kneeR: 1, ankleL: 0.8, ankleR: 0.8,
+};
+
+const LEG_JOINT: Record<JointName, boolean> = {
+  pelvis: false, spine: false, chest: false, neck: false, head: false, armL: false, armR: false, elbowL: false, elbowR: false, wristL: false, wristR: false,
+  hipL: true, hipR: true, kneeL: true, kneeR: true, ankleL: true, ankleR: true,
 };
 
 /* ------------------------------------------------------------------ medidas */
@@ -310,8 +316,6 @@ export function createHero(scene: THREE.Scene): HeroRig {
     iris: toon('#5fa58f'), irisDark: new THREE.MeshBasicMaterial({ color: '#244a42' }),
     eyeWhite: new THREE.MeshBasicMaterial({ color: '#f7f0df' }), shine: new THREE.MeshBasicMaterial({ color: '#ffffff' }),
     lash: new THREE.MeshBasicMaterial({ color: '#3a2f2b' }), lip: toon('#c98a86'), mouthIn: new THREE.MeshBasicMaterial({ color: '#7a3a3a' }),
-    wood: new THREE.MeshStandardMaterial({ color: '#6e4a2c', roughness: 0.72 }),
-    woodHead: new THREE.MeshStandardMaterial({ color: '#7a5233', roughness: 0.6 }),
     purple: toon('#b98ad9'), purpleD: toon('#9a6cc0', THREE.DoubleSide),
     silver: new THREE.MeshStandardMaterial({ color: '#d9dce3', roughness: 0.28, metalness: 0.85 }),
     bead: toon('#c7383a'),
@@ -571,14 +575,22 @@ export function createHero(scene: THREE.Scene): HeroRig {
    * e abaixo da cabeça, anéis de prata gravados, cabeça de madeira que engrossa, achata e inclina para o lado
    * terminando num corte em bisel, e uma fita roxa amarrada com uma conta vermelha.
    * Eixo local Y = haste; y=0 fica na mão direita.
+   *
+   * Proporção: a ponta de baixo fica na altura do chão com o braço relaxado (y = -1) e o topo passa só um
+   * pouco da cabeça da personagem (~2,4 de altura total para ~2,35 dela): tudo acima da mão é comprimido por SU.
+   * Madeira com textura procedural (veio, nós, relevo e oclusão) e veias que acendem com a magia (staff-material.ts).
    */
+  const SU = 0.76;
+  const sv = (x: number, y: number, z: number) => new THREE.Vector3(x, y > 0 ? y * SU : y, z);
+  const HEAD = sv(0.128, 1.8, 0.02); // centro do foco na cabeça do cajado
+  const staffMat = createStaffMaterials(scene);
   const shaftCurve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(0, -1.0, 0), new THREE.Vector3(0.004, -0.55, 0.002), new THREE.Vector3(-0.006, -0.1, 0),
-    new THREE.Vector3(0.006, 0.25, 0.002), new THREE.Vector3(0.026, 0.46, -0.004), new THREE.Vector3(0.014, 0.66, 0),
-    new THREE.Vector3(-0.004, 0.95, 0.002), new THREE.Vector3(0.002, 1.3, 0),
+    sv(0, -1.0, 0), sv(0.004, -0.55, 0.002), sv(-0.006, -0.1, 0),
+    sv(0.006, 0.25, 0.002), sv(0.026, 0.46, -0.004), sv(0.014, 0.66, 0),
+    sv(-0.004, 0.95, 0.002), sv(0.002, 1.3, 0),
   ]);
   const shaftR = (t: number) => (0.025 + 0.009 * t + 0.01 * bump(t, 0.645, 0.035) + 0.006 * bump(t, 0.4, 0.02) + 0.007 * bump(t, 0.715, 0.03)) * min(1, (t + 0.004) / 0.012);
-  part(sweep(shaftCurve, shaftR, { segs: 90, radial: 12 }), mat.wood, staff, [0, 0, 0], { outline: true });
+  part(sweep(shaftCurve, shaftR, { segs: 160, radial: 20 }), staffMat.shaft, staff, [0, 0, 0], { outline: true });
   const at = (t: number) => shaftCurve.getPointAt(t);
   // enrolamento roxo da base (tiras com relevo)
   part(sweep(new SubCurve(shaftCurve, 0.003, 0.27), t => 0.031 + 0.0025 * max(0, sin(t * 120)) + 0.002 * t, { segs: 120, radial: 12 }), mat.purple, staff, [0, 0, 0], { outline: true });
@@ -592,26 +604,37 @@ export function createHero(scene: THREE.Scene): HeroRig {
   ring(0.845, 0.043, 0.022); ring(0.905, 0.043, 0.018);
   // cabeça de madeira: engrossa, inclina para o lado e termina achatada em bisel
   const headCurve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(0.002, 1.24, 0), new THREE.Vector3(0.012, 1.42, 0), new THREE.Vector3(0.05, 1.6, 0), new THREE.Vector3(0.115, 1.78, 0), new THREE.Vector3(0.14, 1.83, 0),
+    sv(0.002, 1.24, 0), sv(0.012, 1.42, 0), sv(0.05, 1.6, 0), sv(0.115, 1.78, 0), sv(0.14, 1.83, 0),
   ]);
-  part(sweep(headCurve, t => (0.036 + 0.042 * smoothstep01(clamp((t - 0.25) / 0.6, 0, 1))) * (t > 0.9 ? Math.sqrt(max(0.0001, 1 - ((t - 0.9) / 0.1) ** 2)) : 1), { segs: 40, radial: 14, flat: t => 1 - 0.42 * smoothstep01(clamp((t - 0.35) / 0.6, 0, 1)) }), mat.woodHead, staff, [0, 0, 0], { outline: true });
+  const headGeo = sweep(headCurve, t => (0.036 + 0.042 * smoothstep01(clamp((t - 0.25) / 0.6, 0, 1))) * (t > 0.9 ? Math.sqrt(max(0.0001, 1 - ((t - 0.9) / 0.1) ** 2)) : 1), { segs: 60, radial: 24, flat: t => 1 - 0.42 * smoothstep01(clamp((t - 0.35) / 0.6, 0, 1)) });
+  {
+    // cabeça mais grossa: veio repetido 2x em volta; ao longo, continua o trecho da haste (sem emenda)
+    const uv = headGeo.getAttribute('uv') as THREE.BufferAttribute;
+    for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * 2, HEAD_V0 + uv.getY(i) * HEAD_V_LEN);
+  }
+  part(headGeo, staffMat.head, staff, [0, 0, 0], { outline: true });
   // fita roxa amarrada + conta vermelha
   const tie = at(0.86);
   part(new THREE.TorusGeometry(0.046, 0.012, 6, 16), mat.purple, staff, [tie.x, tie.y, tie.z], { rot: [PI / 2, 0, 0] });
   part(new THREE.SphereGeometry(0.016, 10, 8), mat.bead, staff, [tie.x + 0.05, tie.y - 0.05, tie.z + 0.012]);
-  const focus = part(new THREE.IcosahedronGeometry(0.026, 1), mat.glow, staff, [0.128, 1.8, 0.02]);
+  const focus = part(new THREE.IcosahedronGeometry(0.026, 1), mat.glow, staff, [HEAD.x, HEAD.y, HEAD.z]);
   // luzes que orbitam a cabeça do cajado e anel rúnico discreto (reagem à magia)
-  const orbiters = [0, 1, 2].map(() => part(new THREE.OctahedronGeometry(0.012, 0), mat.glow, staff, [0.128, 1.8, 0.02], { shadow: false }));
+  const orbiters = [0, 1, 2].map(() => part(new THREE.OctahedronGeometry(0.012, 0), mat.glow, staff, [HEAD.x, HEAD.y, HEAD.z], { shadow: false }));
   const idleRingMat = new THREE.MeshBasicMaterial({ color: '#f6e4ae', transparent: true, opacity: 0.25, depthWrite: false, side: THREE.DoubleSide });
-  const idleRing = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.0035, 5, 44), idleRingMat); idleRing.position.set(0.122, 1.79, 0.01); staff.add(idleRing);
-  const spellPoint = new THREE.Object3D(); spellPoint.position.set(0.13, 1.84, 0.02); staff.add(spellPoint);
-  const aura = new THREE.PointLight('#efdba9', 0.85, 4, 2); aura.position.set(0.1, 1.8, 0.1); staff.add(aura);
-  const haloA = new THREE.Mesh(new THREE.TorusGeometry(0.27, 0.008, 5, 32), mat.halo); haloA.position.set(0.12, 1.78, 0); staff.add(haloA);
-  const haloB = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.006, 5, 32), mat.halo); haloB.position.set(0.12, 1.78, 0); staff.add(haloB);
+  const idleRing = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.0035, 5, 44), idleRingMat); idleRing.position.set(HEAD.x - 0.006, HEAD.y - 0.01, 0.01); staff.add(idleRing);
+  const spellPoint = new THREE.Object3D(); spellPoint.position.set(HEAD.x + 0.002, HEAD.y + 0.04, 0.02); staff.add(spellPoint);
+  const aura = new THREE.PointLight('#efdba9', 0.85, 4, 2); aura.position.set(0.1, HEAD.y, 0.1); staff.add(aura);
+  const haloA = new THREE.Mesh(new THREE.TorusGeometry(0.27, 0.008, 5, 32), mat.halo); haloA.position.set(0.12, HEAD.y - 0.02, 0); staff.add(haloA);
+  const haloB = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.006, 5, 32), mat.halo); haloB.position.set(0.12, HEAD.y - 0.02, 0); staff.add(haloB);
+  // cor atual das veias (segue o feitiço em uso) e luz da aura misturada a ela
+  const veinTarget = new THREE.Color(VEIN_COLORS.zoltraak), auraBase = new THREE.Color('#efdba9');
   haloA.visible = haloB.visible = false;
-  chains.push(makeChain(staff, [tie.x + 0.035, tie.y, tie.z + 0.02], [0.13, 0.13, 0.12, 0.1], (seg, j, len) => {
+  const ribbon = makeChain(staff, [tie.x + 0.035, tie.y, tie.z + 0.02], [0.13, 0.13, 0.12, 0.1], (seg, j, len) => {
     part(new THREE.BoxGeometry(0.058 - j * 0.006, len, 0.006), mat.purpleD, seg, [0, -len / 2, 0], { shadow: false });
-  }, { k: 26, c: 3, gain: 4.5, limit: 1.2, lag: 22, air: 1, breeze: 0.2, seed: 31 }));
+  }, { k: 26, c: 3, gain: 4.5, limit: 1.2, lag: 22, air: 1, breeze: 0.2, seed: 31 });
+  chains.push(ribbon);
+  // cadeias que realmente aparecem (com o modelo completo, só a fita do cajado + ossos secundários do modelo)
+  let activeChains: Chain[] = chains;
 
   Object.assign(root.userData, { body, legs: [J.hipL.node, J.hipR.node], arms: armNodes, focus, clasp, satchel: satchel.segs[0], shoulder: root });
   root.position.set(0, 0, 2);
@@ -675,6 +698,13 @@ export function createHero(scene: THREE.Scene): HeroRig {
   // impacto da aterrissagem proporcional à velocidade de queda
   let airMinVy = 0, landImpact = 0.7;
   const FIDGET_DUR = [2.6, 1.9, 2.8];
+  // marcha contínua: 0 = caminhada, 1 = corrida (mistura todos os parâmetros, sem troca brusca de ciclo)
+  let gait = 0, gaitFresh = true;
+  // voo: fator de voo rápido suavizado (atrasa de propósito: o corpo "pega" a velocidade antes de compactar)
+  let flyDash = 0;
+  // camada de magia sobre locomoção/voo: guarda os alvos da metade inferior calculados pela pose base
+  const LOWER = ['pelvis', 'hipL', 'hipR', 'kneeL', 'kneeR', 'ankleL', 'ankleR'] as const;
+  const lowerSave = new Float32Array(LOWER.length * 3 + 8);
   const ik = { x: 0, z: 0, e: 0 };
   const qParent = new THREE.Quaternion(), qRoot = new THREE.Quaternion(), qDesired = new THREE.Quaternion();
   const eul = new THREE.Euler(0, 0, 0, 'YXZ');
@@ -695,7 +725,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
    * Rcadeia é a composição das rotações procedurais das juntas mapeadas. Quaternion local = D_pai⁻¹ · D.
    */
   type Region = 'legs' | 'torso' | 'armL' | 'armR' | 'hips' | 'head' | 'none';
-  type XNode = { bone: THREE.Object3D; rootQ: THREE.Quaternion | null; parentIdx: number; joint: JointName | null; region: Region; rest: THREE.Quaternion; clip: THREE.Quaternion; Rc: THREE.Quaternion; D: THREE.Quaternion };
+  type XNode = { bone: THREE.Object3D; rootQ: THREE.Quaternion | null; parentIdx: number; joint: JointName | null; region: Region; rest: THREE.Quaternion; clip: THREE.Quaternion; Rc: THREE.Quaternion; D: THREE.Quaternion; extra: THREE.Quaternion | null };
   let xb: null | {
     model: THREE.Object3D; nodes: XNode[]; full: boolean;
     mixer: THREE.AnimationMixer | null; idle: THREE.AnimationAction | null; walk: THREE.AnimationAction | null; run: THREE.AnimationAction | null;
@@ -729,7 +759,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
     const w = xb.w, I = xq2.identity();
     for (const n of xb.nodes) {
       const pR = n.parentIdx >= 0 ? xb.nodes[n.parentIdx].Rc : I, pD = n.parentIdx >= 0 ? xb.nodes[n.parentIdx].D : n.rootQ!;
-      if (n.joint) { const r = J[n.joint].node.rotation; xe.set(r.x, r.y, r.z, 'XYZ'); xq.setFromEuler(xe); } else xq.identity();
+      if (n.joint) { const r = J[n.joint].node.rotation; xe.set(r.x, r.y, r.z, 'XYZ'); xq.setFromEuler(xe); } else if (n.extra) xq.copy(n.extra); else xq.identity();
       n.Rc.copy(pR).multiply(xq);
       n.D.copy(n.Rc).multiply(n.rest);
       n.bone.quaternion.copy(pD).invert().multiply(n.D);
@@ -857,7 +887,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
       const acc = own ?? (pIdx >= 0 ? oacc[pIdx].clone() : new THREE.Quaternion());
       const m = MAP[key];
       idxOf.set(bone, nodes.length); oacc.push(acc);
-      nodes.push({ bone, rootQ: pIdx < 0 ? wq(bone.parent!) : null, parentIdx: pIdx, joint: m ? m[0] : null, region: m ? m[1] : 'none', rest: acc.clone().multiply(wq(bone)), clip: new THREE.Quaternion(), Rc: new THREE.Quaternion(), D: new THREE.Quaternion() });
+      nodes.push({ bone, rootQ: pIdx < 0 ? wq(bone.parent!) : null, parentIdx: pIdx, joint: m ? m[0] : null, region: m ? m[1] : 'none', rest: acc.clone().multiply(wq(bone)), clip: new THREE.Quaternion(), Rc: new THREE.Quaternion(), D: new THREE.Quaternion(), extra: null });
     });
     const hipsIdx = idxOf.get(byName.Hips)!;
 
@@ -924,7 +954,93 @@ export function createHero(scene: THREE.Scene): HeroRig {
       holder.position.y = 0; xbApply(); body.updateWorldMatrix(true, true);
       const low = Math.min(local('LeftToeBase').y, local('RightToeBase').y, local('LeftFoot').y - 0.07 * k);
       holder.position.y = -low + 0.01; holder.updateMatrixWorld(true);
+      rigSecondary(byName, idxOf, nodes, local, full);
       JOINTS.forEach((n, i) => J[n].node.rotation.copy(saved[i])); Object.assign(xb.w, w0);
+    }
+  };
+
+  /*
+   * Ossos secundários do próprio modelo (medidos na pose reta, espaço do corpo):
+   *  - cabelo, saia e punhos (Agris): cadeias de molas iguais às do corpo procedural, aplicadas como rotação
+   *    extra no espaço de repouso do osso (eixo X = vai e vem, Z = lateral);
+   *  - dedos (Biped): curl em torno da linha dos nós dos dedos, no sentido da palma (lado do polegar);
+   *  - clavículas: ombro sobe junto quando o braço passa da horizontal (ritmo escápulo-umeral).
+   */
+  type BoneChain = { chain: Chain; idx: number[]; amp: number; kind: 'hair' | 'skirtSide' | 'skirtBack' | 'cuff'; side: number };
+  const boneChains: BoneChain[] = [];
+  const fingerRigs: { idx: number[]; axis: THREE.Vector3; side: 0 | 1; gain: number }[] = [];
+  const clavicles: { idx: number; side: number }[] = [];
+  const dummy = new THREE.Group();
+  function rigSecondary(byName: Record<string, THREE.Bone>, idxOf: Map<THREE.Object3D, number>, nodes: XNode[], local: (n: string) => THREE.Vector3, full: boolean) {
+    const ix = (key: string) => (byName[key] ? idxOf.get(byName[key]) ?? -1 : -1);
+    const extraOf = (i: number) => (nodes[i].extra ??= new THREE.Quaternion());
+    const addChain = (keys: string[], kind: BoneChain['kind'], amp: number, o: ChainOpts) => {
+      const idx = keys.map(ix);
+      if (idx.some(i => i < 0)) return;
+      idx.forEach(extraOf);
+      const side = Math.sign(local(keys[0]).x) || 0;
+      boneChains.push({ chain: makeChain(dummy, [0, 0, 0], keys.map(() => 0.1), () => {}, o), idx, amp, kind, side });
+    };
+    addChain(['b_hair_01', 'b_hair_02', 'b_hair_03'], 'hair', 0.8, { k: 30, c: 4.2, gain: 4.5, limit: 1.0, lag: 24, air: 1, breeze: 0.14, seed: 3 });
+    addChain(['b_skirt_l_01', 'b_skirt_l_02', 'b_skirt_l_03', 'b_skirt_l_04'], 'skirtSide', 0.5, { k: 46, c: 6.2, gain: 6.5, limit: 0.7, lag: 22, air: 0.75, breeze: 0.06, seed: 1.3 });
+    addChain(['b_skirt_r_01', 'b_skirt_r_02', 'b_skirt_r_03', 'b_skirt_r_04'], 'skirtSide', 0.5, { k: 46, c: 6.2, gain: 6.5, limit: 0.7, lag: 22, air: 0.75, breeze: 0.06, seed: 4.1 });
+    addChain(['b_skirt_b_01', 'b_skirt_b_02', 'b_skirt_b_03', 'b_skirt_b_04'], 'skirtBack', 0.5, { k: 40, c: 5.6, gain: 6.5, limit: 0.7, lag: 20, air: 0.8, breeze: 0.07, seed: 7.7 });
+    addChain(['b_cuff_l_01', 'b_cuff_l_02', 'b_cuff_l_03'], 'cuff', 0.35, { k: 80, c: 7, gain: 3, limit: 0.6, lag: 30, air: 0.6, breeze: 0.05, seed: 9 });
+    addChain(['b_cuff_r_01', 'b_cuff_r_02', 'b_cuff_r_03'], 'cuff', 0.35, { k: 80, c: 7, gain: 3, limit: 0.6, lag: 30, air: 0.6, breeze: 0.05, seed: 13 });
+
+    // dedos Biped: fingerN (base) -> fingerN1 (ponta); 0 = polegar, 1 = indicador ... 4 = mínimo
+    for (const s of ['l', 'r'] as const) {
+      const f = (n: number, tip = false) => `bip001_${s}_finger${n}${tip ? 1 : ''}`;
+      if (!byName[f(1)] || !byName[f(4)] || !byName[f(0)]) continue;
+      const side: 0 | 1 = local(f(1)).x < 0 ? 0 : 1;
+      const across = local(f(1)).sub(local(f(4))), thumb = local(f(0));
+      for (let n = 0; n <= 4; n++) {
+        if (!byName[f(n)] || !byName[f(n, true)]) continue;
+        const base = local(f(n)), d = local(f(n, true)).sub(base).normalize();
+        // "palma" = lado do polegar (para o polegar: em direção ao dedo médio)
+        const toward = n === 0 ? local(f(2)).sub(base) : thumb.clone().sub(base);
+        toward.addScaledVector(d, -toward.dot(d));
+        if (n > 0) { const a = across.clone().normalize(); toward.addScaledVector(a, -toward.dot(a)); }
+        if (toward.lengthSq() < 1e-8) continue;
+        const axis = new THREE.Vector3().crossVectors(d, toward.normalize()).normalize();
+        const idx = [ix(f(n)), ix(f(n, true))].filter(i => i >= 0);
+        idx.forEach(extraOf);
+        fingerRigs.push({ idx, axis, side, gain: n === 0 ? 0.45 : 1 });
+      }
+    }
+    for (const k of ['LeftShoulder', 'RightShoulder']) { const i = ix(k); if (i >= 0) { extraOf(i); clavicles.push({ idx: i, side: Math.sign(local(k === 'LeftShoulder' ? 'LeftArm' : 'RightArm').x) || 1 }); } }
+    if (full) activeChains = [ribbon, ...boneChains.map(b => b.chain)];
+    else activeChains = [...chains, ...boneChains.map(b => b.chain)];
+  }
+  /** Atualiza as rotações extras dos ossos secundários (aplicadas no próximo xbApply). */
+  const updateSecondaryBones = (flare: number) => {
+    if (!xb) return;
+    const nodes = xb.nodes;
+    const hipL = J.hipL.x.v, hipR = J.hipR.x.v;
+    for (const b of boneChains) {
+      const ch = b.chain;
+      if (b.kind === 'skirtSide') {
+        const hip = b.side < 0 ? hipL : hipR;
+        ch.restX = clamp(min(0, hip) * 0.55 + max(0, hip) * 0.2, -0.6, 0.3) + P.magic.v * 0.04;
+        ch.restZ = b.side * (max(0, -hip) * 0.12 + flare * 0.18 + P.magic.v * 0.06);
+      } else if (b.kind === 'skirtBack') {
+        ch.restX = clamp(max(0, hipL, hipR) * 0.45 + flare * 0.3 + P.magic.v * 0.08, 0, 0.6);
+        ch.restZ = 0;
+      } else if (b.kind === 'hair') { ch.restX = P.wind.v * 0.1 + flare * 0.08; ch.restZ = 0; }
+      for (let i = 0; i < b.idx.length; i++) {
+        xe.set(ch.x[i] * b.amp, 0, ch.z[i] * b.amp, 'XYZ');
+        nodes[b.idx[i]].extra!.setFromEuler(xe);
+      }
+    }
+    const curls = [clamp(P.curlL.v, 0, 1), clamp(P.curlR.v, 0, 1)];
+    for (const f of fingerRigs) {
+      const c = curls[f.side] * f.gain;
+      for (let i = 0; i < f.idx.length; i++) nodes[f.idx[i]].extra!.setFromAxisAngle(f.axis, c * (i === 0 ? 0.95 : 0.85));
+    }
+    for (const cl of clavicles) {
+      const a = cl.side < 0 ? J.armL : J.armR;
+      const shrug = clamp((Math.hypot(a.node.rotation.x, a.node.rotation.z) - 1.0) * 0.25, 0, 0.28);
+      nodes[cl.idx].extra!.setFromAxisAngle(Z_AXIS, cl.side * shrug);
     }
   };
 
@@ -974,51 +1090,148 @@ export function createHero(scene: THREE.Scene): HeroRig {
        * o tronco compensa para continuar olhando para a frente, e o ciclo roda ao contrário ao andar de costas.
        * Ciclo: contato de calcanhar (ponta do pé sobe), apoio (joelho absorve), impulso (ponta desce), balanço.
        */
-      const locomote = (run: boolean) => {
+      /**
+       * Marcha contínua: `gait` (0 = caminhada, 1 = corrida) mistura amplitude, cadência, joelhos, braços,
+       * inclinação e quique, então caminhada↔corrida não troca de ciclo de uma vez.
+       * Sincronia pé-chão: no apoio (meio ciclo) o pé percorre ~2·L·sen(A) em relação ao quadril; a cadência
+       * sai da velocidade real para esse percurso bater com o deslocamento (sem patinar). Na corrida a fase
+       * aérea alonga a passada (fator kAir). Velocidade baixa = passos curtos e lentos (arranque e parada).
+       */
+      const locomote = (runTarget: number) => {
+        if (gaitFresh) { gait = runTarget; gaitFresh = false; }
+        gait += (runTarget - gait) * (1 - Math.exp(-dt * 4.5));
+        const g = gait, run = g > 0.5;
         const moving = planar > 0.25;
         const fwd = moving ? vL.z / planar : 1, side = moving ? vL.x / planar : 0;
         const back = fwd < -0.3, dir = back ? -1 : 1;
         const legYaw = clamp(Math.atan2(side, abs(fwd) + 0.05), -1.2, 1.2) * 0.62 * dir;
-        const rate = run ? (speed > 0.1 ? clamp(speed / 4.0, 0.95, 2.4) : 1.9) : (speed > 0.1 ? clamp(speed / 3.3, 0.7, 1.85) : 1.3);
-        const A = run ? (speed > 0.1 ? clamp(speed / (TAU * rate) * 1.15, 0.5, 0.92) : 0.72) : (speed > 0.1 ? clamp(speed / (TAU * rate) * 0.98, 0.3, 0.6) : 0.42);
+        const fAmp = 0.55 + 0.45 * abs(fwd), lat = side * dir * 0.42;
+        const v = max(speed, 0.05);
+        const A = lerp(clamp(0.16 + v * 0.1, 0.18, 0.72), clamp(0.3 + v * 0.07, 0.42, 0.95), g);
+        // duty: fração do ciclo com o pé no chão (caminhada 50%, corrida ~38% por causa da fase aérea)
+        const duty = back ? 0.5 : lerp(0.5, 0.38, g), Ae = A * fAmp, sinAe = sin(Ae);
+        const rate = clamp(v * duty / (2 * (THIGH + SHIN) * sinAe), 0.55, 2.9);
         phase += dt * rate * dir;
         const phi = phase * TAU;
-        const fAmp = 0.55 + 0.45 * abs(fwd), lat = side * dir * 0.42;
         // mocap só quando anda para a frente (strafe/costas ficam 100% procedurais)
         const fwdness = back ? 0 : clamp((abs(fwd) - 0.35) / 0.5, 0, 1) * (moving ? 1 : 0);
-        if (run) clipT.run = fwdness; else clipT.walk = fwdness;
+        clipT.run = fwdness * g; clipT.walk = fwdness * (1 - g);
         clipT.legs = fwdness * 0.85; clipT.torso = fwdness * 0.55; clipT.armL = fwdness * 0.6;
         for (const [hipN, kneeN, ankN, off, sgn] of [['hipL', 'kneeL', 'ankleL', 0, -1], ['hipR', 'kneeR', 'ankleR', PI, 1]] as const) {
-          const p = phi + off, sp = sin(p), cp = cos(p) * dir;           // cp>0: perna em balanço
+          // fase deformada: o apoio ocupa "duty" do ciclo e o balanço o resto (q = 0 no contato do calcanhar)
+          const q = THREE.MathUtils.euclideanModulo((phi + off) / TAU - 0.25, 1), inSt = q < duty;
+          const u = inSt ? q / duty : (q - duty) / (1 - duty);
+          const p = inSt ? PI / 2 + PI * u : 1.5 * PI + PI * u;
+          const sp = sin(p), cp = cos(p) * dir;           // cp>0: perna em balanço
           const swing = max(0, cp), stance = max(0, -cp);
-          setJ(hipN, -sp * A * fAmp + (run ? 0.05 : 0.03), 0, sgn * (run ? 0.03 : 0.015) + sp * A * lat);
-          const kneeBase = run ? 0.22 + swing * (1.25 + A * 0.5) + stance * max(0, sp) * 0.35 : 0.06 + swing * (0.5 + A * 0.95) + stance * max(0, sp) * 0.16;
-          setJ(kneeN, kneeBase);
-          J[ankN].x.t = -(J[hipN].x.t + J[kneeN].x.t) * (run ? 0.72 : 0.85)
-            - max(0, sp) * stance * (run ? 0.1 : 0.28)                    // calcanhar toca: ponta do pé sobe
-            + max(0, -sp) * (run ? 0.55 : 0.4) * (stance + swing * 0.6);  // impulso: ponta empurra o chão
+          // apoio com o pé andando para trás em velocidade constante (= deslocamento do corpo): sem patinar
+          const spH = inSt && !back ? lerp(sp, Math.asin(clamp(sinAe * (1 - 2 * u), -1, 1)) / max(Ae, 1e-3), 0.85) : sp;
+          setJ(hipN, -spH * Ae + lerp(0.03, 0.05, g), 0, sgn * lerp(0.015, 0.03, g) + sp * A * lat);
+          const kW = 0.06 + swing * (0.5 + A * 0.95) + stance * max(0, sp) * 0.16;          // caminhada: perna quase reta no apoio
+          const kR = 0.22 + swing * (1.25 + A * 0.5) + stance * max(0, sp) * 0.35;          // corrida: joelho absorve o impacto
+          setJ(kneeN, lerp(kW, kR, g));
+          J[ankN].x.t = -(J[hipN].x.t + J[kneeN].x.t) * lerp(0.85, 0.72, g)
+            - max(0, sp) * stance * lerp(0.28, 0.1, g)                    // calcanhar toca: ponta do pé sobe
+            + max(0, -sp) * lerp(0.4, 0.55, g) * (stance + swing * 0.6);  // impulso: ponta empurra o chão
         }
-        plant(run ? abs(sin(phi)) * 0.11 : 0);
-        const s1 = sin(phi), twist = run ? 0.2 : 0.11;
-        setJ('pelvis', 0, legYaw + s1 * twist, s1 * (run ? 0.05 : 0.045));       // giro + queda do quadril
-        setJ('spine', run ? 0.1 : 0.04, -legYaw * 0.45 - s1 * twist * 0.45, -s1 * 0.025);
-        setJ('chest', run ? 0.12 : 0.02, -legYaw * 0.45 - s1 * twist * 1.1, -s1 * 0.03);
-        setJ('neck', run ? -0.05 : 0, -legYaw * 0.08 + s1 * 0.05, 0);
-        setJ('head', run ? -0.12 : -0.03, s1 * (run ? 0.12 : 0.08), s1 * 0.015);
-        P.bodyX.t = s1 * (run ? 0.025 : 0.02);
+        plant(abs(sin(phi)) * 0.11 * g * clamp(v / 5, 0.3, 1));
+        const s1 = sin(phi), twist = lerp(0.11, 0.2, g) * clamp(A / 0.6, 0.4, 1.2);
+        setJ('pelvis', 0, legYaw + s1 * twist, s1 * lerp(0.045, 0.05, g));       // giro + queda do quadril
+        setJ('spine', lerp(0.04, 0.1, g), -legYaw * 0.45 - s1 * twist * 0.45, -s1 * 0.025);
+        setJ('chest', lerp(0.02, 0.12, g), -legYaw * 0.45 - s1 * twist * 1.1, -s1 * 0.03);
+        // cabeça estabilizada: compensa parte do giro do peito e do quique (olhar fixo à frente)
+        setJ('neck', lerp(0, -0.05, g), -legYaw * 0.08 + s1 * twist * 0.35, 0);
+        setJ('head', lerp(-0.03, -0.12, g), s1 * twist * 0.25, s1 * 0.012);
+        P.bodyX.t = s1 * lerp(0.02, 0.025, g);
         // braços: contra-balanço com atraso do cotovelo (follow-through)
-        const B = run ? 0.8 : 0.2 + A * 0.4, lagP = phi - 0.35 * dir;
-        setJ('armL', sin(lagP) * B * (0.6 + 0.4 * abs(fwd)), 0, run ? -0.12 : -0.09);
-        setJ('elbowL', -((run ? 1.15 : 0.22) + max(0, -sin(lagP - 0.3)) * (run ? 0.35 : 0.3)));
-        setJ('wristL', run ? 0.1 : 0.05);
-        if (run) { setJ('armR', -0.25 - sin(lagP) * 0.3, 0, 0.12); setJ('elbowR', -1.0); setJ('wristR', -0.4); P.staffP.t = -0.62; P.staffR.t = -0.22; }
-        else { setJ('armR', -0.08 - sin(lagP) * B * 0.3, 0, 0.1); setJ('elbowR', -0.5 - max(0, sin(lagP)) * 0.12); setJ('wristR', -0.4); P.staffP.t = 0.04 - sin(lagP) * 0.06; }
+        const B = lerp(0.2 + A * 0.4, 0.8, g), lagP = phi - 0.35 * dir;
+        setJ('armL', sin(lagP) * B * (0.6 + 0.4 * abs(fwd)), 0, lerp(-0.09, -0.12, g));
+        setJ('elbowL', -(lerp(0.22, 1.15, g) + max(0, -sin(lagP - 0.3)) * lerp(0.3, 0.35, g)));
+        setJ('wristL', lerp(0.05, 0.1, g));
+        setJ('armR', lerp(-0.08 - sin(lagP) * B * 0.3, -0.25 - sin(lagP) * 0.3, g), 0, lerp(0.1, 0.12, g));
+        setJ('elbowR', lerp(-0.5 - max(0, sin(lagP)) * 0.12, -1.0, g)); setJ('wristR', -0.4);
+        P.staffP.t = lerp(0.04 - sin(lagP) * 0.06, -0.62, g); P.staffR.t = lerp(-0.06, -0.22, g);
         // inclinação: para frente ao avançar, levemente para trás de costas, rolagem no strafe
-        const lean = (run ? 0.16 : 0.03) + clamp(planar * (run ? 0.012 : 0.02), 0, run ? 0.1 : 0.12);
+        const lean = lerp(0.03, 0.16, g) + clamp(planar * lerp(0.02, 0.012, g), 0, lerp(0.12, 0.1, g));
         P.pitch.t = lean * (back ? -0.45 : 0.3 + 0.7 * abs(fwd));
-        P.roll.t = -side * (run ? 0.1 : 0.05);
-        if (run) { P.smile.t = 0.1; P.furrow.t = 0.15; P.flare.t = 0.25; }
+        P.roll.t = -side * lerp(0.05, 0.1, g);
+        // quem inclina é o tronco, não as pernas: o quadril contrabalança a inclinação do pivô (+ a de aceleração),
+        // mantendo o arco da passada simétrico sob o centro de massa e o pé de apoio colado no chão
+        const legComp = P.pitch.t + A_LEAN;
+        addJ('hipL', -legComp); addJ('hipR', -legComp);
+        J.ankleL.x.t += legComp * 0.3; J.ankleR.x.t += legComp * 0.3;
+        if (run) { P.smile.t = 0.1; P.furrow.t = 0.15; P.flare.t = 0.25 * g; }
       };
+
+      /**
+       * Voo em três regimes misturados continuamente pela velocidade real:
+       *  - pairando: ereta, sustentação "mágica" com respiração e balanço por senos incomensuráveis
+       *    (nunca repete igual), peso trocando entre as pernas, mão livre corrigindo o equilíbrio;
+       *  - cruzeiro: inclinada, pernas soltas arrastando levemente atrás, cajado à frente;
+       *  - voo rápido (`flyDash`, com atraso): corpo quase horizontal e compacto, pernas juntas e
+       *    estendidas, braço livre colado ao corpo, cajado apontando a trajetória.
+       * A aceleração local (aL.z) dá a reação física: ao acelerar o corpo mergulha e encolhe as pernas
+       * (antecipação) antes de alongar; ao frear ergue o tronco, joga as pernas à frente e abre os braços.
+       */
+      const flyPose = () => {
+        const fwdSp = vL.z, sideSp = vL.x, up = clamp(sVel.y, -14, 14);
+        const move = smoothstep01(clamp(Math.hypot(fwdSp, sideSp) / 8.5, 0, 1));
+        flyDash += (smoothstep01(clamp((planar - 9) / 3.4, 0, 1)) - flyDash) * (1 - Math.exp(-dt * 2.6));
+        const dash = flyDash, cruise = move * (1 - dash), hover = 1 - move;
+        const fwdK = clamp(fwdSp / 4, 0, 1);
+        const push = clamp(aL.z / 14, 0, 1) * (1 - dash * 0.5);               // acelerando para a frente
+        const brake = clamp(-aL.z / 11, 0, 1) * fwdK;                         // freando com embalo
+        const back = fwdSp < -1 ? clamp(-fwdSp / 8, 0, 1) : 0;
+        // respiração + balanço orgânico (três senos com períodos sem múltiplo comum)
+        const breath = sin(time * 1.55);
+        const bob = sin(time * 1.21) * 0.55 + sin(time * 2.03 + 1.3) * 0.28 + sin(time * 0.47 + 2.1) * 0.35;
+        const sway = sin(time * 0.61 + 0.4) * 0.6 + sin(time * 1.37) * 0.25, shift = sin(time * 0.37 + 1.1);
+        // a inclinação aponta para onde o corpo se desloca: componente frontal = pitch, lateral = roll
+        // (voando de lado ou mirando, ela inclina para o lado em vez de "deitar" para a frente)
+        const spd = max(Math.hypot(fwdSp, sideSp), 1e-3), fN = fwdSp / spd, sN = sideSp / spd;
+        const leanMag = 0.5 * cruise + 1.12 * dash + push * 0.2;
+        P.pitch.t = 0.04 * hover + leanMag * max(fN, -0.3) * (1 - back * 0.5) - brake * 0.5 - up * 0.03 * (0.4 + move * 0.6);
+        P.roll.t = clamp(-sN * leanMag * 0.5, -0.55, 0.55) + sway * 0.035 * hover + clamp(-turnVel * 0.05 * move, -0.4, 0.4);
+        P.bodyY.t = 0.42 + bob * 0.045 * hover;
+        P.bodyX.t = sway * 0.025 * hover;
+        P.bodyZ.t = -brake * 0.06;
+        // tronco: leve arco nas costas em velocidade, respiração no peito; cabeça mantém o olhar na trajetória
+        const comp = P.pitch.t;
+        setJ('spine', -0.05 * cruise - 0.08 * dash + brake * 0.1, 0, -P.roll.t * 0.3);
+        setJ('chest', -0.08 + breath * 0.014 * (1 - dash) - 0.08 * cruise - 0.1 * dash + brake * 0.12, -sideSp * 0.02 + sway * 0.03 * hover);
+        setJ('neck', -comp * 0.35); setJ('head', -comp * 0.45 + 0.05 + breath * 0.008, -sideSp * 0.03 + sway * 0.05 * hover, sway * 0.02 * hover);
+        // pernas: pairando = soltas, uma mais dobrada que a outra (troca de peso lenta), ponta do pé relaxada;
+        // cruzeiro = arrastando atrás defasadas; rápido = juntas e estendidas; frear = pernas à frente
+        const dl = 0.5 + 0.5 * shift, dr = 1 - dl, lagV = cos(time * 1.21) * 0.06 * hover;
+        const hipH = (a: number) => 0.06 + a * 0.18, kneeH = (a: number) => 0.32 + a * 0.38;
+        setJ('hipL', hipH(dl) * hover + (0.22 + sin(time * 0.9) * 0.04) * cruise + 0.14 * dash + push * 0.18 - brake * 0.55 - lagV, 0, lerp(-0.08, -0.02, move) + 0.02 * dash);
+        setJ('hipR', hipH(dr) * hover + (0.3 + sin(time * 0.9 + 2) * 0.04) * cruise + 0.1 * dash + push * 0.12 - brake * 0.45 - lagV, 0, lerp(0.08, 0.02, move) - 0.02 * dash);
+        setJ('kneeL', kneeH(dl) * hover + 0.32 * cruise + 0.08 * dash + push * 0.55 + brake * 0.6 + lagV);
+        setJ('kneeR', kneeH(dr) * hover + 0.48 * cruise + 0.12 * dash + push * 0.45 + brake * 0.5 + lagV);
+        J.ankleL.x.t = lerp(0.48, 0.72, move) + 0.18 * dash; J.ankleR.x.t = lerp(0.55, 0.78, move) + 0.16 * dash;
+        // braço livre: pairando = aberto, mão corrigindo o equilíbrio; cruzeiro = solto ao lado; rápido = colado atrás
+        const hand = sin(time * 0.83 + 0.7);
+        setJ('armL', (-0.3 + bob * 0.05) * hover + 0.35 * cruise + 0.7 * dash - brake * 0.7 + push * 0.25, 0,
+          (-0.72 + hand * 0.06) * hover - 0.25 * cruise - 0.08 * dash - brake * 0.45);
+        setJ('elbowL', -0.45 * hover - 0.35 * cruise - 0.12 * dash - brake * 0.2);
+        setJ('wristL', 0.15 + hand * 0.12 * hover + 0.25 * dash);
+        P.curlL.t = 0.25 + hand * 0.1 * hover + 0.35 * dash;
+        // braço do cajado: pairando = cajado ao lado; cruzeiro = à frente; rápido = estendido apontando o rumo
+        setJ('armR', -0.55 * hover - 0.95 * cruise - 2.0 * dash - brake * 0.3, 0, 0.35 * hover + 0.14 * cruise + 0.05 * dash);
+        setJ('elbowR', -0.7 * hover - 0.35 * cruise - 0.12 * dash); setJ('wristR', -0.2 + 0.1 * dash);
+        P.staffP.t = 0.35 * hover + 1.25 * cruise + 1.55 * dash + up * 0.015 - brake * 0.3; P.staffR.t = -0.25 * hover; P.staffY.t = 0;
+        // vento: cabelo e casaco esvoaçam conforme a velocidade
+        P.wind.t = 0.2 + move * 0.5 + dash * 0.35 + push * 0.2; P.flare.t = 0.22 + move * 0.25 + max(0, -up) * 0.03 + brake * 0.35;
+        P.smile.t = 0.35 + dash * 0.15 - brake * 0.2; P.lid.t = 0.85 - dash * 0.12; P.magic.t = 0.25 + dash * 0.25 + push * 0.15;
+        P.furrow.t = dash * 0.2 + brake * 0.25;
+        // transição de entrada: pernas encolhidas e braços abrindo, dissolvendo na pose de voo
+        const ent = poseTime < 0.7 ? 1 - smoothstep01(poseTime / 0.7) : 0;
+        if (ent > 0) {
+          addJ('hipL', -0.5 * ent); addJ('kneeL', 0.7 * ent); addJ('hipR', -0.4 * ent); addJ('kneeR', 0.6 * ent);
+          addJ('armL', -0.9 * ent, 0, -0.3 * ent); P.pitch.t -= 0.25 * ent; P.flare.t += 0.4 * ent;
+        }
+      };
+      if (pose !== 'fly' && (pose !== 'cast' || root.userData.locoPose !== 'fly')) flyDash = 0;
 
       // pesos dos clipes de mocap (só têm efeito com o corpo glTF)
       clipT.legs = clipT.torso = clipT.armL = clipT.walk = clipT.run = 0;
@@ -1026,8 +1239,15 @@ export function createHero(scene: THREE.Scene): HeroRig {
       // ociosidade
       if (pose === 'idle') idleClock += dt; else { idleClock = 0; fidget = -1; nextFidget = 6 + Math.random() * 4; }
 
+      // passos de parada: soltou o direcional mas o corpo ainda desliza -> continua o ciclo, com passadas
+      // encurtando junto com a velocidade, em vez de "patinar" para a pose parada
+      const settling = pose === 'idle' && speed > 0.45;
+      const locoNow = pose === 'walk' || pose === 'run' || settling;
+      if (!locoNow) gaitFresh = true;
+
       switch (pose) {
         case 'idle': {
+          if (settling) { locomote(0); break; }
           const br = sin(time * 1.8), sh = sin(time * 0.4);
           P.bodyX.t = sh * 0.02;
           setJ('pelvis', 0, sin(time * 0.4 + 1) * 0.05, sh * 0.035);
@@ -1089,8 +1309,8 @@ export function createHero(scene: THREE.Scene): HeroRig {
           }
           break;
         }
-        case 'walk': locomote(false); break;
-        case 'run': locomote(true); break;
+        case 'walk': locomote(0); break;
+        case 'run': locomote(1); break;
         case 'jump': {
           const u = poseTime;
           setJ('hipL', kf(u, [[0, 0.3], [0.14, -0.9], [0.5, -0.7]]), 0, -0.05); setJ('kneeL', kf(u, [[0, 0.1], [0.14, 1.3], [0.5, 1.1]]));
@@ -1179,6 +1399,23 @@ export function createHero(scene: THREE.Scene): HeroRig {
         case 'cast': {
           // cada magia tem sua própria pose (Game define root.userData.castKind ao lançar)
           const kind = (root.userData.castKind as string | undefined) ?? 'zoltraak';
+          // camadas: lançando em movimento/voo, a pose base (pernas, quadril, altura, inclinação) continua
+          // e a magia controla só a metade superior. A decolagem ('flight') é de corpo inteiro.
+          const base = root.userData.locoPose as HeroPose | undefined;
+          const layer = kind !== 'flight' && (base === 'fly' || base === 'walk' || base === 'run' || base === 'fall' || base === 'jump');
+          if (layer) {
+            if (base === 'fly') flyPose();
+            else if (base === 'walk' || base === 'run') locomote(base === 'run' ? 1 : 0);
+            else {
+              const f = sin(time * 6);
+              setJ('hipL', -0.3 + f * 0.05, 0, -0.06); setJ('kneeL', 0.45); setJ('hipR', 0.05, 0, 0.06); setJ('kneeR', 0.35);
+              J.ankleL.x.t = 0.35; J.ankleR.x.t = 0.3;
+            }
+            let o = 0;
+            for (const n of LOWER) { const j = J[n]; lowerSave[o++] = j.x.t; lowerSave[o++] = j.y.t; lowerSave[o++] = j.z.t; }
+            lowerSave[o++] = P.bodyX.t; lowerSave[o++] = P.bodyY.t; lowerSave[o++] = P.bodyZ.t; lowerSave[o++] = P.pitch.t;
+            lowerSave[o++] = P.roll.t; lowerSave[o++] = P.wind.t; lowerSave[o++] = P.flare.t;
+          }
           if (kind === 'shield') {
             // cajado cravado à frente, mão esquerda empurra a barreira, base em avanço
             const u = clamp(poseTime / 0.6, 0, 1);
@@ -1258,6 +1495,19 @@ export function createHero(scene: THREE.Scene): HeroRig {
             P.magic.t = kf(u, [[0, 0], [0.25, 0.6], [0.45, 1], [1, 0.85]]);
             P.lid.t = 0.95; P.furrow.t = 0.2; P.flare.t = 0.3;
           }
+          if (layer) {
+            // metade inferior volta para a pose base; o giro de quadril e o avanço da magia entram só em parte
+            const castPelvisY = J.pelvis.y.t, castZ = P.bodyZ.t, castPitch = P.pitch.t;
+            let o = 0;
+            for (const n of LOWER) { const j = J[n]; j.x.t = lowerSave[o++]; j.y.t = lowerSave[o++]; j.z.t = lowerSave[o++]; }
+            J.pelvis.y.t += castPelvisY * 0.35;
+            P.bodyX.t = lowerSave[o++]; P.bodyY.t = lowerSave[o++]; P.bodyZ.t = lowerSave[o++] + castZ * 0.4;
+            const basePitch = lowerSave[o++];
+            P.pitch.t = basePitch + castPitch * 0.6; P.roll.t = lowerSave[o++];
+            P.wind.t = max(P.wind.t, lowerSave[o++]); P.flare.t = max(P.flare.t, lowerSave[o++]);
+            // corpo inclinado no voo: pescoço e cabeça compensam para o olhar seguir a mira
+            if (base === 'fly') { addJ('neck', -basePitch * 0.3); addJ('head', -basePitch * 0.4); addJ('chest', -basePitch * 0.15); }
+          }
           break;
         }
         case 'hit': {
@@ -1294,41 +1544,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
           P.mouth.t = 0.25 * buckle * (1 - fall); P.ear.t = -0.8 * buckle; P.furrow.t = 0.5 * buckle * (1 - fall);
           break;
         }
-        case 'fly': {
-          // voo dependente da velocidade: pairando = ereta, pernas soltas balançando; rápido = mergulho deitado,
-          // pernas esticadas para trás; subindo inclina para trás, descendo mergulha; strafe inclina para o lado
-          const fwdSp = vL.z, sideSp = vL.x, up = clamp(sVel.y, -14, 14);
-          const move = clamp(Math.hypot(fwdSp, sideSp) / 11, 0, 1), dash = smoothstep01(clamp((planar - 9) / 5, 0, 1));
-          const back = fwdSp < -1 ? clamp(-fwdSp / 8, 0, 1) : 0;
-          const hover = 1 - move, bob = sin(time * 1.9);
-          P.pitch.t = 0.06 + move * (0.55 + dash * 0.5) * (1 - back * 1.4) - up * 0.035 * (0.4 + move * 0.6);
-          P.roll.t = clamp(-sideSp * 0.055, -0.5, 0.5);
-          P.bodyY.t = 0.42 + bob * 0.07 * hover;
-          P.bodyX.t = sin(time * 0.9) * 0.03 * hover;
-          // tronco e cabeça compensam a inclinação para continuar olhando à frente
-          const comp = P.pitch.t;
-          setJ('spine', -0.05 * move, 0, -P.roll.t * 0.3); setJ('chest', -0.1 - 0.12 * move, -sideSp * 0.02);
-          setJ('neck', -comp * 0.35); setJ('head', -comp * 0.45 + 0.05, -sideSp * 0.03);
-          // pernas: pairando = penduradas com chutinhos alternados; rápido = juntas e estendidas atrás
-          const k1 = sin(time * 2.1), k2 = sin(time * 2.1 + 1.6);
-          setJ('hipL', lerp(0.18 + k1 * 0.12, 0.28, move), 0, lerp(-0.08, -0.03, move)); setJ('kneeL', lerp(0.55 + max(0, k1) * 0.3, 0.12, move));
-          setJ('hipR', lerp(-0.05 + k2 * 0.12, 0.2, move), 0, lerp(0.08, 0.03, move)); setJ('kneeR', lerp(0.75 + max(0, k2) * 0.3, 0.22, move));
-          J.ankleL.x.t = lerp(0.5, 0.75, move); J.ankleR.x.t = lerp(0.55, 0.8, move);
-          // braços: pairando = esquerdo aberto equilibrando; rápido = esquerdo junto ao corpo, cajado apontado à frente
-          setJ('armL', lerp(-0.35 + bob * 0.06, 0.45, move), 0, lerp(-0.75, -0.18, move)); setJ('elbowL', lerp(-0.45, -0.2, move)); setJ('wristL', 0.15);
-          setJ('armR', lerp(-0.55, -1.25, move), 0, lerp(0.35, 0.12, move)); setJ('elbowR', lerp(-0.7, -0.25, move)); setJ('wristR', -0.2);
-          P.staffP.t = lerp(0.35, 1.45, move) + up * 0.015; P.staffR.t = lerp(-0.25, 0, move); P.staffY.t = 0;
-          // vento: cabelo e casaco esvoaçam conforme a velocidade
-          P.wind.t = 0.25 + move * 0.55 + dash * 0.25; P.flare.t = 0.25 + move * 0.25 + max(0, -up) * 0.03;
-          P.smile.t = 0.35 + dash * 0.2; P.lid.t = 0.85 - dash * 0.1; P.magic.t = 0.25 + dash * 0.2;
-          // transição de entrada: pernas encolhidas e braços abrindo, dissolvendo na pose de voo
-          const ent = poseTime < 0.7 ? 1 - smoothstep01(poseTime / 0.7) : 0;
-          if (ent > 0) {
-            addJ('hipL', -0.5 * ent); addJ('kneeL', 0.7 * ent); addJ('hipR', -0.4 * ent); addJ('kneeR', 0.6 * ent);
-            addJ('armL', -0.9 * ent, 0, -0.3 * ent); P.pitch.t -= 0.25 * ent; P.flare.t += 0.4 * ent;
-          }
-          break;
-        }
+        case 'fly': flyPose(); break;
       }
 
       /* ---- cajado vivo: pêndulo ao andar, inércia nas acelerações, leve balanço parado */
@@ -1388,6 +1604,8 @@ export function createHero(scene: THREE.Scene): HeroRig {
             setJ('pelvis', 0, 0.22); autoFoot(1); plant();
           }
         }
+        // carregando/sustentando no voo: pernas e inclinação seguem o voo; pescoço e cabeça compensam a inclinação
+        if (pose === 'fly') { addJ('neck', -P.pitch.t * 0.3); addJ('head', -P.pitch.t * 0.4); addJ('chest', -P.pitch.t * 0.15); }
       }
 
       /* ---- cajado nas costas / troca animada */
@@ -1417,15 +1635,25 @@ export function createHero(scene: THREE.Scene): HeroRig {
       const blink = blinkWait > 0 ? 0 : sin(blinkP * PI);
 
       /* ---- integração das molas */
-      const [k0, zeta] = overlay && (pose === 'idle' || pose === 'walk' || pose === 'land') ? [620, 0.8] as const : SPRING[pose];
+      // parando (passos de parada) usa a mola da caminhada: pernas acompanham o ciclo sem atraso que faria o pé patinar;
+      // magia sobre voo/corrida usa mola intermediária: braços respondem rápido sem endurecer as pernas soltas do voo
+      const [k0, zeta] = overlay && (pose === 'idle' || pose === 'walk' || pose === 'land') ? [620, 0.8] as const
+        : overlay && (pose === 'fly' || pose === 'run') ? [520, 0.86] as const
+        : SPRING[settling ? 'walk' : pose];
       const steps = min(8, Math.ceil(dt / (1 / 180)));
       const h = dt / steps;
       // evita "desenrolar" a cambalhota completa ao sair do dodge
       if (pose !== 'dodge' && P.pitch.v > PI) P.pitch.v -= TAU;
       const kSoft = 160, dSoft = 2 * sqrt(kSoft);
+      // pernas no ciclo de passos: mola rígida e criticamente amortecida. Com k da pose (~700) a mola atenuava ~25%
+      // da amplitude e atrasava a fase -> passada curta e pé patinando. O tronco mantém a mola macia (follow-through).
+      const base = root.userData.locoPose;
+      const legLoco = locoNow || (pose === 'cast' && (base === 'walk' || base === 'run'));
+      const kLeg = max(k0, 800) * 2.6, dLeg = 2 * sqrt(kLeg);
       for (let s = 0; s < steps; s++) {
         for (const n of JOINTS) {
-          const j = J[n]; const k = k0 * JOINT_K[n]; const d = 2 * zeta * sqrt(k);
+          const j = J[n], leg = legLoco && LEG_JOINT[n];
+          const k = leg ? kLeg * JOINT_K[n] : k0 * JOINT_K[n], d = leg ? dLeg * sqrt(JOINT_K[n]) : 2 * zeta * sqrt(k);
           stepChan(j.x, k, d, h); stepChan(j.y, k, d, h); stepChan(j.z, k, d, h);
         }
         const dHard = 2 * zeta * sqrt(k0);
@@ -1532,16 +1760,24 @@ export function createHero(scene: THREE.Scene): HeroRig {
         t.chain.restX = P.wind.v * 0.12 - min(P.magic.v, 1) * 0.04;
       }
       for (const l of sideLocks) l.chain.restZ = l.side * (0.1 + P.magic.v * 0.2);
-      for (let s = 0; s < steps; s++) for (const ch of chains) stepChain(ch, h, fx, fz, time);
-      for (const ch of chains) ch.segs.forEach((seg, i) => seg.rotation.set(ch.x[i], 0, ch.z[i]));
+      for (let s = 0; s < steps; s++) for (const ch of activeChains) stepChain(ch, h, fx, fz, time);
+      for (const ch of activeChains) { const sg = ch.segs; for (let i = 0; i < sg.length; i++) sg[i].rotation.set(ch.x[i], 0, ch.z[i]); }
+      if (boneChains.length || fingerRigs.length || clavicles.length) updateSecondaryBones(flare);
 
       /* ---- brilho do foco, halos de magia, luz */
       const magic = clamp(P.magic.v, 0, 1.2);
       focus.scale.setScalar(0.93 + sin(time * 1.8) * 0.08 + magic * 0.35);
       orbiters.forEach((o, i) => {
         const a = time * (1.6 + i * 0.5) + i * 2.1, r = 0.12 + 0.02 * sin(time * 2 + i) + magic * 0.05;
-        o.position.set(0.128 + cos(a) * r, 1.8 + sin(a * 1.3 + i) * 0.05, 0.02 + sin(a) * r); o.scale.setScalar(1 + magic * 1.4 + sin(time * 5 + i) * 0.25);
+        o.position.set(HEAD.x + cos(a) * r, HEAD.y + sin(a * 1.3 + i) * 0.05, HEAD.z + sin(a) * r); o.scale.setScalar(1 + magic * 1.4 + sin(time * 5 + i) * 0.25);
       });
+      /* ---- veias de magia na madeira: acendem da mão para as pontas, com a cor do feitiço em uso */
+      const spell = overlay ? (overlay.mode === 'shield' ? 'shield' : 'zoltraak') : pose === 'cast' ? (root.userData.castKind as string | undefined) ?? 'zoltraak' : pose === 'fly' ? 'flight' : null;
+      if (spell && VEIN_COLORS[spell]) veinTarget.set(VEIN_COLORS[spell]);
+      const vu = staffMat.uniforms;
+      vu.uVeinColor.value.lerp(veinTarget, 1 - Math.exp(-dt * 6));
+      vu.uMagic.value = magic; vu.uTime.value = time;
+      aura.color.copy(auraBase).lerp(vu.uVeinColor.value, clamp(magic * 0.8, 0, 0.8));
       idleRing.rotation.set(time * 0.8, time * 0.5, 0); idleRingMat.opacity = 0.22 + magic * 0.4;
       mat.glow.emissiveIntensity = 1.2 + magic * 1.6 + sin(time * 5) * 0.1 * magic;
       aura.intensity = 0.85 + magic * 1.6;
