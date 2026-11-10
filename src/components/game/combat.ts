@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { registerSpecGloss, retargetModel, type Retarget } from './rig-retarget';
-import { terrainHeight } from './world';
+import { terrainHeight, type WorldCollider } from './world';
 import type { SfxName } from './audio';
 import type { LootItemId } from './progression';
 
@@ -172,6 +172,14 @@ const SPAWNS: Spawn[] = [
 
 /** Diferença de altura máxima (m) para um golpe corpo-a-corpo alcançar o jogador. */
 const MELEE_HEIGHT = 2.1;
+/** Fração de `radius` usada como corpo sólido (o raio cheio é a área de acerto, mais generosa). */
+const MOB_BODY = .75;
+/** Raio da jogadora (igual ao do PlayerMotor). */
+const PLAYER_RADIUS = .62;
+/** Acima dessa diferença de altura a jogadora passa por cima dos inimigos (pulo alto / voo). */
+const MOB_PLAYER_HEIGHT = 1.6;
+/** Tamanho da célula da grade espacial de colisores (m). */
+const GRID_CELL = 4;
 const MOB_STATS: Record<MobKind, { hp: number; xp: number; speed: number; range: number; damage: number; cadence: number; radius: number }> = {
   wolf: { hp: 72, xp: 28, speed: 3.2, range: 1.35, damage: 5, cadence: 1.8, radius: .8 },
   bandit: { hp: 120, xp: 46, speed: 2.2, range: 2.1, damage: 9, cadence: 2.4, radius: .72 },
@@ -315,6 +323,9 @@ export class CombatSystem {
   /** Barreira física (escudo) que os inimigos não atravessam; atualizada pelo jogo a cada quadro. */
   barrier: { center: THREE.Vector3; normal: THREE.Vector3; half: number } | null = null;
   private flinchPose = newPose();
+  private colliders: WorldCollider[] = [];
+  private colliderCount = -1;
+  private grid = new Map<number, WorldCollider[]>();
 
   constructor(private scene: THREE.Scene, private onExperience: (amount: number) => void = () => { }, private onItem: (item: LootItemId) => void = () => { }, private onPickup: (message: string) => void = () => { }) {
     this.root.name = 'hostile-mobs'; scene.add(this.root);
@@ -570,6 +581,60 @@ export class CombatSystem {
     }
   }
 
+  /** Colisores estáticos do mundo (círculos) que os inimigos não atravessam. */
+  setColliders(colliders: WorldCollider[]) {
+    this.colliders = colliders; this.colliderCount = -1;
+  }
+
+  /** Grade espacial dos colisores; refeita se a lista mudar (ex.: NPC adicionado depois). */
+  private colliderGrid() {
+    if (this.colliderCount === this.colliders.length) return this.grid;
+    this.grid.clear(); this.colliderCount = this.colliders.length;
+    for (const c of this.colliders) {
+      const x0 = Math.floor((c.x - c.radius) / GRID_CELL), x1 = Math.floor((c.x + c.radius) / GRID_CELL);
+      const z0 = Math.floor((c.z - c.radius) / GRID_CELL), z1 = Math.floor((c.z + c.radius) / GRID_CELL);
+      for (let gx = x0; gx <= x1; gx++) for (let gz = z0; gz <= z1; gz++) {
+        const key = gx * 73856093 ^ gz * 19349663;
+        let cell = this.grid.get(key); if (!cell) this.grid.set(key, cell = []);
+        cell.push(c);
+      }
+    }
+    return this.grid;
+  }
+
+  private collideWorld(pos: THREE.Vector3, radius: number, knockback: THREE.Vector3) {
+    if (!this.colliders.length) return;
+    const grid = this.colliderGrid();
+    for (let pass = 0; pass < 2; pass++) {
+      const x0 = Math.floor((pos.x - radius) / GRID_CELL), x1 = Math.floor((pos.x + radius) / GRID_CELL);
+      const z0 = Math.floor((pos.z - radius) / GRID_CELL), z1 = Math.floor((pos.z + radius) / GRID_CELL);
+      for (let gx = x0; gx <= x1; gx++) for (let gz = z0; gz <= z1; gz++) {
+        const cell = grid.get(gx * 73856093 ^ gz * 19349663); if (!cell) continue;
+        for (const c of cell) {
+          const dx = pos.x - c.x, dz = pos.z - c.z, min = radius + c.radius, d2 = dx * dx + dz * dz;
+          if (d2 >= min * min) continue;
+          const d = Math.sqrt(d2) || .001, nx = d2 > 1e-8 ? dx / d : 1, nz = d2 > 1e-8 ? dz / d : 0;
+          pos.x = c.x + nx * min; pos.z = c.z + nz * min;
+          const into = knockback.x * nx + knockback.z * nz; // o empurrão de golpes não atravessa o obstáculo
+          if (into < 0) { knockback.x -= nx * into; knockback.z -= nz * into; }
+        }
+      }
+    }
+  }
+
+  /** Empurra a jogadora para fora dos inimigos vivos (corpo sólido); chamar depois do PlayerMotor. */
+  pushPlayer(player: THREE.Vector3) {
+    for (const mob of this.mobs) {
+      if (mob.health <= 0) continue;
+      const pos = mob.root.position;
+      if (player.y - pos.y >= MOB_PLAYER_HEIGHT) continue;
+      const dx = player.x - pos.x, dz = player.z - pos.z, min = MOB_STATS[mob.kind].radius * MOB_BODY + PLAYER_RADIUS, d2 = dx * dx + dz * dz;
+      if (d2 >= min * min) continue;
+      const d = Math.sqrt(d2) || .001, nx = d2 > 1e-8 ? dx / d : 1, nz = d2 > 1e-8 ? dz / d : 0;
+      player.x = pos.x + nx * min; player.z = pos.z + nz * min;
+    }
+  }
+
   update(delta: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
     const dt = Math.min(delta, .05);
     for (const mob of this.mobs) {
@@ -689,13 +754,30 @@ export class CombatSystem {
       mob.air = def.air * Math.sin(clamp((progress - def.lungeFrom) / (span + .1), 0, 1) * Math.PI);
     } else mob.air = damp(mob.air, 0, 12, dt);
 
-    // --- soft separation so packs do not stack into each other
+    // --- colisão entre inimigos: cada um resolve metade da sobreposição (o outro resolve a outra metade na sua vez)
+    const body = stats.radius * MOB_BODY;
     for (const other of this.mobs) {
       if (other === mob || other.health <= 0) continue;
       const ox = pos.x - other.root.position.x, oz = pos.z - other.root.position.z;
-      const min = (stats.radius + MOB_STATS[other.kind].radius) * .55, d2 = ox * ox + oz * oz;
-      if (d2 < min * min && d2 > 1e-6) { const d = Math.sqrt(d2), push = (min - d) * .5; pos.x += ox / d * push; pos.z += oz / d * push; }
+      const min = body + MOB_STATS[other.kind].radius * MOB_BODY, d2 = ox * ox + oz * oz;
+      if (d2 >= min * min) continue;
+      if (d2 > 1e-6) { const d = Math.sqrt(d2), push = (min - d) * .5; pos.x += ox / d * push; pos.z += oz / d * push; }
+      else { pos.x += Math.sin(mob.phase) * .05; pos.z += Math.cos(mob.phase) * .05; } // empilhados exatamente: desempata
     }
+
+    // --- colisão com a jogadora (só quando ela está na altura do inimigo, não voando por cima)
+    if (player.y - pos.y < MOB_PLAYER_HEIGHT) {
+      const px = pos.x - player.x, pz = pos.z - player.z, min = body + PLAYER_RADIUS, d2 = px * px + pz * pz;
+      if (d2 < min * min && d2 > 1e-6) {
+        const d = Math.sqrt(d2), nx = px / d, nz = pz / d;
+        pos.x = player.x + nx * min; pos.z = player.z + nz * min;
+        const into = mob.knockback.x * nx + mob.knockback.z * nz;
+        if (into < 0) { mob.knockback.x -= nx * into; mob.knockback.z -= nz * into; }
+      }
+    }
+
+    // --- colisão com o cenário (árvores, pedras, construções): duas passadas para deslizar sem atravessar
+    this.collideWorld(pos, body, mob.knockback);
 
     // --- terrain follow + body tilt to the slope
     // escudo sólido: empurra o inimigo para fora da muralha e anula o avanço contra ela

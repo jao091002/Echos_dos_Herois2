@@ -309,6 +309,7 @@ export default function Game() {
     /* ---- NPC Aldren e a missão dos lobos (ao lado do caminho, à esquerda do ponto de partida) */
     const npc = new QuestGiver(scene, -3.4, -1.6, Math.atan2(0 - -3.4, 2 - -1.6), world.colliders);
     npc.load();
+    combat.setColliders(world.colliders); // inimigos colidem com árvores, pedras, construções e o NPC
     const quest: WolfQuest = { stage: 'available', kills: 0, reward: 0 };
     const publishQuest = () => setWolfQuest({ ...quest });
     let isNearNpc = false;
@@ -651,6 +652,7 @@ export default function Game() {
         const forward = inCine ? 0 : (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0) + touchMoveRef.current.forward;
         const side = inCine ? 0 : (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0) + touchMoveRef.current.side;
         const moving = combat.health > 0 && motor.update(delta, THREE.MathUtils.clamp(forward, -1, 1), THREE.MathUtils.clamp(side, -1, 1), keys.has('alt') || touchSprintRef.current, keys.has(' ') || touchJumpRef.current, cameraRig.yaw, magic.flying, Number(keys.has(' ') || touchJumpRef.current) - Number(keys.has('control')), cameraRig.pitch);
+        combat.pushPlayer(hero.root.position); // inimigos têm corpo sólido
         if (combat.health > 0 && (shiftLockActive || Math.hypot(motor.velocity.x, motor.velocity.z) > .2)) {
           hero.root.userData.facing = shiftLockActive ? cameraRig.yaw + Math.PI : Math.atan2(motor.velocity.x, motor.velocity.z);
         }
