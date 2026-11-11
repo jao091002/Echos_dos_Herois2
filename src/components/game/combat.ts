@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { registerSpecGloss, retargetModel, type Retarget } from './rig-retarget';
+import { adoptFragments, bindSkin, computeSkin, placeAt, segDist, tearSeams, textureSampler, toLocal, type SkinSeg } from './mob-skin';
 import { terrainHeight, type WorldCollider } from './world';
 import type { SfxName } from './audio';
 import type { LootItemId } from './progression';
@@ -127,7 +128,24 @@ const FLINCH: Key[] = [
 type Leg = {
   hip: THREE.Group; knee: THREE.Group; ankle: THREE.Group;
   hy: number; hz: number; l1: number; l2: number; bend: number;
-  phase: number; front: boolean; side: number; footY: number;
+  /** phase = fase no trote/caminhada; gallopPhase = fase no galope (sequência rotatória: traseiras, depois dianteiras). */
+  phase: number; gallopPhase: number; front: boolean; side: number;
+  /** Tornozelo (espaço do root): altura, avanço na marcha e avanço parado (pose esculpida do modelo). */
+  footY: number; footZ: number; restZ: number;
+  /** Comprimento quadril→tornozelo da pose de ligação: na marcha de compasso a perna de apoio mantém esse valor. */
+  stance: number;
+};
+type Gait = { stride: number; duty: number; lift: number };
+/**
+ * Ajuste do rig a um modelo com skin procedural: pivôs no lugar das juntas do modelo, pose neutra igual à pose
+ * esculpida (braços já afastados, boca já aberta...) e passadas compatíveis com o tamanho real das pernas.
+ */
+type RigFit = {
+  pelvisY: number; pelvisZ: number; walkDrop: number; jaw: number;
+  arm: { x: number; z: number; e: number };
+  gait: Gait; gallop: Gait | null; cadence: number; legScale: number;
+  /** Humanoides: altura da pelve pela perna de apoio (Leg.stance), em vez de um quique fixo. */
+  compass: boolean;
 };
 type Arm = { shoulder: THREE.Group; elbow: THREE.Group; wrist: THREE.Group; side: number; legPhase: number; weapon: boolean };
 type Chain = {
@@ -138,6 +156,7 @@ type Rig = {
   pelvis: THREE.Group; chest: THREE.Group; neck: THREE.Group | null; head: THREE.Group; jaw: THREE.Group | null;
   legs: Leg[]; arms: Arm[]; ears: { group: THREE.Group; side: number }[];
   tail: Chain | null; braids: Chain[]; cloth: Chain[]; breath: THREE.Mesh | null; target: THREE.Mesh; modelMesh?: THREE.Mesh; retarget?: Retarget;
+  fit?: RigFit;
 };
 type MatEntry = { m: THREE.MeshStandardMaterial; base: number };
 type ArcFx = { pivot: THREE.Group; ring: THREE.Mesh; material: THREE.MeshBasicMaterial; axis: 'x' | 'y'; from: number; to: number };
@@ -147,7 +166,11 @@ type Mob = {
   health: number; phase: number; attackTimer: number; respawnTimer: number; spawn: number; hitFlash: number; flashing: boolean;
   attack: AttackDef | null; attackAge: number; attackHit: boolean; lungeU: number; air: number;
   gait: number; speed: number; alert: number; guard: number; aggro: boolean; look: number; slope: number;
+  /** 0 = trote, 1 = galope (lobo); misturado continuamente pela velocidade. */
+  gallop: number;
   stagger: number; staggerMax: number; staggerPower: number;
+  /** Direção do último golpe no espaço do inimigo (x = lado, z = frente); o recuo e a queda vão para o lado oposto. */
+  hitX: number; hitZ: number;
   deathAge: number; deathSide: number; knockback: THREE.Vector3;
   home: THREE.Vector3; homeYaw: number; strafeDir: number; strafeTimer: number;
   vel: THREE.Vector2; prev: THREE.Vector2; vf: number; vs: number;
@@ -187,12 +210,95 @@ const MOB_STATS: Record<MobKind, { hp: number; xp: number; speed: number; range:
 };
 
 // stride = foot travel per step (m), duty = fraction of the cycle a foot is planted, lift = swing height
-const GAIT: Record<MobKind, { stride: number; duty: number; lift: number }> = {
+const GAIT: Record<MobKind, Gait> = {
   wolf: { stride: .95, duty: .58, lift: .17 },
   bandit: { stride: .7, duty: .62, lift: .14 },
   demon: { stride: .8, duty: .64, lift: .12 },
 };
+/** Galope do lobo procedural: apoio curto (fase aérea), passada longa e patas subindo mais. */
+const WOLF_GALLOP: Gait = { stride: 1.15, duty: .34, lift: .22 };
+/** Velocidades (m/s) em que o lobo passa do trote ao galope. */
+const GALLOP_FROM = 2.35, GALLOP_TO = 3.05;
 const strideAmp = (g: { stride: number }, speedN: number) => g.stride * smoothstep(speedN, .06, .7) * (.85 + .15 * Math.min(speedN, 1.4));
+/** Interpolação de fase no círculo (0..1), pelo caminho mais curto. */
+const lerpPhase = (a: number, b: number, t: number) => { let d = b - a; d -= Math.round(d); return a + d * t; };
+
+/* ------------------------------------------------------------------ *
+ *  Anatomia dos modelos com skin procedural (medida nos próprios .glb,
+ *  espaço do root: y = altura do chão, +z = frente, x = lado; valores de
+ *  x dos membros são do lado +X e espelhados para o outro lado)
+ * ------------------------------------------------------------------ */
+/** wolf.glb (escala 1,1, centrado na caixa envolvente, patas em y = 0). */
+const WOLF_ANAT = {
+  pelvis: [0, .56, -.33] as V3, chest: [0, .58, .3] as V3, neck: [0, .7, .42] as V3, head: [0, .88, .62] as V3, jaw: [0, .775, .69] as V3,
+  tail: [[0, .6, -.42], [0, .36, -.6], [0, .29, -.79]] as V3[],
+  /** ombro → cotovelo → carpo (tornozelo do rig) → pata */
+  front: { hip: [.2, .56, .31] as V3, l1: .184, l2: .3, footY: .12, footZ: .465 },
+  /** quadril → joelho → jarrete (tornozelo do rig) → pata */
+  hind: { hip: [.17, .56, -.33] as V3, l1: .206, l2: .206, footY: .28, footZ: -.41 },
+  /** apoio das patas na marcha (a pose esculpida tem as dianteiras bem à frente) */
+  frontWalkZ: .4, hindWalkZ: -.4,
+};
+/** Ossos do lobo: 0 pelve, 1 peito, 2 pescoço, 3 cabeça, 4 mandíbula, 5-7 cauda, 8-19 patas (DE, DD, TE, TD × quadril/joelho/tornozelo). */
+const WOLF_BONES = 20;
+const WOLF_SKIN: SkinSeg[] = (() => {
+  const s: SkinSeg[] = [
+    { bone: 0, a: [0, .58, -.45], b: [0, .6, -.02], r: .2 },
+    { bone: 1, a: [0, .6, -.02], b: [0, .64, .36], r: .25 },
+    { bone: 2, a: [0, .66, .36], b: [0, .86, .6], r: .17 },
+    { bone: 3, a: [0, .9, .6], b: [0, .84, .96], r: .15 },
+    { bone: 4, a: [0, .75, .7], b: [0, .66, .93], r: .07 },
+    { bone: 5, a: [0, .6, -.42], b: [0, .36, -.6], r: .1 },
+    { bone: 6, a: [0, .36, -.6], b: [0, .29, -.79], r: .1 },
+    { bone: 7, a: [0, .29, -.79], b: [0, .56, -.97], r: .11 },
+  ];
+  for (const side of [-1, 1]) {
+    s.push({ bone: 3, a: [side * .14, 1, .66], b: [side * .2, 1.2, .42], r: .07 }); // chifres
+    const f = side < 0 ? 8 : 11, h = side < 0 ? 14 : 17;
+    s.push({ bone: f, a: [side * .2, .56, .31], b: [side * .21, .38, .35], r: .085, cut: .2, side });
+    s.push({ bone: f + 1, a: [side * .21, .38, .35], b: [side * .22, .12, .465], r: .075, cut: .15, side });
+    s.push({ bone: f + 2, a: [side * .22, .12, .465], b: [side * .23, .02, .56], r: .07, cut: .14, side });
+    s.push({ bone: h, a: [side * .17, .56, -.33], b: [side * .2, .38, -.23], r: .11, cut: .22, side });
+    s.push({ bone: h + 1, a: [side * .2, .38, -.23], b: [side * .21, .28, -.41], r: .075, cut: .15, side });
+    s.push({ bone: h + 2, a: [side * .21, .28, -.41], b: [side * .21, .03, -.31], r: .07, cut: .14, side });
+  }
+  return s;
+})();
+
+/** aura.glb (altura 2,3 m, eixo do corpo na origem depois de DEMON_DZ). */
+const DEMON_DZ = -.18;
+const DEMON_ANAT = {
+  pelvis: [0, 1.12, .02] as V3, torso: [0, 1.2, 0] as V3, head: [0, 1.8, -.1] as V3,
+  // eixo do braço medido pela luva, fatia por fatia
+  shoulder: [.2, 1.62, -.11] as V3, elbow: [.285, 1.36, -.072] as V3, wrist: [.372, 1.1, -.021] as V3, hand: [.39, .96, -.02] as V3,
+  hip: [.056, 1.07, .04] as V3, knee: [.06, .64, .06] as V3, ankle: [.06, .21, .02] as V3, toe: [.06, .03, .14] as V3, heel: [.06, .03, -.08] as V3,
+  l1: .44, l2: .44, footY: .21, footZ: .02,
+};
+/** Ossos do demônio: 0 pelve, 1 tronco, 2 cabeça, 3-8 braços (E, D × ombro/cotovelo/pulso), 9-14 pernas (E, D × quadril/joelho/tornozelo), 15-20 painéis da saia. */
+const DEMON_BONES = 21;
+const DEMON_SKIN: SkinSeg[] = (() => {
+  const A = DEMON_ANAT, m = (p: V3, s: number): V3 => [p[0] * s, p[1], p[2]];
+  const s: SkinSeg[] = [
+    { bone: 0, a: [0, .98, .02], b: [0, 1.24, 0], r: .16, rz: .12 },
+    { bone: 1, a: [0, 1.24, 0], b: [0, 1.6, -.07], r: .17, rz: .13 },
+    { bone: 2, a: [0, 1.6, -.07], b: [0, 1.76, -.1], r: .06 },
+    { bone: 2, a: [0, 1.78, -.1], b: [0, 2.12, -.13], r: .2 },
+  ];
+  for (const side of [-1, 1]) {
+    const arm = side < 0 ? 3 : 6, leg = side < 0 ? 9 : 12;
+    s.push({ bone: 2, a: [side * .12, 2.05, -.08], b: [side * .2, 2.3, -.12], r: .06 }); // chifres
+    // luvas finas: cortes justos para os volumes da saia ao lado dos quadris não seguirem as mãos
+    s.push({ bone: arm, a: m(A.shoulder, side), b: m(A.elbow, side), r: .05, cut: .07, side });
+    s.push({ bone: arm + 1, a: m(A.elbow, side), b: m(A.wrist, side), r: .045, cut: .062, side });
+    s.push({ bone: arm + 2, a: m(A.wrist, side), b: m(A.hand, side), r: .05, cut: .075, side });
+    // cortes justos: o vestido que passa perto das coxas fica com a pelve/saia, não balança junto com a perna
+    s.push({ bone: leg, a: m(A.hip, side), b: m(A.knee, side), r: .085, cut: .11, side });
+    s.push({ bone: leg + 1, a: m(A.knee, side), b: m(A.ankle, side), r: .06, cut: .09, side });
+    s.push({ bone: leg + 2, a: m(A.ankle, side), b: m(A.toe, side), r: .055, cut: .1, side });
+    s.push({ bone: leg + 2, a: m(A.ankle, side), b: m(A.heel, side), r: .045, cut: .08, side });
+  }
+  return s;
+})();
 
 const LOOT: Record<LootItemId, { color: string }> = {
   wolfPelt: { color: '#c3a77d' }, banditToken: { color: '#d0ad65' }, demonAsh: { color: '#a66a64' },
@@ -417,7 +523,50 @@ export class CombatSystem {
     baked.rotateY(CombatSystem.DEMON_YAW); baked.scale(k, k, k); baked.computeBoundingBox();
     const bb = baked.boundingBox!; baked.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2);
     const geo = CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.0045, 1 / 900);
-    baked.dispose(); geo.computeBoundingBox(); geo.computeBoundingSphere();
+    baked.dispose();
+    // o eixo do corpo (pernas, tronco) fica na origem; a caixa envolvente estava deslocada pela cauda do vestido
+    geo.translate(0, 0, DEMON_DZ);
+    geo.computeBoundingBox(); geo.computeBoundingSphere();
+    // pesos de skin: corpo, braços e pernas seguem o rig; o vestido é dividido entre os seis painéis com mola da saia
+    const sample = textureSampler((mesh.material as THREE.MeshStandardMaterial).map), uv = geo.attributes.uv as THREE.BufferAttribute, rgb: [number, number, number] = [0, 0, 0];
+    computeSkin(geo, DEMON_SKIN, DEMON_BONES, (x, y, z, w, i) => {
+      // tecido cor de vinho (vestido, cabelo) encostado nas luvas nunca segue as mãos: senão a saia estica até elas
+      if (sample) {
+        const c = sample(uv.getX(i), uv.getY(i), rgb);
+        if (c[0] > .05 && c[0] > c[1] * 1.6 && c[0] > c[2] * 1.15) {
+          let any = 0;
+          for (let b = 3; b <= 8; b++) w[b] = 0;
+          for (let b = 0; b < DEMON_BONES; b++) any = Math.max(any, w[b]);
+          if (any < 1e-3) w[y > 1.45 ? 1 : 0] = 1;
+        }
+      }
+      const zone = smoothstep(Math.hypot(x, z), .13, .23) * smoothstep(1.22 - y, 0, .5);
+      if (zone <= 0) return;
+      let armW = 0, legW = 0, sum = 0;
+      for (let b = 3; b <= 8; b++) armW = Math.max(armW, w[b]);
+      for (let b = 9; b <= 14; b++) legW = Math.max(legW, w[b]);
+      const s = zone * (1 - smoothstep(armW, .15, .6)) * (1 - smoothstep(legW, .3, .8));
+      if (s <= 0) return;
+      for (let b = 0; b < 15; b++) sum += w[b];
+      const k = (1 - s) / (sum || 1); for (let b = 0; b < 15; b++) w[b] *= k;
+      const a = THREE.MathUtils.euclideanModulo(Math.atan2(x, z) / (TAU / 6), 6), i0 = Math.floor(a) % 6, f = a - Math.floor(a);
+      w[15 + i0] += s * (1 - f); w[15 + (i0 + 1) % 6] += s * f;
+    });
+    // antebraço/mão só se ligam à própria cadeia; o braço se liga ao tronco/cabeça apenas no ombro
+    const chain = (b: number) => b >= 3 && b <= 5 ? 1 : b >= 6 && b <= 8 ? 2 : 0;
+    tearSeams(geo, (a, b, yMax) => {
+      const ca = chain(a), cb = chain(b);
+      if (ca === cb) return true;
+      const arm = ca ? a : b, other = ca ? b : a;
+      return (arm === 3 || arm === 6) && (other === 1 || other === 2) && chain(other) === 0 && yMax > 1.47;
+    });
+    // pingentes e enfeites soltos junto às mãos/antebraços acompanham o membro
+    adoptFragments(geo, 600, .14, (x, y, z) => {
+      const A = DEMON_ANAT, sd = x < 0 ? -1 : 1, m = (p: V3): V3 => [p[0] * sd, p[1], p[2]];
+      if (segDist(x, y, z, m(A.wrist), m(A.hand)) < .1) return sd < 0 ? 5 : 8;
+      if (segDist(x, y, z, m(A.elbow), m(A.wrist)) < .08) return sd < 0 ? 4 : 7;
+      return -1;
+    });
     this.demonGeo = geo; this.geometries.push(geo); this.demonTex = mesh.material as THREE.Material;
     for (const mob of this.mobs) if (mob.kind === 'demon') this.attachDemonModel(mob);
   }
@@ -427,12 +576,63 @@ export class CombatSystem {
     const rig = mob.rig, mt = (this.demonTex as THREE.MeshStandardMaterial).clone();
     mt.metalness = Math.min(mt.metalness, 0.3); mt.roughness = Math.max(mt.roughness, 0.7); mt.emissive = new THREE.Color('#ff5a3a'); mt.emissiveIntensity = 0; mt.needsUpdate = true;
     this.materials.push(mt);
-    const model = new THREE.Mesh(this.demonGeo, mt); model.castShadow = true; model.receiveShadow = true; model.name = 'demon-model'; model.frustumCulled = false;
-    model.position.set(0, -PELVIS_Y, 0); // pés no chão local (a pelve fica a PELVIS_Y)
-    rig.pelvis.add(model); rig.modelMesh = model;
-    rig.pelvis.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh && m !== model && m !== rig.target) m.visible = false; });
+    this.fitDemon(mob);
+    const [aL, aR] = [rig.arms.find(a => a.side < 0)!, rig.arms.find(a => a.side > 0)!], [lL, lR] = [rig.legs.find(l => l.side < 0)!, rig.legs.find(l => l.side > 0)!];
+    const bones: THREE.Object3D[] = [rig.pelvis, rig.chest, rig.head,
+      aL.shoulder, aL.elbow, aL.wrist, aR.shoulder, aR.elbow, aR.wrist,
+      lL.hip, lL.knee, lL.ankle, lR.hip, lR.knee, lR.ankle, ...rig.cloth.map(c => c.segs[0])];
+    const model = bindSkin(mob.root, this.demonGeo, mt, bones); model.name = 'demon-model';
+    rig.modelMesh = model;
+    // a luz de preenchimento ficava encostada na frente do vestido (mancha vermelha): vai para a frente do rosto
+    const fill = this.fills.find(f => f.mob === mob.root); if (fill) fill.offset.set(0, 2.7, 1.3);
+    rig.pelvis.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh && m !== rig.target) m.visible = false; });
     mob.mats.push({ m: mt, base: 0 });
     mob.eyes = mob.eyes.filter(e => { e.m.emissiveIntensity = 0; return false; });
+  }
+
+  /**
+   * Encaixa o rig humanoide na anatomia do aura.glb: pivôs nas juntas, pernas e braços com o comprimento real e a pose
+   * de repouso dos braços (afastados do vestido, cotovelo dobrado) medida do próprio modelo.
+   */
+  private fitDemon(mob: Mob) {
+    const r = mob.rig, A = DEMON_ANAT, root = mob.root;
+    const fit: RigFit = {
+      pelvisY: A.pelvis[1], pelvisZ: A.pelvis[2], walkDrop: .015, jaw: 1, arm: { x: 0, z: 0, e: 0 },
+      gait: { stride: .6, duty: .6, lift: .09 }, gallop: null, cadence: 3.4, legScale: 1, compass: true,
+    };
+    r.fit = fit;
+    this.neutralPose(mob)();
+    placeAt(root, r.chest, A.torso); placeAt(root, r.head, A.head);
+    const mir = (p: V3, s: number): V3 => [p[0] * s, p[1], p[2]];
+    let ax = 0, az = 0, ae = 0;
+    const q = new THREE.Quaternion(), eu = new THREE.Euler();
+    for (const arm of r.arms) {
+      const s = arm.side, S = mir(A.shoulder, s);
+      placeAt(root, arm.shoulder, S);
+      const sl = toLocal(root, r.chest, S), d = toLocal(root, r.chest, mir(A.elbow, s)).sub(sl), l1 = d.length(); d.normalize();
+      const f = toLocal(root, r.chest, mir(A.wrist, s)).sub(toLocal(root, r.chest, mir(A.elbow, s))), l2 = f.length(); f.normalize();
+      // rotação do ombro (ordem XYZ, só X e Z) que leva o braço pendente (-Y) até a direção do braço do modelo
+      const zA = Math.asin(clamp(d.x, -1, 1)), xA = Math.atan2(-d.z, -d.y);
+      f.applyQuaternion(q.setFromEuler(eu.set(xA, 0, zA, 'XYZ')).invert());
+      const eA = Math.atan2(-f.z, -f.y);
+      ax += (xA + .06) / 2; az += (s * zA - .1) / 2; ae += (-eA - .22) / 2;
+      arm.elbow.position.set(0, -l1, 0); arm.wrist.position.set(0, -l2, 0);
+    }
+    fit.arm = { x: ax, z: az, e: ae };
+    for (const leg of r.legs) {
+      const hip = mir(A.hip, leg.side);
+      placeAt(root, leg.hip, hip);
+      const pl = toLocal(root, r.pelvis, hip); leg.hy = pl.y; leg.hz = pl.z;
+      leg.l1 = A.l1; leg.l2 = A.l2; leg.knee.position.set(0, -A.l1, 0); leg.ankle.position.set(0, -A.l2, 0);
+      leg.footY = A.footY; leg.footZ = A.footZ; leg.restZ = A.footZ;
+    }
+    this.neutralPose(mob)();
+    // comprimento quadril→tornozelo de cada perna na pose de ligação (a perna de apoio mantém esse valor na marcha)
+    const hp = new THREE.Vector3(), ap = new THREE.Vector3();
+    for (const leg of r.legs) {
+      root.worldToLocal(leg.hip.getWorldPosition(hp)); root.worldToLocal(leg.ankle.getWorldPosition(ap));
+      leg.stance = hp.distanceTo(ap);
+    }
   }
   private banditTemplate: THREE.Object3D | null = null;
 
@@ -506,6 +706,13 @@ export class CombatSystem {
       col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
     }
     geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    // pesos de skin: patas, coluna, pescoço, cabeça, mandíbula e cauda seguem o rig procedural
+    computeSkin(geo, WOLF_SKIN, WOLF_BONES, (_x, y, z, w) => {
+      // mandíbula: só o que está abaixo da linha da boca, à frente da articulação; a cabeça fica com o resto
+      const below = z > .64 && y < .785 + (z - .68) * .06 && y > .5;
+      if (below) { const f = smoothstep(z, .66, .76); w[3] *= 1 - f; w[4] = Math.max(w[4], f); }
+      else w[4] = 0;
+    });
     this.wolfGeo = geo; this.geometries.push(geo);
     for (const mob of this.mobs) if (mob.kind === 'wolf') this.attachWolfModel(mob);
   }
@@ -515,13 +722,51 @@ export class CombatSystem {
     const rig = mob.rig, tint = new THREE.Color(CombatSystem.WOLF_TINTS[mob.spawn % CombatSystem.WOLF_TINTS.length]);
     const material = new THREE.MeshStandardMaterial({ vertexColors: true, color: tint, roughness: 0.88, metalness: 0.04, emissive: new THREE.Color('#ff5a3a'), emissiveIntensity: 0 });
     this.materials.push(material);
-    const model = new THREE.Mesh(this.wolfGeo, material); model.castShadow = true; model.receiveShadow = true; model.name = 'wolf-model';
-    model.position.set(0, -0.82, 0); // a pelve fica a 0,82 m: o modelo apoia os pés no chão local
-    rig.pelvis.add(model); rig.modelMesh = model;
+    this.fitWolf(mob);
+    const L = (front: boolean, side: number) => rig.legs.find(l => l.front === front && l.side === side)!;
+    const bones: THREE.Object3D[] = [rig.pelvis, rig.chest, rig.neck!, rig.head, rig.jaw!, ...rig.tail!.segs];
+    for (const [front, side] of [[true, -1], [true, 1], [false, -1], [false, 1]] as const) { const l = L(front, side); bones.push(l.hip, l.knee, l.ankle); }
+    const model = bindSkin(mob.root, this.wolfGeo, material, bones); model.name = 'wolf-model';
+    rig.modelMesh = model;
+    // na marcha as patas dianteiras apoiam um pouco mais sob o ombro que na pose esculpida (sobra alcance para a passada)
+    for (const leg of rig.legs) leg.footZ = leg.front ? WOLF_ANAT.frontWalkZ : WOLF_ANAT.hindWalkZ;
     // esconde o lobo procedural (a área de acerto e o rig seguem funcionando)
-    rig.pelvis.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh && m !== model && m !== rig.target) m.visible = false; });
+    rig.pelvis.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh && m !== rig.target) m.visible = false; });
     mob.mats.push({ m: material, base: 0 });
     mob.eyes = mob.eyes.filter(e => { e.m.emissiveIntensity = 0; return false; });
+  }
+
+  /** Pose neutra de ligação: sem ataque, parado, calmo, cadeias em repouso; aplica o rig uma vez (dt = 0). */
+  private neutralPose(mob: Mob) {
+    const keep = { speed: mob.speed, alert: mob.alert, guard: mob.guard, look: mob.look, gallop: mob.gallop, gait: mob.gait, vf: mob.vf, vs: mob.vs };
+    mob.speed = 0; mob.alert = 0; mob.guard = 0; mob.look = 0; mob.gallop = 0; mob.vf = 0; mob.vs = 0;
+    const r = mob.rig;
+    for (const chain of [...r.cloth, ...r.braids, ...(r.tail ? [r.tail] : [])]) { chain.x = chain.restX.slice(); chain.z.fill(0); chain.vx.fill(0); chain.vz.fill(0); }
+    const p = this.flinchPose; clearPose(p);
+    if (mob.kind === 'wolf') this.applyWolf(mob, p, 0, 0); else this.applyHumanoid(mob, p, 0, 0);
+    mob.root.updateMatrixWorld(true);
+    return () => Object.assign(mob, keep);
+  }
+
+  /** Encaixa o rig do lobo na anatomia do wolf.glb (pivôs nas juntas do modelo, pernas com o comprimento real). */
+  private fitWolf(mob: Mob) {
+    const r = mob.rig, A = WOLF_ANAT, root = mob.root;
+    r.fit = {
+      pelvisY: A.pelvis[1], pelvisZ: A.pelvis[2], walkDrop: 0, jaw: .45, arm: { x: 0, z: 0, e: 0 },
+      gait: { stride: .34, duty: .58, lift: .12 }, gallop: { stride: .4, duty: .3, lift: .17 }, cadence: 4.6, legScale: .62, compass: false,
+    };
+    this.neutralPose(mob)();
+    placeAt(root, r.chest, A.chest); placeAt(root, r.neck!, A.neck); placeAt(root, r.head, A.head); placeAt(root, r.jaw!, A.jaw);
+    r.tail!.segs.forEach((s, i) => placeAt(root, s, A.tail[i]));
+    for (const leg of r.legs) {
+      const d = leg.front ? A.front : A.hind, hip: V3 = [d.hip[0] * leg.side, d.hip[1], d.hip[2]];
+      placeAt(root, leg.hip, hip);
+      const pl = toLocal(root, r.pelvis, hip); leg.hy = pl.y; leg.hz = pl.z;
+      leg.l1 = d.l1; leg.l2 = d.l2; leg.knee.position.set(0, -d.l1, 0); leg.ankle.position.set(0, -d.l2, 0);
+      leg.footY = d.footY; leg.footZ = d.footZ; leg.restZ = d.footZ;
+    }
+    // de novo com as pernas novas: o IK põe joelhos e tornozelos sobre os do modelo; matrizes prontas para o bind
+    this.neutralPose(mob)();
   }
 
   get alive() { return this.mobs.filter(mob => mob.health > 0).length; }
@@ -565,6 +810,11 @@ export class CombatSystem {
     {
       mob.health = Math.max(0, mob.health - damage); mob.hitFlash = .18; this.onSfx('hitEnemy', damage / 60);
       const pushX = mob.root.position.x - point.x, pushZ = mob.root.position.z - point.z;
+      // de onde veio o golpe, no espaço do inimigo (recuo e queda vão para o lado oposto)
+      {
+        const yaw = mob.root.rotation.y, c = Math.cos(yaw), s = Math.sin(yaw), lx = -pushX * c + pushZ * s, lz = -pushX * s - pushZ * c, l = Math.hypot(lx, lz);
+        if (l > 1e-3) { mob.hitX = lx / l; mob.hitZ = lz / l; } else { mob.hitX = 0; mob.hitZ = 1; }
+      }
       const pushLength = Math.hypot(pushX, pushZ);
       if (pushLength > .001) {
         const force = (3.2 + Math.min(damage, 44) * .075) * knock;
@@ -806,8 +1056,10 @@ export class CombatSystem {
     mob.vs = mob.vel.x * cy - mob.vel.y * sy;
 
     // --- gait phase advances with ground speed so planted feet do not slide
-    const g = GAIT[mob.kind], speedN = mob.speed / stats.speed, amp = strideAmp(g, speedN);
-    if (amp > .05 && mob.speed > .05) mob.gait += Math.min(mob.speed * g.duty / amp, 3.4) * dt;
+    // lobo: trote em velocidade baixa, galope na perseguição (troca contínua, as patas re-sincronizam aos poucos)
+    if (mob.kind === 'wolf') mob.gallop = damp(mob.gallop, def ? mob.gallop : smoothstep(mob.speed, GALLOP_FROM, GALLOP_TO), 3, dt);
+    const g = this.gaitOf(mob), speedN = mob.speed / stats.speed, amp = strideAmp(g, speedN);
+    if (amp > .05 && mob.speed > .05) mob.gait += Math.min(mob.speed * g.duty / amp, mob.rig.fit?.cadence ?? 3.4) * dt;
 
     // --- attack state machine
     mob.guard = damp(mob.guard, mob.aggro && !def && mob.stagger <= 0 ? 1 : 0, 6, dt);
@@ -823,8 +1075,13 @@ export class CombatSystem {
     const pose = mob.pose;
     if (mob.attack) sampleKeys(mob.attack.keys, mob.attackAge / mob.attack.duration, pose); else clearPose(pose);
     if (mob.stagger > 0) {
-      sampleKeys(FLINCH, 1 - mob.stagger / mob.staggerMax, this.flinchPose);
-      for (const f of POSE_FIELDS) pose[f] += this.flinchPose[f] * mob.staggerPower;
+      // recuo direcional: o tronco cede para longe do golpe (de frente = para trás, de lado = inclina e gira)
+      const fl = this.flinchPose, pw = mob.staggerPower;
+      sampleKeys(FLINCH, 1 - mob.stagger / mob.staggerMax, fl);
+      const k = clamp(-fl.lean / .3, 0, 1) * pw;
+      for (const f of POSE_FIELDS) if (f !== 'lean') pose[f] += fl[f] * pw;
+      pose.lean += fl.lean * pw * (.3 + .7 * mob.hitZ);
+      pose.roll += .32 * k * mob.hitX; pose.twist += .35 * k * mob.hitX; pose.headYaw -= .4 * k * mob.hitX;
     }
 
     if (mob.kind === 'wolf') this.applyWolf(mob, pose, elapsed, dt); else this.applyHumanoid(mob, pose, elapsed, dt);
@@ -932,8 +1189,19 @@ export class CombatSystem {
     leg.ankle.rotation.x = a2 + footPitch;
   }
 
-  private footCycle(mob: Mob, leg: Leg, amp: number, g: { stride: number; duty: number; lift: number }) {
-    const ph = fract(mob.gait + leg.phase);
+  /** Marcha atual: a do modelo ajustado (pernas reais) ou a do rig procedural, misturada com o galope. */
+  private gaitOf(mob: Mob): Gait {
+    const fit = mob.rig.fit, trot = fit?.gait ?? GAIT[mob.kind], gal = mob.kind === 'wolf' ? (fit ? fit.gallop : WOLF_GALLOP) : null;
+    const k = gal ? mob.gallop : 0;
+    if (k <= 0 || !gal) return trot;
+    const o = this.gaitTmp;
+    o.stride = lerp(trot.stride, gal.stride, k); o.duty = lerp(trot.duty, gal.duty, k); o.lift = lerp(trot.lift, gal.lift, k);
+    return o;
+  }
+  private gaitTmp: Gait = { stride: 0, duty: 0, lift: 0 };
+
+  private footCycle(mob: Mob, leg: Leg, amp: number, g: Gait) {
+    const ph = fract(mob.gait + lerpPhase(leg.phase, leg.gallopPhase, mob.gallop));
     let stepZ = 0, lift = 0, toeOff = 0;
     if (amp > .01) {
       if (ph < g.duty) { const s = ph / g.duty; stepZ = amp * (.5 - s); toeOff = smoothstep(s, .75, 1); }
@@ -946,19 +1214,27 @@ export class CombatSystem {
   }
 
   private applyWolf(mob: Mob, p: Pose, t: number, dt: number) {
-    const r = mob.rig, g = GAIT.wolf, neck = r.neck!, jaw = r.jaw!;
+    const r = mob.rig, fit = r.fit, g = this.gaitOf(mob), neck = r.neck!, jaw = r.jaw!;
     const speedN = clamp(mob.speed / MOB_STATS.wolf.speed, 0, 1.5);
     const amp = strideAmp(g, speedN), w = smoothstep(speedN, .05, .6);
-    const c = mob.gait * TAU, alert = mob.alert;
-    const breath = Math.sin(t * 2.4 + mob.phase);
-    const bob = Math.cos(c * 2) * .03 * w, pitchOsc = Math.sin(c * 2 + .8) * .028 * w, sway = Math.sin(c) * w;
+    const c = mob.gait * TAU, alert = mob.alert, gal = mob.gallop, trot = 1 - gal;
+    // respiração: ofegante (mais rápida e funda) depois de correr
+    const pant = w * .6 + alert * .25, breath = Math.sin(t * (2.4 + pant * 4) + mob.phase) * (1 + pant);
+    // trote: quique duplo por ciclo; galope: corpo mais alto na fase aérea agrupada (~.1), mais baixo no apoio
+    // das dianteiras (~.6), e a coluna flexiona/estende
+    const bob = (Math.cos(c * 2) * .03 * trot + Math.cos(c - TAU * .1) * .05 * gal) * w;
+    const flex = Math.cos(c - TAU * .9) * gal * w;
+    const pitchOsc = Math.sin(c * 2 + .8) * .028 * w * trot, sway = Math.sin(c) * w * trot;
+    const k = fit?.legScale ?? 1;
 
-    r.pelvis.position.set(0, .82 + bob + p.drop - alert * .035 + breath * .004, -.08 + p.push);
-    r.pelvis.rotation.set(p.lean + pitchOsc + alert * .03, sway * .06, sway * .03 + p.roll);
-    r.chest.rotation.set(-pitchOsc * 1.3 - p.lean * .3, -sway * .1 + p.twist * .4, -sway * .03);
-    neck.rotation.set(-alert * .1 + p.head * .5 - .04 + breath * .01, mob.look * .5, 0);
-    r.head.rotation.set(.1 + p.head * .55 - (r.pelvis.rotation.x + r.chest.rotation.x + neck.rotation.x) * .55, mob.look * .5 + p.headYaw * .7 - r.chest.rotation.y * .5, 0);
-    jaw.rotation.x = clamp(p.jaw * .85 + w * (.08 + Math.sin(t * 13) * .04) + alert * .05, 0, 1);
+    r.pelvis.position.set(0, (fit?.pelvisY ?? .82) + bob * k + p.drop * k - alert * .035 * k + breath * .004, (fit?.pelvisZ ?? -.08) + p.push * k);
+    // flexão: a pelve "encaixa" (frente sobe) e o peito desce, arqueando as costas; extensão faz o contrário
+    r.pelvis.rotation.set(p.lean + pitchOsc + alert * .03 - flex * .12 - gal * w * .04, sway * .06, sway * .03 + p.roll);
+    r.chest.rotation.set(-pitchOsc * 1.3 - p.lean * .3 + flex * .24, -sway * .1 + p.twist * .4, -sway * .03);
+    // no galope a cabeça estica para a frente e compensa o balanço do corpo (olhar fixo na presa)
+    neck.rotation.set(-alert * .1 + p.head * .5 - .04 + breath * .01 + gal * w * .22, mob.look * .5, 0);
+    r.head.rotation.set(.1 + p.head * .55 - (r.pelvis.rotation.x + r.chest.rotation.x + neck.rotation.x) * .55 - gal * w * .1, mob.look * .5 + p.headYaw * .7 - r.chest.rotation.y * .5, 0);
+    jaw.rotation.x = clamp((p.jaw * .85 + w * (.08 + Math.sin(t * 13) * .04) + alert * .05 + Math.max(0, breath) * pant * .05) * (fit?.jaw ?? 1), 0, 1);
 
     for (const ear of r.ears) {
       const flick = Math.max(0, Math.sin(t * 1.1 + mob.phase * 5 + ear.side) - .9) * 6;
@@ -972,20 +1248,35 @@ export class CombatSystem {
 
     for (const leg of r.legs) {
       const { stepZ, lift, toeOff } = this.footCycle(mob, leg, amp, g);
-      let footZ = leg.hz - .08 + stepZ, footY = leg.footY + lift;
-      if (leg.front) { footZ += p.reach * .42; footY += p.reach * .24; } else { footZ -= p.reach * .26; footY += p.reach * .1; }
+      let footZ = lerp(leg.restZ, leg.footZ, w) + stepZ, footY = leg.footY + lift;
+      if (leg.front) { footZ += p.reach * .42 * k; footY += p.reach * .24 * k; } else { footZ -= p.reach * .26 * k; footY += p.reach * .1 * k; }
       this.solveLeg(leg, r.pelvis.position.y, r.pelvis.position.z, r.pelvis.rotation.x, leg.front ? r.chest.rotation.x : 0, footZ, footY, toeOff * .45 + p.reach * (leg.front ? .5 : .8));
     }
   }
 
   private applyHumanoid(mob: Mob, p: Pose, t: number, dt: number) {
-    const r = mob.rig, kind = mob.kind, g = GAIT[kind], heavy = kind === 'demon' ? 1.12 : 1;
+    const r = mob.rig, fit = r.fit, kind = mob.kind, g = this.gaitOf(mob), heavy = kind === 'demon' ? 1.12 : 1;
     const speedN = clamp(mob.speed / MOB_STATS[kind].speed, 0, 1.5);
     const amp = strideAmp(g, speedN), w = smoothstep(speedN, .05, .6);
     const c = mob.gait * TAU, alert = mob.alert, guard = mob.guard;
     const breath = Math.sin(t * 2.1 + mob.phase), sway = Math.sin(c) * w;
+    const armX = fit?.arm.x ?? 0, armZ = fit?.arm.z ?? 0, armE = fit?.arm.e ?? 0;
 
-    r.pelvis.position.set(sway * .028, PELVIS_Y - Math.cos(c * 2) * .04 * w * heavy + p.drop + breath * .006 - alert * .03, p.push);
+    const feet = r.legs.map(leg => this.footCycle(mob, leg, amp, g));
+    let py = (fit?.pelvisY ?? PELVIS_Y) - Math.cos(c * 2) * .04 * w * heavy;
+    const pz = (fit?.pelvisZ ?? 0) + p.push;
+    if (fit && fit.compass) {
+      // marcha de compasso: a pelve fica na altura em que a perna de apoio tem o mesmo comprimento da pose esculpida
+      // (malha reta no apoio, só dobra no balanço); sobe no meio do apoio e desce no duplo apoio, sem salto na troca
+      py = fit.pelvisY;
+      r.legs.forEach((leg, i) => {
+        const dz = lerp(leg.restZ, leg.footZ, w) + feet[i].stepZ - (pz + leg.hz);
+        const need = Math.sqrt(Math.max(0, leg.stance * leg.stance - dz * dz)) + leg.footY - leg.hy + feet[i].lift * 3;
+        if (need < py) py = need;
+      });
+      py -= fit.walkDrop * w; // sem agachar em alerta: com salto alto a perna de apoio fica esticada
+    } else py -= alert * .03;
+    r.pelvis.position.set(sway * .028, py + p.drop + breath * .006, pz);
     r.pelvis.rotation.set(.03 * w + p.lean * .3 + alert * .04, p.twist * .35 + sway * .1 * heavy, sway * .035 + p.roll * .4);
     r.chest.rotation.set(p.lean * .7 + w * .04 + breath * .01, p.twist * .65 - sway * .2 * heavy, -sway * .04 + p.roll * .6);
     r.head.rotation.set(
@@ -1001,15 +1292,15 @@ export class CombatSystem {
       const pX = left ? p.lX : p.rX, pZ = left ? p.lZ : p.rZ, pE = left ? p.lE : p.rE;
       const swing = Math.cos((mob.gait + arm.legPhase) * TAU) * (arm.weapon ? .2 : .45) * w * heavy;
       const guardX = (arm.weapon ? -.5 : -.3) * guard, idleSway = Math.sin(t * 1.7 + mob.phase + arm.side) * .02;
-      arm.shoulder.rotation.set(-.06 + swing + pX + guardX + idleSway, 0, arm.side * (.1 + pZ));
-      arm.elbow.rotation.x = -(.22 + pE + guard * .55 + w * .12);
+      arm.shoulder.rotation.set(-.06 + swing + pX + guardX + idleSway + armX, 0, arm.side * (.1 + pZ + armZ));
+      arm.elbow.rotation.x = -(.22 + pE + guard * .55 + w * .12 + armE);
       arm.wrist.rotation.x = arm.weapon ? -.45 : -.1;
     }
 
-    for (const leg of r.legs) {
-      const { stepZ, lift, toeOff } = this.footCycle(mob, leg, amp, g);
-      this.solveLeg(leg, r.pelvis.position.y, r.pelvis.position.z, r.pelvis.rotation.x, 0, .04 + stepZ, leg.footY + lift, toeOff * .4);
-    }
+    r.legs.forEach((leg, i) => {
+      const { stepZ, lift, toeOff } = feet[i];
+      this.solveLeg(leg, r.pelvis.position.y, r.pelvis.position.z, r.pelvis.rotation.x, 0, lerp(leg.restZ, leg.footZ, w) + stepZ, leg.footY + lift, toeOff * .4);
+    });
     r.retarget?.update();
 
     for (const chain of r.cloth) {
@@ -1020,18 +1311,49 @@ export class CombatSystem {
     if (r.tail) this.stepChain(r.tail, dt, mob.vf, mob.vs, t * 2.4 + mob.phase, p.glow * .1);
   }
 
+  /**
+   * Morte em etapas: recuo do golpe final (o corpo ainda desliza com o empurrão) → pernas cedem → queda com
+   * gravidade (acelera até bater no chão) e um pequeno quique → membros relaxam → afunda na terra e some.
+   * O lobo tomba de lado; humanoides caem para longe do golpe (de costas quando atingidos de frente).
+   */
   private animateDefeat(mob: Mob, dt: number, elapsed: number) {
-    const age = mob.deathAge;
-    if (age > 3.1) { mob.root.visible = false; return; }
-    const f = Math.min(1, age / .9), e = f * f * (3 - 2 * f), wolf = mob.kind === 'wolf';
+    const age = mob.deathAge, root = mob.root, pos = root.position, wolf = mob.kind === 'wolf';
+    mob.hitFlash = Math.max(0, mob.hitFlash - dt);
+    if (age > 3.6) { root.visible = false; return; }
+    pos.x += mob.knockback.x * dt; pos.z += mob.knockback.z * dt;
+    mob.knockback.multiplyScalar(Math.exp(-4.5 * dt));
+    this.collideWorld(pos, MOB_STATS[mob.kind].radius * MOB_BODY, mob.knockback);
+
+    const t0 = wolf ? .26 : .38, T = wolf ? .4 : .48, u = clamp((age - t0) / T, 0, 1), b = age - t0 - T;
+    const fall = b < 0 ? u * u : 1 - .085 * Math.exp(-5 * b) * Math.abs(Math.sin(b * 13));
+    const recoil = smoothstep(age, 0, .09) * (1 - smoothstep(age, .1, .45));
+    const buckle = smoothstep(age, .06, .45), settle = b > 0 ? smoothstep(b, 0, .6) : 0;
+    const sink = smoothstep(age, 2.5, 3.6);
+
     const p = mob.pose; clearPose(p);
-    p.lean = (wolf ? .15 : .45) * e; p.drop = -(wolf ? .36 : .5) * e; p.head = .6 * e; p.jaw = .6 * e;
-    p.rX = .45 * e; p.lX = .5 * e; p.rE = .2 * e; p.lE = .3 * e; p.rZ = .6 * e; p.lZ = .6 * e; p.tail = -.4 * e;
-    mob.speed = 0; mob.alert = 0; mob.guard = 0; mob.look = 0; mob.vf = 0; mob.vs = 0;
-    mob.root.rotation.z = mob.deathSide * e * 1.4;
-    mob.root.scale.setScalar(Math.max(.001, 1 - smoothstep(age, 2.4, 3.1)));
+    if (wolf) {
+      // ganido (cabeça para trás, boca aberta) → patas cedem → tomba de lado com a cabeça e a cauda largadas
+      p.head = -.45 * recoil + .55 * fall; p.jaw = .9 * recoil + .4 * fall * (1 - settle * .5);
+      p.lean = .12 * buckle * (1 - fall); p.drop = -.2 * buckle * (1 - fall * .7);
+      p.tail = .5 * recoil - .5 * fall; p.reach = .25 * fall * (1 - settle);
+      root.rotation.set(0, root.rotation.y, -mob.deathSide * 1.48 * fall);
+      pos.y = terrainHeight(pos.x, pos.z) + Math.sin(1.48 * fall) * .27 - sink * .55;
+    } else {
+      // jogado para trás → joelhos cedem → cai para longe do golpe; os braços sobem na queda e se abrem no chão
+      const dx = -mob.hitX, dz = -mob.hitZ, fly = fall * (1 - settle);
+      p.lean = -.35 * recoil + .3 * buckle * (1 - fall) - .1 * fall; p.drop = -.18 * buckle * (1 - fall * .8);
+      p.head = -.5 * recoil + .25 * buckle * (1 - fall) - .2 * fly + .15 * settle; p.headYaw = .5 * settle * (mob.deathSide);
+      p.rX = -1.1 * fly + .25 * settle + .3 * buckle * (1 - fall); p.lX = -.9 * fly + .35 * settle + .3 * buckle * (1 - fall);
+      p.rZ = .55 * fall + .4 * settle; p.lZ = .6 * fall + .5 * settle; p.rE = .3 * buckle + .2 * settle; p.lE = .4 * buckle + .3 * settle;
+      p.twist = .25 * fall * mob.deathSide; p.roll = .2 * fall * mob.deathSide;
+      const ang = 1.42 * fall;
+      root.rotation.set(ang * dz, root.rotation.y, -ang * dx);
+      pos.y = terrainHeight(pos.x, pos.z) + Math.sin(ang) * (mob.kind === 'demon' ? .26 : .17) - sink * .7;
+    }
+    mob.speed = 0; mob.alert = 0; mob.guard = 0; mob.look = 0; mob.vf = 0; mob.vs = 0; mob.gallop = 0;
+    root.scale.setScalar(1 - sink * .35);
     if (wolf) this.applyWolf(mob, p, elapsed, dt); else this.applyHumanoid(mob, p, elapsed, dt);
-    this.updateMaterials(mob, e);
+    this.updateMaterials(mob, buckle);
     if (mob.arc) mob.arc.pivot.visible = false;
   }
 
@@ -1083,8 +1405,8 @@ export class CombatSystem {
       kind: spawn.kind, root, rig, target: rig.target, health: stats.hp, phase: Math.random() * 6, attackTimer: 1 + Math.random() * 1.8,
       respawnTimer: 0, spawn: index, hitFlash: 0, flashing: false,
       attack: null, attackAge: 0, attackHit: false, lungeU: 0, air: 0,
-      gait: Math.random(), speed: 0, alert: 0, guard: 0, aggro: false, look: 0, slope: 0,
-      stagger: 0, staggerMax: .3, staggerPower: 1, deathAge: 0, deathSide: 1, knockback: new THREE.Vector3(),
+      gait: Math.random(), speed: 0, alert: 0, guard: 0, aggro: false, look: 0, slope: 0, gallop: 0,
+      stagger: 0, staggerMax: .3, staggerPower: 1, hitX: 0, hitZ: -1, deathAge: 0, deathSide: 1, knockback: new THREE.Vector3(),
       home: new THREE.Vector3(spawn.x, 0, spawn.z), homeYaw: 0, strafeDir: Math.random() < .5 ? -1 : 1, strafeTimer: 1 + Math.random() * 2,
       vel: new THREE.Vector2(), prev: new THREE.Vector2(spawn.x, spawn.z), vf: 0, vs: 0,
       pose: newPose(), mats, eyes, arc,
@@ -1167,7 +1489,9 @@ export class CombatSystem {
       }
       part(ankle, this.sphere, hide, [0, -.03, .07], [.095, .065, .15]);
       for (const toe of [-1, 0, 1]) part(ankle, this.sphere, hide, [toe * .055, -.035, .19], [.04, .04, .07]);
-      legs.push({ hip, knee, ankle, hy: pelvisPos[1], hz: pelvisPos[2], l1, l2, bend: front ? -1 : 1, phase, front, side, footY: .09 });
+      // galope rotatório: traseira esquerda, traseira direita, dianteira direita, dianteira esquerda
+      const gallopPhase = front ? (side < 0 ? .56 : .45) : (side < 0 ? 0 : .1);
+      legs.push({ hip, knee, ankle, hy: pelvisPos[1], hz: pelvisPos[2], l1, l2, bend: front ? -1 : 1, phase, gallopPhase, front, side, footY: .09, footZ: pelvisPos[2] - .08, restZ: pelvisPos[2] - .08, stance: 0 });
     };
     // trot: diagonal pairs move together
     for (const side of [-1, 1]) {
@@ -1214,7 +1538,7 @@ export class CombatSystem {
       if (!demon) part(knee, this.cylinder, accent, [0, -.34, 0], [1.15, .22, 1.15]);
       part(ankle, this.box, hide, [0, -.05, .08], [.19, .13, .34]);
       part(ankle, this.sphere, hide, [0, -.05, .26], [.095, .065, .1]);
-      legs.push({ hip, knee, ankle, hy: -.04, hz: 0, l1, l2, bend: 1, phase: side > 0 ? 0 : .5, front: false, side, footY: demon ? .13 : .12 });
+      legs.push({ hip, knee, ankle, hy: -.04, hz: 0, l1, l2, bend: 1, phase: side > 0 ? 0 : .5, gallopPhase: side > 0 ? 0 : .5, front: false, side, footY: demon ? .13 : .12, footZ: .04, restZ: .04, stance: 0 });
     }
 
     // ---- torso
@@ -1339,7 +1663,8 @@ export class CombatSystem {
     this.onSfx('enemyDie');
     this.onKill(mob.kind);
     mob.root.visible = true;
-    mob.deathAge = 0; mob.deathSide = Math.random() < .5 ? 1 : -1;
+    // tomba para longe do golpe (de lado, para o lobo); golpe de frente/de trás sorteia o lado
+    mob.deathAge = 0; mob.deathSide = Math.abs(mob.hitX) > .25 ? -Math.sign(mob.hitX) : Math.random() < .5 ? 1 : -1;
     mob.attack = null; mob.attackAge = 0; mob.stagger = 0;
     mob.respawnTimer = 12 + Math.random() * 8;
     const stats = MOB_STATS[mob.kind];
