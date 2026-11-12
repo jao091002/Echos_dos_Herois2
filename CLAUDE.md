@@ -43,7 +43,9 @@ The game loop and React are bridged by refs, not by state:
 
 **Multiplayer and save:**
 - `server/relay.mjs` is a dumb room relay (max 4 per room, stamps `from`). The first player in a room is the host. It has its own `server/package.json` and `Dockerfile`, plus `render.yaml` at the root, so it can be deployed on its own. Vercel can't host it because it has no persistent WebSockets. It serves `GET /health` and `GET /rooms` (public rooms), and reads the env vars `PORT`, `ALLOWED_ORIGINS` and `MAX_CONNECTIONS`.
-- The game's official server comes from `NEXT_PUBLIC_MP_SERVER` (a `wss://` URL, set in Vercel). Without it, the default is `ws://<host>:3210`.
+- The default transport is P2P (server value `p2p`). Browsers connect over WebRTC (PeerJS, using the free public broker only for signaling). The first player in a room claims the PeerJS id `ecos-da-era-dos-herois-<room>` and becomes the in-browser relay with the same protocol as `relay.mjs`. There is a 2 s heartbeat; a silent host is replaced after 15 s and a silent player is dropped after 20 s. `hostbye`/`bye` are sent on `pagehide`.
+- `NEXT_PUBLIC_MP_SERVER` (a `wss://` URL, set in Vercel) replaces P2P with a hosted relay. The room list (`/rooms`) only exists in relay mode.
+- E2E multiplayer test: Playwright with 2 Chromium contexts against `npm run dev`. Use `--use-angle=d3d11`, because SwiftShader takes about 270 ms per frame and trips the timeouts. The hooks are `window.__ecos.net` and `window.__ecos.mp()`.
 - `net.ts` (`NetClient`) is the browser side. `CombatSystem.netRole` is `solo`, `host` or `client`. The host simulates mobs, targets the nearest player and broadcasts `snapshot()` at 10 Hz. Clients run `updatePuppet` and send damage to the host (`onHitRequest`). Loot is per client (each one runs `defeat()` locally).
 - `remote-players.ts` keeps a fixed pool of 3 remote avatars created at startup. Never create heroes at runtime, because each one has a PointLight.
 - The party lives in `Game.tsx` (`pinv`/`pacc`/`pst`/`pleave` messages). Cura em Grupo and Despertar reach party members.

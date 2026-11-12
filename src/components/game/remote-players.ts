@@ -61,11 +61,11 @@ export class RemotePlayers {
   }
   clear() { for (const s of this.slots) if (s.id) this.remove(s.id); }
 
-  /** Interpola posição/rotação e anima os avatares ativos. Some quem ficou 5 s sem mandar estado. */
+  /** Interpola posição/rotação e anima os avatares ativos. Some quem ficou 15 s sem mandar estado (aba em segundo plano para de enviar). */
   update(time: number, dt: number, now: number) {
     for (const s of this.slots) {
       if (!s.id || !s.st) continue;
-      if (now - s.seen > 5000) { this.remove(s.id); continue; }
+      if (now - s.seen > 15000) { this.remove(s.id); continue; }
       const st = s.st, root = s.hero.root;
       this.target.set(st.x, st.y, st.z);
       if (root.position.distanceTo(this.target) > 8) root.position.copy(this.target); // teleporte (Passo Arcano, renascer)

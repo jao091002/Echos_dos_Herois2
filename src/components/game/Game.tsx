@@ -16,7 +16,7 @@ import { PlayerProgression, LOOT_INFO, SKILL_TREES, isUnlocked, unlockNode, type
 import { PlayerMotor, ThirdPersonCamera } from './simulation';
 import { PerfMonitor } from './perf-monitor';
 import { QuestGiver, type QuestStage } from './npc';
-import { NetClient, r2, defaultServer, listRooms, OFFICIAL_SERVER, type NetMsg, type RoomInfo } from './net';
+import { NetClient, r2, defaultServer, listRooms, OFFICIAL_SERVER, isP2P, type NetMsg, type RoomInfo } from './net';
 import { RemotePlayers, type RemoteState } from './remote-players';
 import { readSave, writeSave, exportSave, importSave, type SaveData } from './save';
 
@@ -242,7 +242,10 @@ export default function Game() {
   useEffect(() => {
     let saved: Partial<typeof mpForm> = {};
     try { saved = JSON.parse(localStorage.getItem('ecos.mp.v1') ?? '{}'); } catch { /* sem armazenamento */ }
-    setMpForm({ name: saved.name ?? '', server: saved.server || defaultServer(), room: saved.room ?? 'aurora', priv: !!saved.priv });
+    // endereço salvo que aponta para o próprio site (ex.: wss://…vercel.app:3210) nunca funcionou: volta ao padrão
+    let server = saved.server || defaultServer();
+    try { if (!isP2P(server) && new URL(server).hostname === location.hostname && location.hostname !== 'localhost') server = defaultServer(); } catch { server = defaultServer(); }
+    setMpForm({ name: saved.name ?? '', server, room: saved.room ?? 'aurora', priv: !!saved.priv });
   }, []);
   const connectMp = (roomOverride?: string) => {
     const form = roomOverride ? { ...mpForm, room: roomOverride, priv: false } : mpForm;
@@ -790,6 +793,8 @@ export default function Game() {
         quest: () => ({ ...quest, level: progression.level, xp: progression.experience, next: progression.nextLevelXp }),
         questKill: () => combat.onKill('wolf'),
         npcTalk: () => { isNearNpc = true; talkToNpc(); },
+        // multijogador (testes automatizados): rede, avatares remotos e papel no combate
+        net: netRef.current, mp: () => ({ status: netRef.current!.status, error: netRef.current!.error, id: netRef.current!.id, host: netRef.current!.host, peers: [...netRef.current!.peers.values()], role: combat.netRole, remotes: remotes.active().map(s => ({ id: s.id, name: s.st.name, cls: s.st.cls, x: s.hero.root.position.x, z: s.hero.root.position.z })), mobs: combat.snapshot().length, mob0: combat.snapshot()[0], health: combat.health, party: partyRef.current }),
       };
     }
     const interactMarker = () => {
@@ -900,7 +905,7 @@ export default function Game() {
           const hp = hero.root.position;
           net.send({ t: 'st', x: r2(hp.x), y: r2(hp.y), z: r2(hp.z), yaw: r2(hero.root.rotation.y), pose: netPose, lp: netLoco, spd: r2(netSpeed),
             ov: netOverlay, ck: (hero.root.userData.castKind as string | undefined) ?? null, hp: Math.round(combat.health), mhp: Math.round(combat.maxHealth),
-            cls: heroChoiceRef.current.cls, look: heroChoiceRef.current.look, name: mpNameRef.current, lvl: progression.level });
+            cls: heroChoiceRef.current.cls, look: heroChoiceRef.current.look, name: net.myName || mpNameRef.current, lvl: progression.level });
         }
       }
       if (combat.netRole === 'host') { snapAcc += delta; if (snapAcc >= .1) { snapAcc = 0; net.send({ t: 'snap', m: combat.snapshot() }); } }
@@ -1436,25 +1441,28 @@ export default function Game() {
     : net.status === 'waking' ? 'Acordando o servidor… (na primeira conexão do dia pode levar até 1 minuto)'
       : net.status === 'connecting' ? 'Conectando…' : net.error || 'Desconectado';
   const mpIdle = net.status === 'offline' || net.status === 'error';
-  const usingOfficial = !!OFFICIAL_SERVER && mpForm.server.trim() === OFFICIAL_SERVER;
+  const p2pMode = isP2P(mpForm.server);
+  const usingOfficial = mpForm.server.trim() === OFFICIAL_SERVER || (p2pMode && isP2P(OFFICIAL_SERVER));
   const mpPanel = () => <div className="mp-panel">
     <label className="mp-field"><span>Seu nome</span><input value={mpForm.name} maxLength={16} placeholder="Viajante" disabled={!mpIdle} onChange={e => setMpForm(f => ({ ...f, name: e.target.value }))} /></label>
     <label className="mp-field"><span>Servidor</span><input value={mpForm.server} spellCheck={false} disabled={!mpIdle} onChange={e => { setMpForm(f => ({ ...f, server: e.target.value })); setRooms(null); }} /></label>
-    {OFFICIAL_SERVER && !usingOfficial && mpIdle && <button type="button" className="text-btn mp-official" onClick={() => { setMpForm(f => ({ ...f, server: OFFICIAL_SERVER })); setRooms(null); void refreshRooms(OFFICIAL_SERVER); }}>↺ Usar o servidor oficial</button>}
+    {!usingOfficial && mpIdle && <button type="button" className="text-btn mp-official" onClick={() => { setMpForm(f => ({ ...f, server: OFFICIAL_SERVER })); setRooms(null); void refreshRooms(OFFICIAL_SERVER); }}>{isP2P(OFFICIAL_SERVER) ? '↺ Voltar ao modo padrão (p2p)' : '↺ Usar o servidor oficial'}</button>}
     <label className="mp-field"><span>Sala</span><input value={mpForm.room} maxLength={24} spellCheck={false} disabled={!mpIdle} onChange={e => setMpForm(f => ({ ...f, room: e.target.value }))} /></label>
-    <label className="mp-check"><input type="checkbox" checked={mpForm.priv} disabled={!mpIdle} onChange={e => setMpForm(f => ({ ...f, priv: e.target.checked }))} /><span>Sala privada (não aparece na lista; entra quem souber o nome)</span></label>
+    {!p2pMode && <label className="mp-check"><input type="checkbox" checked={mpForm.priv} disabled={!mpIdle} onChange={e => setMpForm(f => ({ ...f, priv: e.target.checked }))} /><span>Sala privada (não aparece na lista; entra quem souber o nome)</span></label>}
     <div className={`mp-status mp-${net.status}`}><i />{mpStatusText}</div>
     {!mpIdle
       ? <button type="button" className="menu-line" onClick={disconnectMp}>{net.status === 'online' ? 'Desconectar' : 'Cancelar'}</button>
-      : <button type="button" className="continue" onClick={() => connectMp()}>{mpForm.priv ? 'CRIAR / ENTRAR NA SALA PRIVADA' : 'CRIAR / ENTRAR NA SALA'} <span>→</span></button>}
-    {mpIdle && <div className="mp-rooms">
+      : <button type="button" className="continue" onClick={() => connectMp()}>{mpForm.priv && !p2pMode ? 'CRIAR / ENTRAR NA SALA PRIVADA' : 'CRIAR / ENTRAR NA SALA'} <span>→</span></button>}
+    {mpIdle && !p2pMode && <div className="mp-rooms">
       <div className="mp-rooms-head"><span>SALAS ABERTAS</span><button type="button" className="text-btn" disabled={roomsLoading} onClick={() => void refreshRooms(mpForm.server.trim())}>{roomsLoading ? 'Buscando…' : '↻ Atualizar'}</button></div>
       {rooms === null ? <p className="mp-help">{roomsLoading ? 'Consultando o servidor (se estava dormindo, pode demorar um pouco)…' : 'Clique em Atualizar para ver as salas.'}</p>
         : rooms.length === 0 ? <p className="mp-help">Nenhuma sala aberta agora — crie uma e chame os amigos.</p>
           : rooms.map(r => <div key={r.room} className="mp-room"><b>{r.room}</b><small>{r.players}/{r.max} jogadores</small>
             <button type="button" className="mp-btn" disabled={r.players >= r.max} onClick={() => connectMp(r.room)}>{r.players >= r.max ? 'Cheia' : 'Entrar'}</button></div>)}
     </div>}
-    <p className="mp-help">{usingOfficial
+    <p className="mp-help">{p2pMode
+      ? <>Modo padrão (<code>p2p</code>): conexão direta entre os navegadores, sem instalar nada. Quem cria a sala vira o host — combine o nome da sala com os amigos e todos entram nela. Até 4 jogadores; cada um salva o próprio herói na própria máquina.</>
+      : usingOfficial
       ? 'Servidor público do jogo: qualquer pessoa pode criar ou entrar numa sala. Até 4 jogadores por sala; o primeiro a entrar simula os inimigos. Cada um salva o próprio herói na própria máquina.'
       : <>Servidor próprio: quem hospeda roda <code>npm run server</code> e passa o endereço (na rede local, ex.: <code>ws://192.168.0.10:3210</code>). Até 4 jogadores por sala.</>}</p>
   </div>;
