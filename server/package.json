@@ -1,0 +1,17 @@
+{
+  "name": "ecos-multijogador",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Servidor de salas do multijogador de Ecos da Era dos Heróis",
+  "type": "module",
+  "main": "relay.mjs",
+  "scripts": {
+    "start": "node relay.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  }
+}

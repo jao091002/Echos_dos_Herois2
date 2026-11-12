@@ -54,6 +54,8 @@ function sampleKeys(keys: Key[], t: number, out: Pose) {
 }
 
 type AttackId = 'bite' | 'overhead' | 'slash' | 'swipe' | 'slam';
+/** Ordem fixa dos golpes (índice enviado pela rede nas fotos do host). */
+const ATTACK_IDS: AttackId[] = ['bite', 'overhead', 'slash', 'swipe', 'slam'];
 type AttackDef = {
   id: AttackId; duration: number; hitAt: number;
   lunge: number; lungeFrom: number; lungeTo: number; air: number;
@@ -175,6 +177,24 @@ type Mob = {
   home: THREE.Vector3; homeYaw: number; strafeDir: number; strafeTimer: number;
   vel: THREE.Vector2; prev: THREE.Vector2; vf: number; vs: number;
   pose: Pose; mats: MatEntry[]; eyes: MatEntry[]; arc: ArcFx | null;
+  /** Preso no Agarrão do guerreiro: posição/rotação vêm de fora (GrabHandle), sem IA. */
+  held?: { yaw: number; tilt: number; lift: number } | null;
+  /** Multijogador (cliente): última foto do host para este inimigo. */
+  net?: { x: number; z: number; yaw: number; atk: number; age: number; stagger: number; air: number; heldTilt: number; heldLift: number };
+  /** Multijogador (host): última vez (ms) que um cliente mandou a posição deste inimigo agarrado. */
+  netHeldAt?: number;
+};
+/** Controle de um inimigo agarrado (Agarrão do guerreiro). */
+export type GrabHandle = {
+  readonly kind: MobKind;
+  /** Vivo e ainda preso. */
+  readonly alive: boolean;
+  readonly position: THREE.Vector3;
+  /** Coloca o inimigo (pés em x/z, altura extra lift), virado para yaw e tombado tilt rad (deitado ≈ 1.35). */
+  hold: (x: number, z: number, yaw: number, tilt: number, lift?: number) => void;
+  hit: (damage: number) => void;
+  /** Solta com um empurrão (x/z em m/s). */
+  release: (pushX?: number, pushZ?: number) => void;
 };
 type Drop = { root: THREE.Group; kind: 'experience' | LootItemId; age: number; value: number; materials: THREE.Material[]; color: string };
 /**
@@ -421,6 +441,8 @@ export class CombatSystem {
   get engaged() { let n = 0; for (const m of this.mobs) if (m.aggro && m.health > 0) n++; return n; }
   private tmpA = new THREE.Vector3();
   private tmpB = new THREE.Vector3();
+  private tmpC = new THREE.Vector3();
+  private tmpD = new THREE.Vector3();
   private segment = new THREE.Line3();
   /** Efeitos sonoros (ligado pelo jogo ao motor de áudio). */
   onSfx: (name: SfxName, v?: number) => void = () => {};
@@ -788,25 +810,55 @@ export class CombatSystem {
   }
 
   /**
-   * Dano ao longo de um segmento (raios contínuos). Cada inimigo é atingido no máximo uma vez por chamada;
-   * knock escala o empurrão (raios aplicam vários "ticks" pequenos). onHit recebe o ponto de contato no raio.
+   * Primeiro inimigo vivo tocado pelo segmento from → to (raio radius + corpo do inimigo). Não causa dano:
+   * devolve o ponto de contato mais próximo de from (para projéteis que param no primeiro alvo), ou null.
    */
-  damageSegment(from: THREE.Vector3, to: THREE.Vector3, radius: number, damage: number, knock = .35, onHit?: (point: THREE.Vector3) => void) {
-    let count = 0;
+  firstHitOnSegment(from: THREE.Vector3, to: THREE.Vector3, radius: number, out = new THREE.Vector3()) {
     const seg = this.segment.set(from, to);
+    let best = Infinity;
     for (const mob of this.mobs) {
       if (mob.health <= 0) continue;
       const stats = MOB_STATS[mob.kind];
       this.tmpA.set(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? .7 : 1.15), mob.root.position.z);
       const contact = seg.closestPointToPoint(this.tmpA, true, this.tmpB);
       if (contact.distanceTo(this.tmpA) > radius + stats.radius) continue;
+      const d = contact.distanceToSquared(from);
+      if (d < best) { best = d; out.copy(contact); }
+    }
+    return best < Infinity ? out : null;
+  }
+
+  /**
+   * Dano ao longo de um segmento (raios contínuos). Cada inimigo é atingido no máximo uma vez por chamada;
+   * knock escala o empurrão (raios aplicam vários "ticks" pequenos). onHit recebe o ponto de contato no raio.
+   */
+  damageSegment(from: THREE.Vector3, to: THREE.Vector3, radius: number, damage: number, knock = .35, onHit?: (point: THREE.Vector3) => void, once?: Set<object>) {
+    let count = 0;
+    const seg = this.segment.set(from, to);
+    for (const mob of this.mobs) {
+      if (mob.health <= 0) continue;
+      // once: projéteis que atravessam (testados todo quadro) só ferem cada inimigo uma vez
+      if (once) { if (once.has(mob)) continue; }
+      const stats = MOB_STATS[mob.kind];
+      this.tmpA.set(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? .7 : 1.15), mob.root.position.z);
+      const contact = seg.closestPointToPoint(this.tmpA, true, this.tmpB);
+      if (contact.distanceTo(this.tmpA) > radius + stats.radius) continue;
+      once?.add(mob);
       onHit?.(contact);
       this.applyHit(mob, contact, damage, knock); count++;
     }
     return count;
   }
 
-  private applyHit(mob: Mob, point: THREE.Vector3, damage: number, knock: number) {
+  private applyHit(mob: Mob, point: THREE.Vector3, damage: number, knock: number, fromNet = false) {
+    if (this.netRole === 'client' && !fromNet) {
+      // cliente: o dano é decidido pelo host; aqui só o retorno visual imediato (piscar, partículas, som)
+      this.onHitRequest(this.mobs.indexOf(mob), damage, point, knock);
+      mob.hitFlash = .18; mob.root.scale.setScalar(1.05); this.onSfx('hitEnemy', damage / 60);
+      this.tmpD.set(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? .7 : 1.15), mob.root.position.z);
+      this.particles.emit(this.tmpD, mob.kind === 'demon' ? '#ff7a5a' : '#ffe2a8', 6 + Math.min(8, Math.floor(damage / 6)), 3.2, 1.8, .4, 1);
+      return;
+    }
     {
       mob.health = Math.max(0, mob.health - damage); mob.hitFlash = .18; this.onSfx('hitEnemy', damage / 60);
       const pushX = mob.root.position.x - point.x, pushZ = mob.root.position.z - point.z;
@@ -829,6 +881,214 @@ export class CombatSystem {
       if (mob.health === 0) this.defeat(mob);
       else this.reactToHit(mob, damage);
     }
+  }
+
+  /** Durante a cutscene do Agarrão a heroína não recebe golpes. */
+  invulnerable = false;
+
+  /* ==================================================================== MULTIJOGADOR
+   * solo: tudo local. host: simula os inimigos para a sala inteira e escolhe como alvo o jogador mais próximo
+   * (local ou remoto). client: os inimigos são "marionetes" que seguem as fotos do host; golpes do cliente viram
+   * pedidos ao host. Cada jogador tem os próprios drops (loot instanciado) quando um inimigo cai.
+   */
+  netRole: 'solo' | 'host' | 'client' = 'solo';
+  /** Outros jogadores na sala (o host usa para escolher o alvo dos inimigos). */
+  remotes: { id: string; pos: THREE.Vector3; alive: boolean }[] = [];
+  /** host → golpe de inimigo acertou um jogador remoto (o jogo envia pela rede). */
+  onRemoteStrike: (id: string, damage: number, fromX: number, fromZ: number) => void = () => {};
+  /** cliente → pedido de dano a um inimigo (o host aplica). */
+  onHitRequest: (index: number, damage: number, point: THREE.Vector3, knock: number) => void = () => {};
+  /** cliente → Agarrão: o host passa a posicionar o inimigo como o cliente mandar. */
+  onNetHold: (index: number, x: number, z: number, yaw: number, tilt: number, lift: number) => void = () => {};
+  onNetRelease: (index: number, pushX: number, pushZ: number) => void = () => {};
+  /** Alvo atual do golpe em resolução (id remoto, ou null = jogador local). */
+  private strikeTarget: string | null = null;
+  private readonly targetTmp = new THREE.Vector3();
+
+  /** Foto do estado dos inimigos (host → clientes, ~10 vezes por segundo). */
+  snapshot() {
+    return this.mobs.map(m => {
+      const atk = m.attack ? ATTACK_IDS.indexOf(m.attack.id) : -1;
+      return [Math.round(m.root.position.x * 100) / 100, Math.round(m.root.position.z * 100) / 100, Math.round(m.root.rotation.y * 100) / 100,
+        Math.round(m.health * 10) / 10, atk, Math.round(m.attackAge * 100) / 100, Math.round(m.stagger * 100) / 100, Math.round(m.air * 100) / 100,
+        m.held ? Math.round(m.held.tilt * 100) / 100 : -1, m.held ? Math.round(m.held.lift * 100) / 100 : 0];
+    });
+  }
+  /** Cliente: aplica a foto do host (posição alvo, vida, ataque em curso, mortes e renascimentos). */
+  /** Cliente: false até a primeira foto (ao entrar na sala, inimigos já mortos somem sem dar loot). */
+  netSynced = false;
+  applySnapshot(snap: number[][], elapsed: number) {
+    for (let i = 0; i < this.mobs.length && i < snap.length; i++) {
+      const m = this.mobs[i], s = snap[i]; if (!s) continue;
+      const [x, z, yaw, hp, atk, age, stagger, air, heldTilt, heldLift] = s;
+      if (hp <= 0 && m.health > 0) {
+        if (this.netSynced) this.defeat(m); else { m.deathAge = 99; m.root.visible = false; }
+        m.health = 0; m.respawnTimer = Infinity; continue;
+      }
+      if (hp > 0 && m.health <= 0) { this.respawn(m, elapsed); m.root.position.set(x, terrainHeight(x, z), z); m.prev.set(x, z); }
+      if (hp <= 0) continue;
+      m.health = hp;
+      m.net = { x, z, yaw, atk, age, stagger, air, heldTilt, heldLift };
+    }
+    this.netSynced = true;
+  }
+  /** Este jogador virou host (o anterior saiu) ou saiu da sala: volta a simular os inimigos daqui. */
+  resumeAuthority() {
+    for (const m of this.mobs) {
+      if (m.health <= 0 && !Number.isFinite(m.respawnTimer)) m.respawnTimer = 6 + Math.random() * 6;
+      m.net = undefined; m.knockback.set(0, 0, 0);
+      if (m.root.rotation.order === 'YXZ' && !m.held) { m.root.rotation.order = 'XYZ'; m.root.rotation.z = 0; }
+      if (m.health > 0) m.home.set(m.root.position.x, 0, m.root.position.z);
+    }
+  }
+  /** Host: aplica o pedido de dano de um cliente. */
+  netApplyHit(index: number, damage: number, point: THREE.Vector3, knock: number) {
+    const m = this.mobs[index]; if (!m || m.health <= 0) return;
+    this.applyHit(m, point, damage, knock, true);
+  }
+  /** Host: um cliente está segurando este inimigo (Agarrão). */
+  netHold(index: number, x: number, z: number, yaw: number, tilt: number, lift: number) {
+    const m = this.mobs[index]; if (!m || m.health <= 0) return;
+    if (!m.held) { m.held = { yaw, tilt, lift }; m.attack = null; m.speed = 0; m.knockback.set(0, 0, 0); m.root.rotation.order = 'YXZ'; }
+    m.held.yaw = yaw; m.held.tilt = tilt; m.held.lift = lift; m.netHeldAt = performance.now();
+    m.root.position.set(x, terrainHeight(x, z) + lift, z);
+  }
+  netRelease(index: number, pushX: number, pushZ: number) {
+    const m = this.mobs[index]; if (!m || !m.held) return;
+    m.held = null; m.netHeldAt = undefined; m.root.rotation.order = 'XYZ'; m.root.rotation.z = 0;
+    m.knockback.set(pushX, 0, pushZ); m.stagger = m.staggerMax = .9; m.staggerPower = 1; m.attackTimer = Math.max(m.attackTimer, 1.4);
+  }
+  /** Jogador local recebeu um golpe de inimigo vindo do host (aplica escudo, resistência e invulnerabilidade daqui). */
+  receiveStrike(damage: number, fromX: number, fromZ: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+    if (this.invulnerable || this.health <= 0) return;
+    this.tmpA.set(player.x, player.y + .9, player.z); this.tmpB.set(fromX, player.y + 1, fromZ);
+    if (block(this.tmpA, this.tmpB)) return;
+    this.health = Math.max(0, this.health - damage * (1 - this.resist)); this.onSfx('hurt');
+    this.tmpA.set(player.x, player.y + 1, player.z); this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
+  }
+
+  /** Cliente: inimigo segue a foto do host (sem IA), animado com o mesmo sistema de poses. */
+  private updatePuppet(mob: Mob, dt: number, elapsed: number, player: THREE.Vector3) {
+    const n = mob.net, root = mob.root, pos = root.position, stats = MOB_STATS[mob.kind];
+    mob.hitFlash = Math.max(0, mob.hitFlash - dt);
+    root.scale.setScalar(damp(root.scale.x, 1, 18, dt));
+    if (n) {
+      pos.x = damp(pos.x, n.x, 12, dt); pos.z = damp(pos.z, n.z, 12, dt);
+      const dy = THREE.MathUtils.euclideanModulo(n.yaw - root.rotation.y + Math.PI, TAU) - Math.PI; root.rotation.y += dy * (1 - Math.exp(-dt * 12));
+      mob.air = damp(mob.air, n.air, 12, dt);
+      // ataque em curso: segue o mesmo golpe e tempo do host
+      const atkId = n.atk >= 0 ? ATTACK_IDS[n.atk] : null;
+      if (atkId) { if (!mob.attack || mob.attack.id !== atkId) { mob.attack = ATTACKS[atkId]; mob.attackAge = n.age; } else mob.attackAge = Math.max(mob.attackAge + dt, n.age); }
+      else mob.attack = null;
+      mob.stagger = Math.max(n.stagger, mob.stagger - dt);
+      if (n.heldTilt >= 0) { root.rotation.order = 'YXZ'; if (mob.kind === 'wolf') root.rotation.z = damp(root.rotation.z, n.heldTilt, 12, dt); else root.rotation.x = damp(root.rotation.x, -n.heldTilt, 12, dt); }
+      else if (root.rotation.order === 'YXZ') { root.rotation.order = 'XYZ'; root.rotation.z = 0; }
+    }
+    const held = !!n && n.heldTilt >= 0;
+    pos.y = terrainHeight(pos.x, pos.z) + mob.air + (held && n ? n.heldLift : 0);
+    const yaw = root.rotation.y, sy = Math.sin(yaw), cy = Math.cos(yaw);
+    if (!held) {
+      const hF = terrainHeight(pos.x + sy * .7, pos.z + cy * .7), hB = terrainHeight(pos.x - sy * .7, pos.z - cy * .7);
+      mob.slope = damp(mob.slope, clamp(-Math.atan2(hF - hB, 1.4), -.4, .4) * (mob.kind === 'wolf' ? .9 : .35), 8, dt);
+      root.rotation.x = mob.slope;
+    }
+    const inv = 1 / Math.max(dt, 1e-3);
+    mob.vel.x = damp(mob.vel.x, (pos.x - mob.prev.x) * inv, 12, dt); mob.vel.y = damp(mob.vel.y, (pos.z - mob.prev.y) * inv, 12, dt);
+    mob.prev.set(pos.x, pos.z);
+    mob.vf = mob.vel.x * sy + mob.vel.y * cy; mob.vs = mob.vel.x * cy - mob.vel.y * sy;
+    mob.speed = damp(mob.speed, Math.min(stats.speed * 1.5, Math.hypot(mob.vel.x, mob.vel.y)), 8, dt);
+    const dist = Math.hypot(player.x - pos.x, player.z - pos.z);
+    mob.aggro = dist < 24; mob.alert = damp(mob.alert, mob.aggro ? 1 : 0, 4, dt);
+    mob.look = damp(mob.look, 0, 6, dt);
+    if (mob.kind === 'wolf') mob.gallop = damp(mob.gallop, mob.attack ? mob.gallop : smoothstep(mob.speed, GALLOP_FROM, GALLOP_TO), 3, dt);
+    const g = this.gaitOf(mob), speedN = mob.speed / stats.speed, amp = strideAmp(g, speedN);
+    if (amp > .05 && mob.speed > .05) mob.gait += Math.min(mob.speed * g.duty / amp, mob.rig.fit?.cadence ?? 3.4) * dt;
+    mob.guard = damp(mob.guard, mob.aggro && !mob.attack && mob.stagger <= 0 ? 1 : 0, 6, dt);
+    const progress = mob.attack ? mob.attackAge / mob.attack.duration : 0;
+    if (mob.attack && progress >= 1) mob.attack = null;
+    this.updateArc(mob, progress);
+    const pose = mob.pose;
+    if (held) { sampleKeys(FLINCH, .35 + .3 * Math.sin(elapsed * 17 + mob.phase), pose); pose.roll += Math.sin(elapsed * 11 + mob.phase) * .25; }
+    else {
+      if (mob.attack) sampleKeys(mob.attack.keys, progress, pose); else clearPose(pose);
+      if (mob.stagger > 0) {
+        const fl = this.flinchPose, pw = mob.staggerPower;
+        sampleKeys(FLINCH, 1 - Math.min(1, mob.stagger / Math.max(.01, mob.staggerMax)), fl);
+        for (const f of POSE_FIELDS) pose[f] += fl[f] * pw;
+      }
+    }
+    if (mob.kind === 'wolf') this.applyWolf(mob, pose, elapsed, dt); else this.applyHumanoid(mob, pose, elapsed, dt);
+    this.updateMaterials(mob, 0);
+  }
+
+  /**
+   * Agarrão: procura o inimigo vivo mais próximo ao longo de from → from + dir·reach (raio radius) e o prende.
+   * Retorna o controle (posicionar, ferir, soltar) ou null se não havia ninguém ao alcance.
+   */
+  grabMob(from: THREE.Vector3, dir: THREE.Vector3, reach: number, radius = 1.1): GrabHandle | null {
+    const seg = this.segment.set(from, this.tmpB.copy(from).addScaledVector(dir, reach));
+    let best: Mob | null = null, bestD = Infinity;
+    for (const mob of this.mobs) {
+      if (mob.health <= 0 || mob.held) continue;
+      this.tmpA.set(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? .7 : 1.15), mob.root.position.z);
+      const c = seg.closestPointToPoint(this.tmpA, true, this.tmpC);
+      if (c.distanceTo(this.tmpA) > radius + MOB_STATS[mob.kind].radius) continue;
+      const d = c.distanceTo(from); if (d < bestD) { bestD = d; best = mob; }
+    }
+    if (!best) return null;
+    const mob = best;
+    mob.held = { yaw: mob.root.rotation.y, tilt: 0, lift: 0 };
+    mob.attack = null; mob.attackAge = 0; mob.speed = 0; mob.knockback.set(0, 0, 0); mob.air = 0;
+    mob.root.rotation.order = 'YXZ'; // tombar em volta do eixo lateral do próprio corpo
+    this.onSfx('hitEnemy', 1);
+    const self = this;
+    return {
+      kind: mob.kind,
+      get alive() { return mob.health > 0 && !!mob.held; },
+      position: mob.root.position,
+      hold(x, z, yaw, tilt, lift = 0) {
+        if (!mob.held) return;
+        mob.root.position.set(x, terrainHeight(x, z) + lift, z);
+        mob.held.yaw = yaw; mob.held.tilt = tilt; mob.held.lift = lift;
+        if (self.netRole === 'client') self.onNetHold(self.mobs.indexOf(mob), x, z, yaw, tilt, lift);
+      },
+      hit(damage) {
+        if (!mob.held || mob.health <= 0) return;
+        self.tmpD.copy(mob.root.position); self.tmpD.y += .6;
+        self.applyHit(mob, self.tmpD, damage, 0); mob.knockback.set(0, 0, 0);
+        if (mob.health <= 0) { mob.held = null; mob.root.rotation.order = 'XYZ'; }
+      },
+      release(pushX = 0, pushZ = 0) {
+        if (!mob.held) return;
+        mob.held = null; mob.root.rotation.order = 'XYZ'; mob.root.rotation.z = 0;
+        mob.knockback.set(pushX, 0, pushZ);
+        mob.stagger = mob.staggerMax = .9; mob.staggerPower = 1; mob.attackTimer = Math.max(mob.attackTimer, 1.4);
+        if (self.netRole === 'client') self.onNetRelease(self.mobs.indexOf(mob), pushX, pushZ);
+      },
+    };
+  }
+
+  /** Inimigo preso: segue a posição dada de fora, tomba e se debate (sem IA, sem atacar). */
+  private updateHeld(mob: Mob, dt: number, elapsed: number) {
+    const h = mob.held!, root = mob.root, pos = root.position;
+    mob.hitFlash = Math.max(0, mob.hitFlash - dt);
+    root.scale.setScalar(damp(root.scale.x, 1, 18, dt));
+    root.rotation.y = h.yaw;
+    // humanoides caem de costas (inclinação no eixo lateral); o lobo tomba de lado
+    if (mob.kind === 'wolf') { root.rotation.x = damp(root.rotation.x, 0, 10, dt); root.rotation.z = damp(root.rotation.z, h.tilt, 12, dt); }
+    else root.rotation.x = damp(root.rotation.x, -h.tilt, 12, dt);
+    const inv = 1 / Math.max(dt, 1e-3), yaw = h.yaw, sy = Math.sin(yaw), cy = Math.cos(yaw);
+    mob.vel.x = damp(mob.vel.x, (pos.x - mob.prev.x) * inv, 12, dt);
+    mob.vel.y = damp(mob.vel.y, (pos.z - mob.prev.y) * inv, 12, dt);
+    mob.prev.set(pos.x, pos.z); mob.vf = mob.vel.x * sy + mob.vel.y * cy; mob.vs = mob.vel.x * cy - mob.vel.y * sy;
+    mob.speed = 0; mob.guard = damp(mob.guard, 0, 6, dt);
+    this.updateArc(mob, 0);
+    // debatendo-se: o recuo de golpe oscilando rápido, com a cabeça e os braços em pânico
+    const pose = mob.pose;
+    sampleKeys(FLINCH, .35 + .3 * Math.sin(elapsed * 17 + mob.phase), pose);
+    pose.roll += Math.sin(elapsed * 11 + mob.phase) * .25; pose.headYaw += Math.sin(elapsed * 23) * .4;
+    if (mob.kind === 'wolf') this.applyWolf(mob, pose, elapsed, dt); else this.applyHumanoid(mob, pose, elapsed, dt);
+    this.updateMaterials(mob, 0);
   }
 
   /** Colisores estáticos do mundo (círculos) que os inimigos não atravessam. */
@@ -875,7 +1135,7 @@ export class CombatSystem {
   /** Empurra a jogadora para fora dos inimigos vivos (corpo sólido); chamar depois do PlayerMotor. */
   pushPlayer(player: THREE.Vector3) {
     for (const mob of this.mobs) {
-      if (mob.health <= 0) continue;
+      if (mob.health <= 0 || mob.held) continue;
       const pos = mob.root.position;
       if (player.y - pos.y >= MOB_PLAYER_HEIGHT) continue;
       const dx = player.x - pos.x, dz = player.z - pos.z, min = MOB_STATS[mob.kind].radius * MOB_BODY + PLAYER_RADIUS, d2 = dx * dx + dz * dz;
@@ -891,10 +1151,31 @@ export class CombatSystem {
       if (mob.health <= 0) {
         mob.respawnTimer -= dt; mob.deathAge += dt;
         this.animateDefeat(mob, dt, elapsed);
+        // cliente: quem decide o renascimento é o host (chega pela foto)
+        if (this.netRole === 'client' && !Number.isFinite(mob.respawnTimer)) continue;
         if (mob.respawnTimer <= 0) this.respawn(mob, elapsed);
         continue;
       }
-      this.updateMob(mob, dt, elapsed, player, block);
+      if (this.netRole === 'client') {
+        // mob segurado pelo Agarrão deste cliente: posição local (o host recebe pela rede)
+        if (mob.held) this.updateHeld(mob, dt, elapsed); else this.updatePuppet(mob, dt, elapsed, player);
+        continue;
+      }
+      // agarrado por um cliente que sumiu (caiu a conexão): solta depois de 1,5 s sem notícias
+      if (mob.held && mob.netHeldAt !== undefined && performance.now() - mob.netHeldAt > 1500) this.netRelease(this.mobs.indexOf(mob), 0, 0);
+      if (mob.held) { this.updateHeld(mob, dt, elapsed); continue; }
+      // host: persegue o jogador mais próximo (local ou remoto)
+      let target = player; this.strikeTarget = null;
+      if (this.netRole === 'host' && this.remotes.length) {
+        let best = Math.hypot(player.x - mob.root.position.x, player.z - mob.root.position.z);
+        if (this.health <= 0) best = Infinity;
+        for (const r of this.remotes) {
+          if (!r.alive) continue;
+          const d = Math.hypot(r.pos.x - mob.root.position.x, r.pos.z - mob.root.position.z);
+          if (d < best) { best = d; target = this.targetTmp.copy(r.pos); this.strikeTarget = r.id; }
+        }
+      }
+      this.updateMob(mob, dt, elapsed, target, block);
     }
 
     for (let index = this.drops.length - 1; index >= 0; index--) {
@@ -1115,6 +1396,9 @@ export class CombatSystem {
     }
     if (dist > range || (!def.aoe && facing < .25)) return;
     if (player.y - root.position.y > MELEE_HEIGHT + (def.aoe ? .4 : 0)) return; // fora do alcance vertical (voando/pulando alto)
+    // alvo remoto: o próprio jogador aplica escudo/resistência na máquina dele
+    if (this.strikeTarget) { this.onRemoteStrike(this.strikeTarget, stats.damage * def.damage, root.position.x, root.position.z); return; }
+    if (this.invulnerable) return;
     this.tmpA.set(player.x, player.y + .9, player.z);
     this.tmpB.set(root.position.x, root.position.y + 1, root.position.z);
     if (block(this.tmpA, this.tmpB)) return;
@@ -1660,6 +1944,7 @@ export class CombatSystem {
    *  Death, drops, respawn, effects
    * ------------------------------------------------------------------ */
   private defeat(mob: Mob) {
+    if (mob.held) { mob.held = null; mob.root.rotation.order = 'XYZ'; mob.root.rotation.z = 0; }
     this.onSfx('enemyDie');
     this.onKill(mob.kind);
     mob.root.visible = true;

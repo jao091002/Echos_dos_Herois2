@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { terrainHeight } from './world';
 import { createStaffMaterials, HEAD_V0, HEAD_V_LEN, VEIN_COLORS } from './staff-material';
+import type { Appearance, WeaponKind } from './classes';
 
 /* ============================================================================
  *  HERO — rig articulado procedural (Frieren-like)
@@ -29,13 +30,21 @@ import { createStaffMaterials, HEAD_V0, HEAD_V_LEN, VEIN_COLORS } from './staff-
 
 export type HeroPose = 'idle' | 'walk' | 'run' | 'jump' | 'fall' | 'land' | 'attack' | 'dodge' | 'guard' | 'cast' | 'hit' | 'defeat' | 'fly';
 /** Camada de parte superior do corpo para o Zoltraak (carregar / sustentar o raio); as pernas seguem a pose base. */
-export type HeroOverlay = { mode: 'charge' | 'beam' | 'shield'; power: number };
+/** grab: Agarrão do guerreiro (power 0 = braços à frente segurando baixo, 1 = inimigo erguido acima da cabeça). */
+export type HeroOverlay = { mode: 'charge' | 'beam' | 'shield' | 'grab'; power: number };
 export type HeroRig = {
   root: THREE.Group; spellPoint: THREE.Object3D;
+  /** Ponto de bloqueio do guerreiro: meio da haste do machado (faíscas da defesa saem daqui). */
+  shieldPoint: THREE.Object3D;
   update: (time: number, delta: number, pose: HeroPose, speed?: number, overlay?: HeroOverlay) => void;
   /** Troca o corpo procedural pelo corpo esquelético do glTF (Xbot), mantendo cabeça, cabelo, casaco, capa e cajado. */
   /** full=true: o modelo já traz cabeça/cabelo/roupa próprios (só o cajado e a física procedural são mantidos). */
-  attachBody: (gltf: { scene: THREE.Object3D; animations: THREE.AnimationClip[] }, opts?: { full?: boolean }) => void;
+  /** plain=true: o Xbot "puro" (sem cabeça, cabelo, capa e saia procedurais), com as cores de setAppearance. */
+  attachBody: (gltf: { scene: THREE.Object3D; animations: THREE.AnimationClip[] }, opts?: { full?: boolean; plain?: boolean }) => void;
+  /** Arma da classe: cajado (maga), machado de batalha (guerreiro) ou livro sagrado (clérigo). */
+  setWeapon: (kind: WeaponKind) => void;
+  /** Cores do corpo e das juntas do Xbot (personalização). */
+  setAppearance: (look: Appearance) => void;
   /** Guarda/saca o cajado (com animação). Retorna o estado final (true = em mãos). */
   toggleStaff: () => boolean;
   /** Garante o cajado em mãos imediatamente (antes de lançar magia). */
@@ -322,6 +331,12 @@ export function createHero(scene: THREE.Scene): HeroRig {
     blush: new THREE.MeshBasicMaterial({ color: '#f29a9a', transparent: true, opacity: 0.22, depthWrite: false }),
     glow: new THREE.MeshToonMaterial({ color: '#f2dca5', emissive: '#b58a3f', emissiveIntensity: 1.2, gradientMap: toonRamp }),
     halo: new THREE.MeshBasicMaterial({ color: '#f6e4ae', transparent: true, opacity: 0.75, depthWrite: false, side: THREE.DoubleSide }),
+    // Xbot puro (cores personalizáveis) e armas das classes
+    xbSurface: toon('#c9ccd2'), xbJoint: toon('#a86bff'),
+    steel: new THREE.MeshStandardMaterial({ color: '#d4d9e2', roughness: 0.3, metalness: 0.8 }),
+    gold: new THREE.MeshStandardMaterial({ color: '#d9b45a', roughness: 0.35, metalness: 0.75 }),
+    grip: toon('#3d2c22'), shieldFace: toon('#7a2f26'), holyCloth: toon('#efe6cf'),
+    axeShaft: toon('#2c2128'), axeDark: new THREE.MeshStandardMaterial({ color: '#3f454e', roughness: 0.45, metalness: 0.7 }),
   };
 
   /* ------------------------------------------------------- registro de juntas */
@@ -633,6 +648,103 @@ export function createHero(scene: THREE.Scene): HeroRig {
     part(new THREE.BoxGeometry(0.058 - j * 0.006, len, 0.006), mat.purpleD, seg, [0, -len / 2, 0], { shadow: false });
   }, { k: 26, c: 3, gain: 4.5, limit: 1.2, lag: 22, air: 1, breeze: 0.2, seed: 31 });
   chains.push(ribbon);
+
+  /* ================================================================== ARMAS DAS CLASSES
+   * Todas vivem dentro do grupo do cajado: herdam as mesmas poses (staffP/Y/R), a troca mão ↔ costas (T)
+   * e o encaixe na mão do Xbot. Trocar de arma só alterna a visibilidade — a luz da aura nunca some
+   * (o número de luzes visíveis precisa ficar constante).
+   */
+  const staffArt = staff.children.filter(c => c !== spellPoint && c !== aura);
+  /*
+   * Machado de batalha do guerreiro: haste longa e escura (quase da altura dele), ponteira de metal com anéis,
+   * cabeça de lâmina dupla em meia-lua (a maior à frente = gume que corta no golpe, a menor atrás), alvado com
+   * anéis e um espigão no topo. As lâminas têm a borda de aço claro e o miolo escuro.
+   * Eixo local Y = haste (y=0 na mão direita); +Z = lado do gume (direção do movimento quando o golpe desce).
+   */
+  const AXE_HEAD = 1.1, AXE_BUTT = -0.84;
+  const axe = new THREE.Group(); axe.name = 'weapon-axe'; staff.add(axe);
+  {
+    const shaftTop = AXE_HEAD + 0.12, shaftLen = shaftTop - (AXE_BUTT + 0.06);
+    part(new THREE.CylinderGeometry(0.02, 0.023, shaftLen, 12), mat.axeShaft, axe, [0, AXE_BUTT + 0.06 + shaftLen / 2, 0], { outline: true }); // haste
+    // ponteira: luva de metal com frisos e tampa arredondada
+    part(new THREE.CylinderGeometry(0.028, 0.026, 0.13, 12), mat.steel, axe, [0, AXE_BUTT + 0.065, 0], { outline: true });
+    for (const y of [0.025, 0.065, 0.105]) part(new THREE.TorusGeometry(0.029, 0.005, 6, 16), mat.axeDark, axe, [0, AXE_BUTT + y, 0], { rot: [PI / 2, 0, 0], shadow: false });
+    part(new THREE.SphereGeometry(0.027, 10, 8), mat.steel, axe, [0, AXE_BUTT, 0], { scale: [1, 0.6, 1] });
+    // alvado (encaixe da cabeça) com anéis, langetas descendo pela haste e espigão no topo
+    part(new THREE.CylinderGeometry(0.034, 0.036, 0.3, 12), mat.axeDark, axe, [0, AXE_HEAD, 0], { outline: true });
+    for (const y of [-0.15, -0.05, 0.08, 0.16]) part(new THREE.TorusGeometry(0.037, 0.007, 6, 18), mat.steel, axe, [0, AXE_HEAD + y, 0], { rot: [PI / 2, 0, 0], shadow: false });
+    for (const s of [-1, 1]) part(new THREE.BoxGeometry(0.008, 0.26, 0.022), mat.steel, axe, [s * 0.022, AXE_HEAD - 0.28, 0], { shadow: false });
+    part(new THREE.CylinderGeometry(0.0, 0.026, 0.24, 8), mat.steel, axe, [0, AXE_HEAD + 0.29, 0], { outline: true });
+    part(new THREE.SphereGeometry(0.03, 10, 8), mat.steel, axe, [0, AXE_HEAD + 0.17, 0]);
+    // lâminas em meia-lua (perfil em u = distância da haste, v = ao longo da haste)
+    const bladeGeo = (depth: number, bevel: number) => {
+      const s = new THREE.Shape();
+      s.moveTo(0.015, 0.08);
+      s.quadraticCurveTo(0.14, 0.065, 0.27, 0.26);   // chifre de cima (côncavo)
+      s.quadraticCurveTo(0.385, 0.0, 0.27, -0.26);   // gume (convexo)
+      s.quadraticCurveTo(0.14, -0.065, 0.015, -0.08); // chifre de baixo
+      s.closePath();
+      const g = new THREE.ExtrudeGeometry(s, { depth, bevelEnabled: true, bevelThickness: bevel, bevelSize: bevel, bevelSegments: 2, curveSegments: 18 });
+      g.translate(0, 0, -depth / 2);
+      return g;
+    };
+    for (const [dirZ, k] of [[1, 1], [-1, 0.78]] as const) {
+      const turn = dirZ > 0 ? -PI / 2 : PI / 2; // leva o eixo u do perfil para +Z (gume) ou -Z (lâmina de trás)
+      const outer = bladeGeo(0.012, 0.006); outer.scale(k, k, 1); outer.rotateY(turn);
+      part(outer, mat.steel, axe, [0, AXE_HEAD, 0], { outline: true });
+      // miolo escuro, um pouco mais espesso (aparece nas duas faces) e menor (sobra a borda clara)
+      const inner = bladeGeo(0.024, 0.004); inner.translate(-0.17, 0, 0); inner.scale(0.7, 0.7, 1); inner.translate(0.16, 0, 0); inner.scale(k, k, 1); inner.rotateY(turn);
+      part(inner, mat.axeDark, axe, [0, AXE_HEAD, 0], { shadow: false });
+    }
+  }
+  const mace = new THREE.Group(); mace.name = 'weapon-mace'; staff.add(mace);
+  {
+    part(new THREE.CylinderGeometry(0.024, 0.028, 0.7, 10), mat.grip, mace, [0, 0.1, 0], { outline: true });
+    part(new THREE.SphereGeometry(0.036, 10, 8), mat.gold, mace, [0, -0.27, 0]);
+    part(new THREE.CylinderGeometry(0.034, 0.034, 0.05, 12), mat.gold, mace, [0, 0.43, 0]);
+    part(new THREE.SphereGeometry(0.1, 16, 12), mat.gold, mace, [0, 0.55, 0], { outline: true });                        // cabeça
+    for (let i = 0; i < 6; i++) {                                                                                         // flanges
+      const a = (i / 6) * TAU;
+      part(new THREE.BoxGeometry(0.03, 0.2, 0.07), mat.steel, mace, [cos(a) * 0.1, 0.55, sin(a) * 0.1], { rot: [0, -a, 0] });
+    }
+    part(new THREE.OctahedronGeometry(0.045, 0), mat.glow, mace, [0, 0.69, 0], { shadow: false });                       // gema sagrada
+    // faixa de tecido amarrada abaixo da cabeça
+    part(new THREE.BoxGeometry(0.05, 0.2, 0.008), mat.holyCloth, mace, [0.03, 0.32, 0.03], { rot: [0, 0, 0.15], shadow: false });
+  }
+  // livro sagrado do clérigo: aberto na mão, páginas que acendem em dourado com a magia
+  const pageMat = new THREE.MeshToonMaterial({ color: '#fff6d8', emissive: '#f3d27a', emissiveIntensity: 0.6, gradientMap: toonRamp, side: THREE.DoubleSide });
+  const coverMat = toon('#4a3324');
+  const book = new THREE.Group(); book.name = 'weapon-book'; staff.add(book);
+  {
+    // segurado pela lombada, aberto em "V" voltado para a frente
+    book.position.set(0.02, 0.06, 0.08); book.rotation.set(-0.35, 0, 0);
+    for (const s of [-1, 1] as const) {
+      const half = new THREE.Group(); half.rotation.y = s * 0.32; book.add(half);
+      part(new THREE.BoxGeometry(0.17, 0.25, 0.012), coverMat, half, [s * 0.088, 0, -0.004], { outline: true });               // capa
+      part(new THREE.BoxGeometry(0.155, 0.23, 0.02), pageMat, half, [s * 0.082, 0, 0.012], { shadow: false });                 // bloco de páginas
+      part(new THREE.BoxGeometry(0.008, 0.25, 0.016), mat.gold, half, [s * 0.172, 0, 0.0], { shadow: false });                 // canto dourado
+      part(new THREE.BoxGeometry(0.17, 0.008, 0.016), mat.gold, half, [s * 0.088, 0.122, 0.0], { shadow: false });
+      part(new THREE.BoxGeometry(0.17, 0.008, 0.016), mat.gold, half, [s * 0.088, -0.122, 0.0], { shadow: false });
+    }
+    part(new THREE.CylinderGeometry(0.016, 0.016, 0.25, 8), coverMat, book, [0, 0, -0.01]);                                     // lombada
+  }
+  // mão esquerda livre (encaixe para itens de mão; no Xbot segue o osso da mão)
+  const offhand = new THREE.Group(); offhand.name = 'weapon-offhand'; J.wristL.node.add(offhand);
+  /** Ponto de bloqueio do guerreiro: o meio da haste do machado (faíscas da defesa saem daqui). */
+  const shieldPoint = new THREE.Object3D(); shieldPoint.position.set(0, 0.35, 0.02); axe.add(shieldPoint);
+  let weapon = 'staff' as WeaponKind;
+  const applyWeapon = () => {
+    for (const c of staffArt) c.visible = weapon === 'staff';
+    axe.visible = weapon === 'axe'; mace.visible = weapon === 'mace'; book.visible = weapon === 'book';
+    // ponto de onde saem as magias/efeitos: cabeça do cajado, gume do machado, gema da maça ou páginas do livro
+    if (weapon === 'staff') spellPoint.position.set(HEAD.x + 0.002, HEAD.y + 0.04, 0.02);
+    else if (weapon === 'axe') spellPoint.position.set(0, AXE_HEAD, 0.3);
+    else if (weapon === 'book') spellPoint.position.set(0.02, 0.1, 0.22);
+    else spellPoint.position.set(0, 0.72, 0);
+    aura.position.set(spellPoint.position.x + 0.08, spellPoint.position.y, spellPoint.position.z + 0.08);
+    aura.distance = weapon === 'staff' ? 4 : 2.5;
+  };
+  applyWeapon();
   // cadeias que realmente aparecem (com o modelo completo, só a fita do cajado + ossos secundários do modelo)
   let activeChains: Chain[] = chains;
 
@@ -656,6 +768,20 @@ export function createHero(scene: THREE.Scene): HeroRig {
     J.ankleR.x.t = -(J.hipR.x.t + J.kneeR.x.t) * k;
   };
 
+  /**
+   * Guarda do machado (bloqueio F e postura V do guerreiro): a haste atravessada à frente do peito, quase na
+   * horizontal, com a cabeça do machado para a esquerda; mão direita perto da base, a esquerda (IK) segura o
+   * meio da haste. Orientação em espaço do corpo (Euler YXZ): girar em Z leva o eixo da haste (Y) para a esquerda (-X).
+   */
+  const axeGuard = (strain: number, still: boolean) => {
+    setJ('armR', -1.0 + strain, 0, 0.25); setJ('elbowR', -0.95); setJ('wristR', 0.1);
+    P.staffP.t = 0; P.staffY.t = 0.1; P.staffR.t = 1.3 + strain * 2;
+    setJ('armL', -1.1, 0, -0.3); setJ('elbowL', -0.9); // FK de reserva; o IK de gripL leva a mão à haste
+    P.gripL.t = 1; P.gripY.t = 0.62; P.curlL.t = 1; P.curlR.t = 1;
+    setJ('spine', 0.08); setJ('chest', 0.12 + strain, 0.1); setJ('head', 0.1, -0.05);
+    P.magic.t = 0; P.lid.t = 0.9; P.furrow.t = 0.7;
+    if (still) { setJ('hipL', -0.4, 0, -0.12); setJ('kneeL', 0.6); setJ('hipR', 0.34, 0, 0.12); setJ('kneeR', 0.5); setJ('pelvis', 0, -0.2); autoFoot(1); plant(); }
+  };
   const resetTargets = () => {
     for (const n of JOINTS) setJ(n);
     for (const n of HARD_PARAMS) P[n].t = 0;
@@ -784,7 +910,9 @@ export function createHero(scene: THREE.Scene): HeroRig {
 
   const attachBody: HeroRig['attachBody'] = (gltf, opts = {}) => {
     if (xb) return;
-    const full = !!opts.full;
+    const full = !!opts.full, plain = !full && !!opts.plain;
+    /** O modelo mostra a própria cabeça (sem a cabeça/cabelo/roupa procedurais). */
+    const ownHead = full || plain;
     const model = gltf.scene; model.name = full ? 'character-body' : 'xbot-body';
     const holder = new THREE.Group(); holder.name = 'body-holder'; holder.add(model); body.add(holder);
     const byName: Record<string, THREE.Bone> = {};
@@ -823,11 +951,11 @@ export function createHero(scene: THREE.Scene): HeroRig {
         }
       }
       if (!full) {
-        m.material = m.name.includes('Joints') ? mat.suit : mat.coat;
+        m.material = m.name.includes('Joints') ? (plain ? mat.xbJoint : mat.suit) : (plain ? mat.xbSurface : mat.coat);
         if (OUTLINES && (m as THREE.SkinnedMesh).isSkinnedMesh) { const o = new THREE.SkinnedMesh(m.geometry, outlineSkin); o.position.copy(m.position); o.quaternion.copy(m.quaternion); o.scale.copy(m.scale); o.bind(m.skeleton, m.bindMatrix); o.frustumCulled = false; o.castShadow = false; m.parent!.add(o); }
       }
     }
-    if (!full) byName.Head.scale.setScalar(0.001);
+    if (!ownHead) byName.Head.scale.setScalar(0.001);
     // acessórios de arma do modelo baixado (ex.: o leque da Agris) somem: os ossos de arma colapsam e levam os vértices junto
     if (full) model.traverse(o => { if ((o as THREE.Bone).isBone && /weapon/i.test(o.name)) o.scale.setScalar(0.0001); });
 
@@ -839,7 +967,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
       [`${sideL}UpLeg`]: ['hipL', 'legs'], [`${sideL}Leg`]: ['kneeL', 'legs'], [`${sideL}Foot`]: ['ankleL', 'legs'],
       [`${sideR}UpLeg`]: ['hipR', 'legs'], [`${sideR}Leg`]: ['kneeR', 'legs'], [`${sideR}Foot`]: ['ankleR', 'legs'],
     };
-    if (full) MAP.Head = ['head', 'head'];
+    if (ownHead) MAP.Head = ['head', 'head'];
     body.updateWorldMatrix(true, true);
     const bodyQ = body.getWorldQuaternion(new THREE.Quaternion()), bodyQI = bodyQ.clone().invert();
     const wq = (o: THREE.Object3D) => bodyQI.clone().multiply(o.getWorldQuaternion(new THREE.Quaternion()));
@@ -915,8 +1043,9 @@ export function createHero(scene: THREE.Scene): HeroRig {
     const handR = socket(`${sideR}Hand`), chestS = socket('Spine2');
     chestS.add(backMount); backMount.position.set(0.02, 0.12, -0.16);
     handR.add(staffMount); staffMount.position.set(0.0, -0.085, 0.0);
+    const handL = socket(`${sideL}Hand`); handL.add(offhand); offhand.position.set(0, -0.05, 0);
     const keep = new Set<THREE.Object3D>([staffMount, holder, ...sockets.map(sk => sk.obj)]);
-    if (!full) {
+    if (!ownHead) {
       const neckS = socket('Neck'), hipsS = socket('Hips');
       neckS.add(head); head.position.set(0, (local('Head').y - local('Neck').y) + 0.085, 0.025); head.scale.setScalar(0.8);
       skirtAnchors.forEach((a, i) => { const phi = (i / skirtAnchors.length) * TAU; hipsS.add(a); a.position.set(sin(phi) * 0.19, 0.075, cos(phi) * 0.15 + 0.01); });
@@ -954,7 +1083,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
       holder.position.y = 0; xbApply(); body.updateWorldMatrix(true, true);
       const low = Math.min(local('LeftToeBase').y, local('RightToeBase').y, local('LeftFoot').y - 0.07 * k);
       holder.position.y = -low + 0.01; holder.updateMatrixWorld(true);
-      rigSecondary(byName, idxOf, nodes, local, full);
+      rigSecondary(byName, idxOf, nodes, local, ownHead);
       JOINTS.forEach((n, i) => J[n].node.rotation.copy(saved[i])); Object.assign(xb.w, w0);
     }
   };
@@ -1047,7 +1176,10 @@ export function createHero(scene: THREE.Scene): HeroRig {
   return {
     root,
     spellPoint,
+    shieldPoint,
     attachBody,
+    setWeapon(kind) { weapon = kind; applyWeapon(); },
+    setAppearance(look) { mat.xbSurface.color.set(look.body); mat.xbJoint.color.set(look.joints); },
     toggleStaff() { if (swapT < 0) { swapT = 0; swapTo = !staffEquipped; } return swapTo; },
     ensureStaff() { swapT = -1; if (!staffEquipped) placeStaff(true); },
     isStaffEquipped: () => staffEquipped,
@@ -1386,6 +1518,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
           break;
         }
         case 'guard': {
+          if (weapon === 'axe') { axeGuard(sin(time * 3) * 0.01, true); P.bodyZ.t = -0.05; P.pitch.t = 0.08; break; }
           setJ('armR', -0.55, 0, 0.18); setJ('elbowR', -1.35); setJ('wristR', -0.2);
           P.staffP.t = 0.15; P.staffR.t = -1.3; P.staffY.t = 0;
           setJ('armL', -0.6, 0, -0.4); setJ('elbowL', -1.0);
@@ -1398,7 +1531,10 @@ export function createHero(scene: THREE.Scene): HeroRig {
         }
         case 'cast': {
           // cada magia tem sua própria pose (Game define root.userData.castKind ao lançar)
-          const kind = (root.userData.castKind as string | undefined) ?? 'zoltraak';
+          // habilidades de guerreiro/clérigo reaproveitam as poses: gritos e bênçãos = braços ao alto (como a decolagem)
+          const rawKind = (root.userData.castKind as string | undefined) ?? 'zoltraak';
+          // (a Magia de Cura e as Três Lanças usam a pose padrão: braço estendido à frente, como nas referências)
+          const kind = rawKind === 'brado' || rawKind === 'bencao' || rawKind === 'curaEquipe' || rawKind === 'despertar' ? 'flight' : rawKind === 'consagracao' ? 'shield' : rawKind;
           // camadas: lançando em movimento/voo, a pose base (pernas, quadril, altura, inclinação) continua
           // e a magia controla só a metade superior. A decolagem ('flight') é de corpo inteiro.
           const base = root.userData.locoPose as HeroPose | undefined;
@@ -1568,7 +1704,21 @@ export function createHero(scene: THREE.Scene): HeroRig {
       if (overlay && pose !== 'defeat' && pose !== 'hit' && pose !== 'dodge') {
         clipT.armL = 0; clipT.torso = 0;
         const pw = clamp(overlay.power, 0, 1), still = pose === 'idle' || pose === 'land';
-        if (overlay.mode === 'shield') {
+        if (overlay.mode === 'grab') {
+          // Agarrão: mão esquerda prende o inimigo à frente e embaixo (arrasto), machado recuado; ao erguer (power→1)
+          // os dois braços sobem acima da cabeça e o tronco arqueia para trás antes da pancada
+          const lift = clamp(overlay.power, 0, 1), jit = sin(time * 31) * 0.03 * (1 - lift);
+          setJ('armL', lerp(-1.05, -2.75, lift) + jit, 0, lerp(-0.05, -0.2, lift)); setJ('elbowL', lerp(-0.35, -0.25, lift)); setJ('wristL', lerp(-0.5, 0.1, lift)); P.curlL.t = 1;
+          setJ('armR', lerp(-0.25, -2.6, lift), 0, lerp(0.35, 0.2, lift)); setJ('elbowR', lerp(-1.1, -0.4, lift)); setJ('wristR', -0.1);
+          P.staffP.t = lerp(-0.6, 0.4, lift); P.staffR.t = -0.2; P.staffY.t = 0;
+          setJ('spine', lerp(0.28, -0.18, lift)); setJ('chest', lerp(0.22, -0.22, lift) + jit, lerp(-0.15, 0, lift)); setJ('neck', lerp(-0.1, 0.1, lift)); setJ('head', lerp(-0.15, 0.2, lift));
+          P.pitch.t += lerp(0.12, -0.04, lift);
+          P.furrow.t = 0.9; P.lid.t = 0.85; P.mouth.t = 0.35 + lift * 0.3; P.smile.t = 0;
+          if (still) { setJ('hipL', -0.45, 0, -0.14); setJ('kneeL', 0.6); setJ('hipR', 0.35, 0, 0.14); setJ('kneeR', 0.5); setJ('pelvis', 0, 0.1); autoFoot(1); plant(); }
+        } else if (overlay.mode === 'shield' && weapon === 'axe') {
+          // guerreiro: defende com o próprio machado atravessado à frente; treme quando a guarda está para quebrar
+          axeGuard((1 - pw) * (sin(time * 41) * 0.03), still);
+        } else if (overlay.mode === 'shield') {
           // segurando a barreira: cajado erguido ao lado, mão esquerda espalmada à frente; treme quando a barreira está fraca
           const strain = (1 - pw) * (sin(time * 41) * 0.03);
           setJ('armR', -0.45, 0, 0.16); setJ('elbowR', -1.15); setJ('wristR', -0.1); P.staffP.t = 0.08; P.staffR.t = -0.1; P.staffY.t = 0;
@@ -1692,9 +1842,10 @@ export function createHero(scene: THREE.Scene): HeroRig {
       /* ---- cajado como bastão: a ponta de baixo toca o chão parada e levanta a cada passo */
       if (staff.parent === staffMount) {
         let shift = 0;
-        if (staffEquipped && !overlay && swapT < 0 && (pose === 'idle' || pose === 'walk' || pose === 'land')) {
+        // machado: só apoia a ponteira no chão parado (andando ele vai erguido)
+        if (staffEquipped && !overlay && swapT < 0 && ((weapon === 'staff' && (pose === 'idle' || pose === 'walk' || pose === 'land')) || (weapon === 'axe' && (pose === 'idle' || pose === 'land')))) {
           staff.position.set(0, 0, 0); staff.updateWorldMatrix(true, false);
-          const butt = staff.localToWorld(sv1.set(0, -1.0, 0));
+          const butt = staff.localToWorld(sv1.set(0, weapon === 'axe' ? AXE_BUTT : -1.0, 0));
           const lift = pose === 'walk' ? max(0, sin(phase * TAU + 0.6)) * 0.14 : 0;
           shift = clamp(terrainHeight(butt.x, butt.z) + 0.03 + lift - butt.y, -0.4, 0.4);
         }
@@ -1780,8 +1931,9 @@ export function createHero(scene: THREE.Scene): HeroRig {
       aura.color.copy(auraBase).lerp(vu.uVeinColor.value, clamp(magic * 0.8, 0, 0.8));
       idleRing.rotation.set(time * 0.8, time * 0.5, 0); idleRingMat.opacity = 0.22 + magic * 0.4;
       mat.glow.emissiveIntensity = 1.2 + magic * 1.6 + sin(time * 5) * 0.1 * magic;
+      if (weapon === 'book') pageMat.emissiveIntensity = 0.55 + magic * 2.4 + sin(time * 2.2) * 0.08;
       aura.intensity = 0.85 + magic * 1.6;
-      const showHalo = magic > 0.12;
+      const showHalo = magic > 0.12 && weapon === 'staff';
       haloA.visible = haloB.visible = showHalo;
       if (showHalo) {
         haloA.scale.setScalar(0.4 + magic * 0.7); haloB.scale.setScalar(0.3 + magic * 0.8);

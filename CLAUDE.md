@@ -12,6 +12,7 @@ See [AGENTS.md](AGENTS.md): this Next.js version has breaking changes compared w
 
 - `npm run dev`: dev server
 - `npm run build`: production build (also runs type checking)
+- `npm run server`: multiplayer relay server (`server/relay.mjs`, WebSocket, port 3210 or `PORT`)
 - `npx tsc --noEmit`: type check only
 
 The project has no linter and no test suite.
@@ -38,7 +39,14 @@ The game loop and React are bridged by refs, not by state:
 - `audio.ts`: `AmbientAudio`, procedural Web Audio ambience and `sfx(name)`.
 - `rig-retarget.ts`: retargets Mixamo or Biped skeletons onto the procedural joint rigs. It also adds a loader plugin for legacy spec-gloss glTF materials (Sketchfab exports).
 
-**Models (`public/models/*.glb`) are optional enhancements.** Every model is loaded asynchronously and falls back to procedural geometry when it is missing or fails to load. For the hero, `agris.glb` is tried first, then `Xbot.glb`, then the procedural body. Wolves use `wolf.glb`, demons `aura.glb` (decimated on load) and bandits `perso.glb` (retargeted). Keep this fallback pattern and check the `disposed` flag in load callbacks.
+**Models (`public/models/*.glb`) are optional enhancements.** Every model is loaded asynchronously and falls back to procedural geometry when it is missing or fails to load. The hero is the plain `Xbot.glb` (`attachBody(gltf, { plain: true })`, colors from the character creator), falling back to the procedural body. Classes (Maga, Guerreiro, Clérigo) live in `classes.ts`: weapon, base health/resist, basic attack and the 5-slot ability bar (Q, 1, 2, F, R); their abilities are `SpellId`s in `magic.ts`. Wolves use `wolf.glb`, demons `aura.glb` (decimated on load) and bandits `perso.glb` (retargeted). Keep this fallback pattern and check the `disposed` flag in load callbacks.
+
+**Multiplayer and save:**
+- `server/relay.mjs` is a dumb room relay (max 4 per room, stamps `from`). The first player in a room is the host.
+- `net.ts` (`NetClient`) is the browser side. `CombatSystem.netRole` is `solo`, `host` or `client`. The host simulates mobs, targets the nearest player and broadcasts `snapshot()` at 10 Hz. Clients run `updatePuppet` and send damage to the host (`onHitRequest`). Loot is per client (each one runs `defeat()` locally).
+- `remote-players.ts` keeps a fixed pool of 3 remote avatars created at startup. Never create heroes at runtime, because each one has a PointLight.
+- The party lives in `Game.tsx` (`pinv`/`pacc`/`pst`/`pleave` messages). Cura em Grupo and Despertar reach party members.
+- `save.ts` stores the save in localStorage (`ecos.save.v1`) and can export/import it as .json. Autosave runs every 30 s and on `beforeunload`.
 
 **Performance invariants (each one caused multi-second hitches when broken):**
 - The visible PointLight count must stay constant. Three.js bakes the light count into the shader key, so adding a light or hiding its parent recompiles every lit material. Reuse the fixed pools: drop lights and mob fill lights in `combat.ts`, the 4 light slots in `magic.ts`.

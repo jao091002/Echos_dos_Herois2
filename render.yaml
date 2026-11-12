@@ -1,0 +1,19 @@
+# Blueprint do Render (render.com): cria o servidor de salas do multijogador no plano gratuito.
+# Render → New → Blueprint → escolha este repositório. Depois copie a URL do serviço
+# (ex.: https://ecos-multijogador.onrender.com) e configure na Vercel:
+#   NEXT_PUBLIC_MP_SERVER = wss://ecos-multijogador.onrender.com
+services:
+  - type: web
+    name: ecos-multijogador
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install --omit=dev
+    startCommand: node relay.mjs
+    healthCheckPath: /health
+    envVars:
+      # quem pode conectar: o site na Vercel (troque/adicione o seu domínio) e o desenvolvimento local
+      - key: ALLOWED_ORIGINS
+        value: "*.vercel.app,localhost"
+      - key: NODE_VERSION
+        value: "22"
