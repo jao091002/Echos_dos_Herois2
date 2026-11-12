@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { terrainHeight } from './world';
 import { createStaffMaterials, HEAD_V0, HEAD_V_LEN, VEIN_COLORS } from './staff-material';
 import type { Appearance, WeaponKind } from './classes';
+import type { AnimName } from './anim-library';
 
 /* ============================================================================
  *  HERO — rig articulado procedural (Frieren-like)
@@ -43,6 +44,8 @@ export type HeroRig = {
   attachBody: (gltf: { scene: THREE.Object3D; animations: THREE.AnimationClip[] }, opts?: { full?: boolean; plain?: boolean }) => void;
   /** Arma da classe: cajado (maga), machado de batalha (guerreiro) ou livro sagrado (clérigo). */
   setWeapon: (kind: WeaponKind) => void;
+  /** Clipes de public/animations convertidos para o Xbot (corrida, voo, queda). */
+  addClips: (clips: Partial<Record<AnimName, THREE.AnimationClip>>) => void;
   /** Cores do corpo e das juntas do Xbot (personalização). */
   setAppearance: (look: Appearance) => void;
   /** Guarda/saca o cajado (com animação). Retorna o estado final (true = em mãos). */
@@ -855,10 +858,14 @@ export function createHero(scene: THREE.Scene): HeroRig {
   let xb: null | {
     model: THREE.Object3D; nodes: XNode[]; full: boolean;
     mixer: THREE.AnimationMixer | null; idle: THREE.AnimationAction | null; walk: THREE.AnimationAction | null; run: THREE.AnimationAction | null;
+    /** Clipes da pasta public/animations (voo e queda), quando carregados. */
+    fly: THREE.AnimationAction | null; fall: THREE.AnimationAction | null;
+    /** Fase do passo em que o pé esquerdo está mais à frente (sincroniza o ciclo com a passada procedural). */
+    peakOf: (a: THREE.AnimationAction) => number;
     sockets: { obj: THREE.Object3D; idx: number }[]; hipsIdx: number; hipsBind: THREE.Vector3; hipsClipY: number; walkOff: number; runOff: number;
-    fingers: { bones: THREE.Bone[]; sign: number; side: 0 | 1 }[]; chestSocket: THREE.Object3D; shoulderL: THREE.Bone; w: { legs: number; torso: number; armL: number; walk: number; run: number };
+    fingers: { bones: THREE.Bone[]; sign: number; side: 0 | 1 }[]; chestSocket: THREE.Object3D; shoulderL: THREE.Bone; w: { legs: number; torso: number; armL: number; walk: number; run: number; fly: number; fall: number };
   } = null;
-  const clipT = { legs: 0, torso: 0, armL: 0, walk: 0, run: 0 };
+  const clipT = { legs: 0, torso: 0, armL: 0, walk: 0, run: 0, fly: 0, fall: 0 };
   const xq = new THREE.Quaternion(), xq2 = new THREE.Quaternion(), xe = new THREE.Euler(), xv = new THREE.Vector3(), bodyQInv = new THREE.Quaternion();
   // esqueletos "Biped" (bip001_*) são mapeados para os nomes Mixamo usados pelo retarget
   const BIPED: Record<string, string> = {
@@ -875,10 +882,30 @@ export function createHero(scene: THREE.Scene): HeroRig {
     if (!xb.mixer || !xb.walk || !xb.run || !xb.idle) return;
     xb.walk.time = THREE.MathUtils.euclideanModulo(phase + xb.walkOff, 1) * xb.walk.getClip().duration;
     xb.run.time = THREE.MathUtils.euclideanModulo(phase + xb.runOff, 1) * xb.run.getClip().duration;
-    xb.walk.setEffectiveWeight(w.walk); xb.run.setEffectiveWeight(w.run); xb.idle.setEffectiveWeight(Math.max(0, 1 - w.walk - w.run));
+    xb.walk.setEffectiveWeight(w.walk); xb.run.setEffectiveWeight(w.run);
+    xb.fly?.setEffectiveWeight(w.fly); xb.fall?.setEffectiveWeight(w.fall);
+    xb.idle.setEffectiveWeight(Math.max(0, 1 - w.walk - w.run - (xb.fly ? w.fly : 0) - (xb.fall ? w.fall : 0)));
     xb.mixer.update(dt);
     for (const n of xb.nodes) n.clip.copy(n.bone.quaternion);
     xb.hipsClipY = xb.nodes[xb.hipsIdx].bone.position.y;
+  };
+  /**
+   * Clipes da pasta public/animations já convertidos para o esqueleto do Xbot (anim-library.ts):
+   * run substitui a corrida embutida do Xbot (sincronizada com a passada); fly e fall entram na mistura
+   * por região (pernas, tronco, braço livre) nas poses de voo e de queda. Antes do corpo existir, ficam guardados.
+   */
+  let pendingClips: Partial<Record<AnimName, THREE.AnimationClip>> | null = null;
+  const addClips = (clips: Partial<Record<AnimName, THREE.AnimationClip>>) => {
+    if (!xb || !xb.mixer || !xb.idle) { pendingClips = clips; return; }
+    const mx = xb.mixer;
+    if (clips.run && xb.run) {
+      xb.run.stop(); xb.run = mx.clipAction(clips.run); xb.run.play();
+      xb.run.setEffectiveTimeScale(0); xb.run.setEffectiveWeight(0);
+      xb.runOff = xb.peakOf(xb.run);
+    }
+    if (clips.fly && !xb.fly) { xb.fly = mx.clipAction(clips.fly); xb.fly.play(); xb.fly.setEffectiveWeight(0); }
+    if (clips.fall && !xb.fall) { xb.fall = mx.clipAction(clips.fall); xb.fall.setLoop(THREE.LoopPingPong, Infinity); xb.fall.play(); xb.fall.setEffectiveWeight(0); }
+    xb.idle.setEffectiveWeight(1); mx.update(0);
   };
   const xbApply = () => {
     if (!xb) return;
@@ -1022,18 +1049,19 @@ export function createHero(scene: THREE.Scene): HeroRig {
     // clipes de mocap (só se houver idle/walk/run, como no Xbot)
     const clip = (n: string) => gltf.animations.find(a => a.name === n);
     let mixer: THREE.AnimationMixer | null = null, idle: THREE.AnimationAction | null = null, walk: THREE.AnimationAction | null = null, run: THREE.AnimationAction | null = null, walkOff = 0, runOff = 0;
+    let peakOf: (a: THREE.AnimationAction) => number = () => 0;
     if (clip('idle') && clip('walk') && clip('run')) {
       mixer = new THREE.AnimationMixer(model);
       idle = mixer.clipAction(clip('idle')!); walk = mixer.clipAction(clip('walk')!); run = mixer.clipAction(clip('run')!);
       for (const a of [idle, walk, run]) { a.play(); a.setEffectiveWeight(0); }
       walk.setEffectiveTimeScale(0); run.setEffectiveTimeScale(0);
       const peak = (a: THREE.AnimationAction) => {
-        for (const o of [idle!, walk!, run!]) o.setEffectiveWeight(o === a ? 1 : 0);
+        for (const o of [idle!, walk!, run!, ...(xb?.fly ? [xb.fly] : []), ...(xb?.fall ? [xb.fall] : [])]) o.setEffectiveWeight(o === a ? 1 : 0);
         let best = 0, bestZ = -Infinity;
         for (let i = 0; i < 50; i++) { a.time = (i / 50) * a.getClip().duration; mixer!.update(0); const z = local(`${sideL}Foot`).z - local(`${sideL}UpLeg`).z; if (z > bestZ) { bestZ = z; best = i / 50; } }
         return best - 0.25;
       };
-      walkOff = peak(walk); runOff = peak(run);
+      walkOff = peak(walk); runOff = peak(run); peakOf = peak;
       idle.setEffectiveWeight(1); walk.setEffectiveWeight(0); run.setEffectiveWeight(0); mixer.update(0);
     }
 
@@ -1074,7 +1102,8 @@ export function createHero(scene: THREE.Scene): HeroRig {
     if (!full) for (const [side, prefix, sign] of [[0, 'RightHand', 1], [1, 'LeftHand', -1]] as const)
       for (const f of ['Index', 'Middle', 'Ring', 'Pinky']) fingers.push({ side, sign, bones: [1, 2, 3].map(i => byName[`${prefix}${f}${i}`]).filter(Boolean) });
 
-    xb = { model, nodes, full, mixer, idle, walk, run, sockets, hipsIdx, hipsBind: byName.Hips.position.clone(), hipsClipY: byName.Hips.position.y, walkOff, runOff, fingers, chestSocket: chestS, shoulderL: byName[`${sideL}Arm`], w: { legs: 0, torso: 0, armL: 0, walk: 0, run: 0 } };
+    xb = { model, nodes, full, mixer, idle, walk, run, fly: null, fall: null, peakOf, sockets, hipsIdx, hipsBind: byName.Hips.position.clone(), hipsClipY: byName.Hips.position.y, walkOff, runOff, fingers, chestSocket: chestS, shoulderL: byName[`${sideL}Arm`], w: { legs: 0, torso: 0, armL: 0, walk: 0, run: 0, fly: 0, fall: 0 } };
+    if (pendingClips) { const pc = pendingClips; pendingClips = null; addClips(pc); }
     // apoia a sola no chão medindo a pose reta (juntas zeradas)
     {
       const saved = JOINTS.map(n => J[n].node.rotation.clone()), w0 = { ...xb.w };
@@ -1178,6 +1207,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
     spellPoint,
     shieldPoint,
     attachBody,
+    addClips,
     setWeapon(kind) { weapon = kind; applyWeapon(); },
     setAppearance(look) { mat.xbSurface.color.set(look.body); mat.xbJoint.color.set(look.joints); },
     toggleStaff() { if (swapT < 0) { swapT = 0; swapTo = !staffEquipped; } return swapTo; },
@@ -1366,7 +1396,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
       if (pose !== 'fly' && (pose !== 'cast' || root.userData.locoPose !== 'fly')) flyDash = 0;
 
       // pesos dos clipes de mocap (só têm efeito com o corpo glTF)
-      clipT.legs = clipT.torso = clipT.armL = clipT.walk = clipT.run = 0;
+      clipT.legs = clipT.torso = clipT.armL = clipT.walk = clipT.run = clipT.fly = clipT.fall = 0;
 
       // ociosidade
       if (pose === 'idle') idleClock += dt; else { idleClock = 0; fidget = -1; nextFidget = 6 + Math.random() * 4; }
@@ -1467,6 +1497,8 @@ export function createHero(scene: THREE.Scene): HeroRig {
           setJ('chest', -0.04); setJ('head', -0.1);
           P.staffP.t = 0.5; P.staffR.t = -0.9;
           P.lid.t = 0.95; P.mouth.t = 0.2; P.flare.t = 0.6;
+          // queda: pernas, tronco e braço livre seguem o trecho no ar do "Jumping Down" (public/animations)
+          if (xb?.fall) { clipT.fall = 1; clipT.legs = 0.8; clipT.torso = 0.45; clipT.armL = 0.8; }
           break;
         }
         case 'land': {
@@ -1680,7 +1712,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
           P.mouth.t = 0.25 * buckle * (1 - fall); P.ear.t = -0.8 * buckle; P.furrow.t = 0.5 * buckle * (1 - fall);
           break;
         }
-        case 'fly': flyPose(); break;
+        case 'fly': flyPose(); if (xb?.fly) { clipT.fly = 1; clipT.legs = 0.9; clipT.torso = 0.55; clipT.armL = 0.85; } break;
       }
 
       /* ---- cajado vivo: pêndulo ao andar, inércia nas acelerações, leve balanço parado */

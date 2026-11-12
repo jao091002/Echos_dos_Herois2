@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
-import { registerSpecGloss, retargetModel, type Retarget } from './rig-retarget';
+import { registerSpecGloss, retargetModel, type Retarget, type ClipBlend } from './rig-retarget';
+import { clipsFor } from './anim-library';
 import { adoptFragments, bindSkin, computeSkin, placeAt, segDist, tearSeams, textureSampler, toLocal, type SkinSeg } from './mob-skin';
 import { terrainHeight, type WorldCollider } from './world';
 import type { SfxName } from './audio';
@@ -183,6 +184,14 @@ type Mob = {
   net?: { x: number; z: number; yaw: number; atk: number; age: number; stagger: number; air: number; heldTilt: number; heldLift: number };
   /** Multijogador (host): última vez (ms) que um cliente mandou a posição deste inimigo agarrado. */
   netHeldAt?: number;
+  /** Corrida do Mixamo: peso atual e tempo no clipe (bandidos com modelo). */
+  runW?: number; runT?: number;
+  /** Ameaça por jogador (host): quem mais incomoda vira o alvo. */
+  threat?: Map<string, number>;
+  /** Alvo atual (id do jogador; host decide, clientes recebem na foto). */
+  targetId?: string;
+  /** Última vez (ms) que ESTE jogador acertou o inimigo: dá direito a loot/XP quando ele cair. */
+  myHitAt?: number;
 };
 /** Controle de um inimigo agarrado (Agarrão do guerreiro). */
 export type GrabHandle = {
@@ -491,7 +500,7 @@ export class CombatSystem {
     new GLTFLoader().load('/models/aura.glb', gltf => { if (!this.disposed) this.onDemonModel(gltf.scene); }, undefined, () => { /* mantém o procedural */ });
     // bandido modelado (perso.glb): cada bandido recebe sua própria cópia do modelo
     const bandits = new GLTFLoader(); registerSpecGloss(bandits);
-    bandits.load('/models/perso.glb', gltf => { if (this.disposed) return; this.banditTemplate = gltf.scene; for (const mob of this.mobs) if (mob.kind === 'bandit') this.attachBanditModel(mob); }, undefined, () => { /* mantém o procedural */ });
+    bandits.load('/models/perso.glb', gltf => { if (this.disposed) return; this.banditTemplate = gltf.scene; void clipsFor(gltf.scene).then(c => { if (!this.disposed) this.banditRun = c.run ?? null; }); for (const mob of this.mobs) if (mob.kind === 'bandit') this.attachBanditModel(mob); }, undefined, () => { /* mantém o procedural */ });
   }
 
   private disposed = false;
@@ -657,6 +666,8 @@ export class CombatSystem {
     }
   }
   private banditTemplate: THREE.Object3D | null = null;
+  /** Corrida do Mixamo convertida para o esqueleto do perso.glb (anim-library.ts). */
+  private banditRun: THREE.AnimationClip | null = null;
 
   private attachBanditModel(mob: Mob) {
     const tpl = this.banditTemplate, rig = mob.rig;
@@ -850,16 +861,24 @@ export class CombatSystem {
     return count;
   }
 
-  private applyHit(mob: Mob, point: THREE.Vector3, damage: number, knock: number, fromNet = false) {
+  private applyHit(mob: Mob, point: THREE.Vector3, damage: number, knock: number, fromNet = false, attacker = '') {
+    if (!fromNet) mob.myHitAt = performance.now();
     if (this.netRole === 'client' && !fromNet) {
-      // cliente: o dano é decidido pelo host; aqui só o retorno visual imediato (piscar, partículas, som)
+      // cliente: o dano é decidido pelo host; aqui só o retorno visual imediato (piscar, partículas, som, número)
       this.onHitRequest(this.mobs.indexOf(mob), damage, point, knock);
+      this.onDamageNumber(this.mobHead(mob), Math.round(damage / this.groupScale(mob)), 'mine');
       mob.hitFlash = .18; mob.root.scale.setScalar(1.05); this.onSfx('hitEnemy', damage / 60);
       this.tmpD.set(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? .7 : 1.15), mob.root.position.z);
       this.particles.emit(this.tmpD, mob.kind === 'demon' ? '#ff7a5a' : '#ffe2a8', 6 + Math.min(8, Math.floor(damage / 6)), 3.2, 1.8, .4, 1);
       return;
     }
     {
+      // grupo: inimigos ficam mais resistentes com mais jogadores por perto
+      damage /= this.groupScale(mob);
+      const who = fromNet ? attacker : this.selfId;
+      this.addThreat(mob, who, damage * (fromNet ? 1 : this.threatMult));
+      this.onDamageNumber(this.mobHead(mob), Math.round(damage), fromNet ? 'ally' : 'mine');
+      if (this.netRole === 'host') this.hitEvents.push([this.mobs.indexOf(mob), Math.round(damage), who]);
       mob.health = Math.max(0, mob.health - damage); mob.hitFlash = .18; this.onSfx('hitEnemy', damage / 60);
       const pushX = mob.root.position.x - point.x, pushZ = mob.root.position.z - point.z;
       // de onde veio o golpe, no espaço do inimigo (recuo e queda vão para o lado oposto)
@@ -886,6 +905,63 @@ export class CombatSystem {
   /** Durante a cutscene do Agarrão a heroína não recebe golpes. */
   invulnerable = false;
 
+  /* ==================================================================== COMBATE EM GRUPO
+   * Ameaça: cada golpe soma ameaça (o guerreiro gera o dobro); o inimigo persegue quem tem mais ameaça entre os
+   * jogadores a até 30 m, e a ameaça esfria com o tempo. O Brado provoca: põe o guerreiro no topo da lista.
+   * Recompensa: loot/XP/missão só para quem acertou o inimigo nos últimos 30 s ou estava a até 25 m quando ele caiu.
+   */
+  /** Id deste jogador na sala ('self' fora do multijogador). */
+  selfId = 'self';
+  /** Multiplicador de ameaça deste jogador (classe: o guerreiro é o tanque). */
+  threatMult = 1;
+  /** Esquiva em curso (i-frames): golpes não acertam. */
+  isDodging: () => boolean = () => false;
+  /** Número flutuante: dano causado (meu/aliado), recebido ou esquivado. */
+  onDamageNumber: (at: THREE.Vector3, amount: number, kind: 'mine' | 'ally' | 'hurt' | 'dodge' | 'block') => void = () => {};
+  /** Host: golpes aplicados desde a última foto [inimigo, dano, atacante] (os clientes mostram os números dos aliados). */
+  hitEvents: [number, number, string][] = [];
+  private readonly lastPlayer = new THREE.Vector3();
+  private mobHead(mob: Mob) { return new THREE.Vector3(mob.root.position.x, mob.root.position.y + (mob.kind === 'wolf' ? 1.2 : mob.kind === 'demon' ? 2.6 : 2.1), mob.root.position.z); }
+  /** Quantos jogadores (vivos) estão a até 30 m do inimigo → resistência extra de 30% por jogador além do primeiro. */
+  private groupScale(mob: Mob) {
+    if (this.netRole === 'solo' || !this.remotes.length) return 1;
+    let n = this.health > 0 && this.lastPlayer.distanceTo(mob.root.position) < 30 ? 1 : 0;
+    for (const r of this.remotes) if (r.alive && r.pos.distanceTo(mob.root.position) < 30) n++;
+    return 1 + .3 * Math.max(0, n - 1);
+  }
+  private addThreat(mob: Mob, id: string, amount: number) {
+    if (!id) return;
+    const t = mob.threat ?? (mob.threat = new Map());
+    t.set(id, (t.get(id) ?? 0) + amount);
+  }
+  /** Provocação (Brado do guerreiro): inimigos a até adius passam a mirar em id. */
+  taunt(id: string, x: number, z: number, radius = 12) {
+    if (this.netRole === 'client') return;
+    for (const m of this.mobs) {
+      if (m.health <= 0 || Math.hypot(m.root.position.x - x, m.root.position.z - z) > radius) continue;
+      let top = 0; m.threat?.forEach(v => { top = Math.max(top, v); });
+      this.addThreat(m, id, top + 200 - (m.threat?.get(id) ?? 0));
+      m.aggro = true;
+    }
+  }
+  /** O que é este alvo (malha de acerto de um inimigo) e se ainda está vivo — para travar a mira. */
+  targetInfo(obj: THREE.Object3D) { const m = this.mobs.find(x => x.target === obj); return m ? { kind: m.kind, alive: m.health > 0 && m.root.visible } : null; }
+  /** Ponto acima da cabeça do inimigo i (números de dano dos aliados vindos do host). */
+  mobHeadAt(i: number) { const m = this.mobs[i]; return m ? this.mobHead(m) : null; }
+  /** Barras de vida sobre os inimigos em combate (para a interface). */
+  mobBars() {
+    return this.mobs.map(m => ({
+      at: this.mobHead(m), hp: m.health, max: MOB_STATS[m.kind].hp, kind: m.kind,
+      show: m.health > 0 && m.root.visible && (m.health < MOB_STATS[m.kind].hp || (m.aggro && m.root.position.distanceTo(this.lastPlayer) < 18)),
+      onMe: !!m.targetId && m.targetId === this.selfId,
+    }));
+  }
+  /** O jogador local teve participação na morte deste inimigo? (sempre, fora do multijogador) */
+  private earned(mob: Mob) {
+    if (this.netRole === 'solo') return true;
+    return (mob.myHitAt !== undefined && performance.now() - mob.myHitAt < 30000) || this.lastPlayer.distanceTo(mob.root.position) < 25;
+  }
+
   /* ==================================================================== MULTIJOGADOR
    * solo: tudo local. host: simula os inimigos para a sala inteira e escolhe como alvo o jogador mais próximo
    * (local ou remoto). client: os inimigos são "marionetes" que seguem as fotos do host; golpes do cliente viram
@@ -911,16 +987,17 @@ export class CombatSystem {
       const atk = m.attack ? ATTACK_IDS.indexOf(m.attack.id) : -1;
       return [Math.round(m.root.position.x * 100) / 100, Math.round(m.root.position.z * 100) / 100, Math.round(m.root.rotation.y * 100) / 100,
         Math.round(m.health * 10) / 10, atk, Math.round(m.attackAge * 100) / 100, Math.round(m.stagger * 100) / 100, Math.round(m.air * 100) / 100,
-        m.held ? Math.round(m.held.tilt * 100) / 100 : -1, m.held ? Math.round(m.held.lift * 100) / 100 : 0];
+        m.held ? Math.round(m.held.tilt * 100) / 100 : -1, m.held ? Math.round(m.held.lift * 100) / 100 : 0, m.targetId ?? ''];
     });
   }
   /** Cliente: aplica a foto do host (posição alvo, vida, ataque em curso, mortes e renascimentos). */
   /** Cliente: false até a primeira foto (ao entrar na sala, inimigos já mortos somem sem dar loot). */
   netSynced = false;
-  applySnapshot(snap: number[][], elapsed: number) {
+  applySnapshot(snap: (number | string)[][], elapsed: number) {
     for (let i = 0; i < this.mobs.length && i < snap.length; i++) {
       const m = this.mobs[i], s = snap[i]; if (!s) continue;
-      const [x, z, yaw, hp, atk, age, stagger, air, heldTilt, heldLift] = s;
+      const [x, z, yaw, hp, atk, age, stagger, air, heldTilt, heldLift] = s as number[];
+      m.targetId = String(s[10] ?? '');
       if (hp <= 0 && m.health > 0) {
         if (this.netSynced) this.defeat(m); else { m.deathAge = 99; m.root.visible = false; }
         m.health = 0; m.respawnTimer = Infinity; continue;
@@ -942,9 +1019,12 @@ export class CombatSystem {
     }
   }
   /** Host: aplica o pedido de dano de um cliente. */
-  netApplyHit(index: number, damage: number, point: THREE.Vector3, knock: number) {
+  netApplyHit(index: number, damage: number, point: THREE.Vector3, knock: number, attacker = '', threatMult = 1) {
     const m = this.mobs[index]; if (!m || m.health <= 0) return;
-    this.applyHit(m, point, damage, knock, true);
+    // dano absurdo (cliente modificado) é limitado
+    damage = Math.min(Math.max(0, damage), 400);
+    this.addThreat(m, attacker, damage * (Math.min(3, Math.max(0, threatMult)) - 1) / this.groupScale(m));
+    this.applyHit(m, point, damage, knock, true, attacker);
   }
   /** Host: um cliente está segurando este inimigo (Agarrão). */
   netHold(index: number, x: number, z: number, yaw: number, tilt: number, lift: number) {
@@ -961,9 +1041,12 @@ export class CombatSystem {
   /** Jogador local recebeu um golpe de inimigo vindo do host (aplica escudo, resistência e invulnerabilidade daqui). */
   receiveStrike(damage: number, fromX: number, fromZ: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
     if (this.invulnerable || this.health <= 0) return;
+    this.tmpC.set(player.x, player.y + 2.2, player.z);
+    if (this.isDodging()) { this.onDamageNumber(this.tmpC, 0, 'dodge'); return; }
     this.tmpA.set(player.x, player.y + .9, player.z); this.tmpB.set(fromX, player.y + 1, fromZ);
-    if (block(this.tmpA, this.tmpB)) return;
-    this.health = Math.max(0, this.health - damage * (1 - this.resist)); this.onSfx('hurt');
+    if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
+    const dealt = damage * (1 - this.resist);
+    this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
     this.tmpA.set(player.x, player.y + 1, player.z); this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
 
@@ -1147,6 +1230,7 @@ export class CombatSystem {
 
   update(delta: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
     const dt = Math.min(delta, .05);
+    this.lastPlayer.copy(player);
     for (const mob of this.mobs) {
       if (mob.health <= 0) {
         mob.respawnTimer -= dt; mob.deathAge += dt;
@@ -1164,16 +1248,22 @@ export class CombatSystem {
       // agarrado por um cliente que sumiu (caiu a conexão): solta depois de 1,5 s sem notícias
       if (mob.held && mob.netHeldAt !== undefined && performance.now() - mob.netHeldAt > 1500) this.netRelease(this.mobs.indexOf(mob), 0, 0);
       if (mob.held) { this.updateHeld(mob, dt, elapsed); continue; }
-      // host: persegue o jogador mais próximo (local ou remoto)
-      let target = player; this.strikeTarget = null;
+      // host: persegue quem tem mais ameaça entre os jogadores a até 30 m (sem ameaça: o mais próximo)
+      let target = player; this.strikeTarget = null; mob.targetId = this.health > 0 ? this.selfId : '';
       if (this.netRole === 'host' && this.remotes.length) {
-        let best = Math.hypot(player.x - mob.root.position.x, player.z - mob.root.position.z);
-        if (this.health <= 0) best = Infinity;
-        for (const r of this.remotes) {
-          if (!r.alive) continue;
-          const d = Math.hypot(r.pos.x - mob.root.position.x, r.pos.z - mob.root.position.z);
-          if (d < best) { best = d; target = this.targetTmp.copy(r.pos); this.strikeTarget = r.id; }
-        }
+        const mp = mob.root.position, th = mob.threat;
+        th?.forEach((v, k) => { const nv = v * Math.exp(-dt * .12); if (nv < 1) th.delete(k); else th.set(k, nv); }); // ameaça esfria
+        let bestT = -1, bestD = Infinity, pick: { id: string; pos: THREE.Vector3 } | null = null;
+        const consider = (id: string, pos: THREE.Vector3) => {
+          const d = Math.hypot(pos.x - mp.x, pos.z - mp.z); if (d > 30) return;
+          const t = th?.get(id) ?? 0;
+          if (t > bestT + 1e-3 || (Math.abs(t - bestT) <= 1e-3 && d < bestD)) { bestT = t; bestD = d; pick = { id, pos }; }
+        };
+        if (this.health > 0) consider(this.selfId, player);
+        for (const r of this.remotes) if (r.alive) consider(r.id, r.pos);
+        const chosen = pick as { id: string; pos: THREE.Vector3 } | null;
+        if (chosen && chosen.id !== this.selfId) { target = this.targetTmp.copy(chosen.pos); this.strikeTarget = chosen.id; }
+        mob.targetId = chosen?.id ?? '';
       }
       this.updateMob(mob, dt, elapsed, target, block);
     }
@@ -1399,10 +1489,13 @@ export class CombatSystem {
     // alvo remoto: o próprio jogador aplica escudo/resistência na máquina dele
     if (this.strikeTarget) { this.onRemoteStrike(this.strikeTarget, stats.damage * def.damage, root.position.x, root.position.z); return; }
     if (this.invulnerable) return;
+    this.tmpC.set(player.x, player.y + 2.2, player.z);
+    if (this.isDodging()) { this.onDamageNumber(this.tmpC, 0, 'dodge'); return; } // esquiva: invulnerável
     this.tmpA.set(player.x, player.y + .9, player.z);
     this.tmpB.set(root.position.x, root.position.y + 1, root.position.z);
-    if (block(this.tmpA, this.tmpB)) return;
-    this.health = Math.max(0, this.health - stats.damage * def.damage * (1 - this.resist)); this.onSfx('hurt');
+    if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
+    const dealt = stats.damage * def.damage * (1 - this.resist);
+    this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
     this.tmpA.set(player.x, player.y + 1, player.z);
     this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
@@ -1585,7 +1678,15 @@ export class CombatSystem {
       const { stepZ, lift, toeOff } = feet[i];
       this.solveLeg(leg, r.pelvis.position.y, r.pelvis.position.z, r.pelvis.rotation.x, 0, lerp(leg.restZ, leg.footZ, w) + stepZ, leg.footY + lift, toeOff * .4);
     });
-    r.retarget?.update();
+    // bandido com modelo: corre com a animação 'Running' (public/animations) por cima da passada procedural
+    let blend: ClipBlend | undefined;
+    if (r.retarget && mob.kind === 'bandit' && this.banditRun) {
+      const sp = MOB_STATS[mob.kind].speed, running = mob.health > 0 && !mob.attack && mob.stagger <= 0 && !mob.held;
+      mob.runW = damp(mob.runW ?? 0, running ? smoothstep(mob.speed, sp * .35, sp * .8) : 0, 6, dt);
+      mob.runT = (mob.runT ?? Math.random()) + dt * clamp(mob.speed / 4.2, .6, 1.5);
+      if (mob.runW > .01) blend = { clip: this.banditRun, time: mob.runT, weight: mob.runW * .9 };
+    }
+    r.retarget?.update(blend);
 
     for (const chain of r.cloth) {
       if (chain.segs.length === 1 && chain.angle !== 0) this.stepChain(chain, dt, mob.vf * Math.cos(chain.angle) + mob.vs * Math.sin(chain.angle), 0, t * 2 + chain.angle, 0);
@@ -1946,7 +2047,10 @@ export class CombatSystem {
   private defeat(mob: Mob) {
     if (mob.held) { mob.held = null; mob.root.rotation.order = 'XYZ'; mob.root.rotation.z = 0; }
     this.onSfx('enemyDie');
-    this.onKill(mob.kind);
+    // multijogador: só quem participou (acertou há pouco ou estava perto) ganha crédito, XP e loot
+    const earned = this.earned(mob);
+    mob.threat?.clear(); mob.targetId = ''; mob.myHitAt = undefined;
+    if (earned) this.onKill(mob.kind);
     mob.root.visible = true;
     // tomba para longe do golpe (de lado, para o lobo); golpe de frente/de trás sorteia o lado
     mob.deathAge = 0; mob.deathSide = Math.abs(mob.hitX) > .25 ? -Math.sign(mob.hitX) : Math.random() < .5 ? 1 : -1;
@@ -1955,6 +2059,7 @@ export class CombatSystem {
     const stats = MOB_STATS[mob.kind];
     this.tmpA.set(mob.root.position.x, mob.root.position.y + .4, mob.root.position.z);
     this.particles.emit(this.tmpA, '#b9a98a', 14, 2.2, 1.4, .8, 1.5);
+    if (!earned) return;
     this.spawnDrop('experience', mob.root.position, stats.xp);
     const roll = Math.random();
     const loot: LootItemId | undefined = mob.kind === 'wolf'

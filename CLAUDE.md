@@ -41,6 +41,8 @@ The game loop and React are bridged by refs, not by state:
 
 **Models (`public/models/*.glb`) are optional enhancements.** Every model is loaded asynchronously and falls back to procedural geometry when it is missing or fails to load. The hero is the plain `Xbot.glb` (`attachBody(gltf, { plain: true })`, colors from the character creator), falling back to the procedural body. Classes (Maga, Guerreiro, Clérigo) live in `classes.ts`: weapon, base health/resist, basic attack and the 5-slot ability bar (Q, 1, 2, F, R); their abilities are `SpellId`s in `magic.ts`. Wolves use `wolf.glb`, demons `aura.glb` (decimated on load) and bandits `perso.glb` (retargeted). Keep this fallback pattern and check the `disposed` flag in load callbacks.
 
+**Animations (`public/animations/*.fbx`, from Mixamo):** `anim-library.ts` loads them once (meshes discarded) and converts each clip to the target skeleton. The two skeletons use different local axes (the FBX right thigh is 180° off from Xbot.glb), so binding the tracks directly flips the legs. The conversion is `q' = O_parent⁻¹·q·O_bone` with `O = W_src_rest⁻¹·W_dst_rest`, and it strips root motion and Hips rotation. Always convert from a rest copy of the model (`cloneSkinned` before `attachBody`). The hero and remote avatars use `addClips`: `run` replaces the Xbot run, and `fly`/`fall` are blended by region in those poses. Bandits blend `run` through `Retarget.update(blend)`. Wolves are quadrupeds and demons don't use Mixamo, so neither gets these clips. To add a clip, register it in `ANIM_FILES` (and `ANIM_TRIM` for a segment).
+
 **Multiplayer and save:**
 - `server/relay.mjs` is a dumb room relay (max 4 per room, stamps `from`). The first player in a room is the host. It has its own `server/package.json` and `Dockerfile`, plus `render.yaml` at the root, so it can be deployed on its own. Vercel can't host it because it has no persistent WebSockets. It serves `GET /health` and `GET /rooms` (public rooms), and reads the env vars `PORT`, `ALLOWED_ORIGINS` and `MAX_CONNECTIONS`.
 - The default transport is P2P (server value `p2p`). Browsers connect over WebRTC (PeerJS, using the free public broker only for signaling). The first player in a room claims the PeerJS id `ecos-da-era-dos-herois-<room>` and becomes the in-browser relay with the same protocol as `relay.mjs`. There is a 2 s heartbeat; a silent host is replaced after 15 s and a silent player is dropped after 20 s. `hostbye`/`bye` are sent on `pagehide`.
@@ -49,6 +51,15 @@ The game loop and React are bridged by refs, not by state:
 - `net.ts` (`NetClient`) is the browser side. `CombatSystem.netRole` is `solo`, `host` or `client`. The host simulates mobs, targets the nearest player and broadcasts `snapshot()` at 10 Hz. Clients run `updatePuppet` and send damage to the host (`onHitRequest`). Loot is per client (each one runs `defeat()` locally).
 - `remote-players.ts` keeps a fixed pool of 3 remote avatars created at startup. Never create heroes at runtime, because each one has a PointLight.
 - The party lives in `Game.tsx` (`pinv`/`pacc`/`pst`/`pleave` messages). Cura em Grupo and Despertar reach party members.
+- Group combat in `combat.ts`:
+  - Each mob has a threat map per player. The host targets the highest threat within 30 m, threat decays over time, the warrior's `threatMult` is 2, and the Brado calls `taunt()`. The target id goes out in the snapshot (index 10).
+  - Damage is divided by `groupScale` (+30% per extra player within 30 m).
+  - `earned()` grants loot, XP and quest credit only to players who hit the mob in the last 30 s or were within 25 m.
+  - Floating numbers go through `onDamageNumber`. The host sends ally hits in `snap.h`.
+  - Dodge gives i-frames through `isDodging`, including remote strikes.
+  - When a player falls in multiplayer, they wait up to 20 s to be revived (G from an ally, the `revive` message).
+- Target lock (Tab / middle mouse, in `Game.tsx`): the target can be a mob (`combat.targets` + `targetInfo`) or a remote player. `cameraRig.turnToward` keeps it in front, the hero faces it, and `aimPoint()` sends every spell to it.
+- Remote players send `vx`/`vz` at 20 Hz. `RemotePlayers.update` extrapolates up to 0.25 s ahead.
 - `save.ts` stores the save in localStorage (`ecos.save.v1`) and can export/import it as .json. Autosave runs every 30 s and on `beforeunload`.
 
 **Performance invariants (each one caused multi-second hitches when broken):**

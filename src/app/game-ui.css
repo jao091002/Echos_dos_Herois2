@@ -647,3 +647,30 @@
 .mp-room b { flex: 1; font: 500 13px var(--serif); color: #f4eedd; overflow: hidden; text-overflow: ellipsis }
 .mp-room small { font: 500 10px var(--sans); color: var(--muted) }
 .mp-btn:disabled { opacity: .45; cursor: default }
+
+/* corrida ligada (Alt / botão Correr alternam) */
+.touch-action.is-on { border-color: var(--gold-bright); color: var(--gold-bright); background: rgba(220, 200, 147, .2) }
+
+/* ============================ combate em grupo ============================ */
+.floaters, .mob-bars { position: absolute; inset: 0; z-index: 3; pointer-events: none; overflow: hidden }
+.floater { position: absolute; left: 0; top: 0; white-space: nowrap; font: 700 15px var(--sans); color: #fff1c4; text-shadow: 0 1px 3px #000, 0 0 6px rgba(0, 0, 0, .7); will-change: transform, opacity }
+.floater.mine { color: #ffd76a }
+.floater.mine.big { font-size: 21px; color: #ffb347 }
+.floater.ally { color: #d9dde6; font-size: 13px; font-weight: 600 }
+.floater.hurt { color: #ff6a52; font-size: 16px }
+.floater.dodge, .floater.block { color: #9ff0cf; font: italic 600 13px var(--serif) }
+.mob-bar { position: absolute; left: 0; top: 0; width: 56px; height: 5px; border: 1px solid rgba(0, 0, 0, .6); background: rgba(0, 0, 0, .55); will-change: transform }
+.mob-bar i { display: block; height: 100%; background: linear-gradient(90deg, #c8742c, #f0a046); transition: width .15s }
+.mob-bar.on-me { border-color: rgba(255, 90, 70, .9); box-shadow: 0 0 6px rgba(255, 70, 50, .6) }
+.mob-bar.on-me i { background: linear-gradient(90deg, #b8302e, #ff5a46) }
+.downed { position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%); z-index: 6; display: grid; justify-items: center; gap: 10px; padding: 18px 24px; border: 1px solid rgba(255, 106, 82, .45); background: rgba(14, 8, 8, .78); backdrop-filter: blur(6px); text-align: center; animation: rise .4s var(--ease) both }
+.downed strong { font: 500 24px var(--serif); letter-spacing: .14em; text-transform: uppercase; color: #ff9a86 }
+.downed span { font: 500 13px var(--sans); color: #e6dbb8 }
+.downed kbd { margin: 0 3px; padding: 1px 6px; border: 1px solid var(--line-strong); font: 500 11px var(--sans); color: var(--gold-bright) }
+
+/* alvo travado (Tab / botão do meio) */
+.lock-marker { position: absolute; left: 0; top: 0; z-index: 4; pointer-events: none; display: grid; justify-items: center; will-change: transform }
+.lock-marker i { width: 34px; height: 34px; border: 2px solid #ff6a4a; transform: rotate(45deg); box-shadow: 0 0 10px rgba(255, 90, 60, .6), inset 0 0 6px rgba(255, 90, 60, .4); animation: lock-pulse 1.1s ease-in-out infinite }
+.lock-marker span { margin-top: 12px; padding: 1px 8px; font: 600 11px var(--sans); letter-spacing: .08em; color: #ffd2c6; background: rgba(20, 8, 6, .7); white-space: nowrap }
+.lock-marker.is-player i { border-color: #ffb347; box-shadow: 0 0 10px rgba(255, 180, 70, .6) }
+@keyframes lock-pulse { 0%, 100% { transform: rotate(45deg) scale(1) } 50% { transform: rotate(45deg) scale(.86) } }

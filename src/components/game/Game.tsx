@@ -18,6 +18,8 @@ import { PerfMonitor } from './perf-monitor';
 import { QuestGiver, type QuestStage } from './npc';
 import { NetClient, r2, defaultServer, listRooms, OFFICIAL_SERVER, isP2P, type NetMsg, type RoomInfo } from './net';
 import { RemotePlayers, type RemoteState } from './remote-players';
+import { clipsFor } from './anim-library';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { readSave, writeSave, exportSave, importSave, type SaveData } from './save';
 
 /** Missão do Aldren: abater lobos perto do caminho do marco. */
@@ -78,9 +80,9 @@ const WEAPON_NAME = { staff: 'cajado', axe: 'machado', mace: 'maça', book: 'liv
 const WEAPON_ART = { staff: 'o', axe: 'o', mace: 'a', book: 'o' } as const;
 const controlsFor = (def: ClassDef): [string[], string][] => [
   [['W', 'A', 'S', 'D'], 'Mover'], [['Cursor'], 'Mirar (mouse livre)'], [['Arrastar'], 'Girar a câmera (botão esq./dir.)'], [['Roda'], 'Zoom da câmera'], [['Shift'], 'Alternar Shift Lock'],
-  [['Alt'], def.weapon === 'staff' ? 'Correr / voar rápido' : 'Correr'], [['Espaço'], def.weapon === 'staff' ? 'Pular / subir voando' : 'Pular'], ...(def.weapon === 'staff' ? [[['Ctrl'], 'Descer voando'] as [string[], string]] : []),
+  [['Alt'], def.weapon === 'staff' ? 'Ligar / desligar corrida (e voo rápido)' : 'Ligar / desligar corrida'], [['Espaço'], def.weapon === 'staff' ? 'Pular / subir voando' : 'Pular'], ...(def.weapon === 'staff' ? [[['Ctrl'], 'Descer voando'] as [string[], string]] : []),
   ...def.abilities.map(a => [[a.key], `${a.label} · ${ABILITY_HINT[a.spell]}`] as [string[], string]),
-  [['Clique dir.'], `Golpe com ${WEAPON_ART[def.weapon]} ${WEAPON_NAME[def.weapon]} (sem arrastar)`], [['X'], 'Esquiva'], [['T'], `Guardar / sacar ${WEAPON_ART[def.weapon]} ${WEAPON_NAME[def.weapon]}`], [['V'], 'Postura defensiva'],
+  [['Clique dir.'], `Golpe com ${WEAPON_ART[def.weapon]} ${WEAPON_NAME[def.weapon]} (sem arrastar)`], [['X'], 'Esquiva (invulnerável por um instante)'], [['Tab'], 'Travar alvo / trocar · Tab sem alvo solta'], [['Botão do meio'], 'Travar / soltar alvo'], [['T'], `Guardar / sacar ${WEAPON_ART[def.weapon]} ${WEAPON_NAME[def.weapon]}`], [['V'], 'Postura defensiva'],
   [['E'], 'Inventário'], [[','], 'Habilidades'], [['P'], 'Jogadores e grupo (multijogador)'], [['G'], 'Ouvir o Marco'], [['J'], 'Diário de viagem'], [['Esc'], 'Pausar'],
 ];
 
@@ -154,8 +156,18 @@ export default function Game() {
   const fpsRef = useRef<HTMLDivElement>(null);
   const perfPanelRef = useRef<HTMLPreElement>(null);
   const shellRef = useRef<HTMLElement>(null);
+  /** Números de dano flutuantes e barras de vida dos inimigos (pools de elementos posicionados a cada quadro). */
+  const floatersRef = useRef<HTMLDivElement>(null);
+  const mobBarsRef = useRef<HTMLDivElement>(null);
+  /** Caído no multijogador (esperando um aliado reviver): contagem regressiva e renascer agora. */
+  const [downed, setDowned] = useState(false);
+  const downedRef = useRef<HTMLSpanElement>(null);
+  const respawnRef = useRef<() => void>(() => {});
+  const [nearDowned, setNearDowned] = useState<{ id: string; name: string } | null>(null);
   /** Nomes sobre a cabeça dos outros jogadores (um por avatar remoto, posicionados a cada quadro). */
   const nameplatesRef = useRef<HTMLDivElement>(null);
+  /** Marcador do alvo travado (Tab). */
+  const lockMarkerRef = useRef<HTMLDivElement>(null);
   const captionRef = useRef<HTMLDivElement>(null);
   const damageRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef(true);
@@ -167,7 +179,13 @@ export default function Game() {
   const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const touchPointerRef = useRef<number | null>(null);
   const touchMoveRef = useRef({ forward: 0, side: 0 });
+  /** Corrida ligada (Alt ou botão Correr alternam: aperta uma vez e fica correndo até apertar de novo). */
   const touchSprintRef = useRef(false);
+  const [sprintOn, setSprintOn] = useState(false);
+  const toggleSprint = useCallback((announce = true) => {
+    touchSprintRef.current = !touchSprintRef.current; setSprintOn(touchSprintRef.current);
+    if (announce) { setHint(touchSprintRef.current ? 'Corrida ligada · Alt para voltar a andar' : 'Corrida desligada'); setTimeout(() => setHint(''), 1600); }
+  }, []);
   const touchJumpRef = useRef(false);
   const [status, setStatus] = useState<GameStatus>({ area: 'Campos da Aurora', discovered: 0 });
   const [hint, setHint] = useState('');
@@ -471,8 +489,11 @@ export default function Game() {
     const remotes = new RemotePlayers(scene, 3);
     loader.load('/models/Xbot.glb', gltf => {
       if (disposed) return;
+      // animações da pasta public/animations (corrida, voo, queda): convertidas a partir de uma cópia em repouso
+      const rest = cloneSkinned(gltf.scene);
       remotes.attachBodies(gltf); // clona antes: o herói local reaproveita a cena original
       hero.attachBody(gltf, { plain: true });
+      void clipsFor(rest).then(clips => { if (disposed) return; hero.addClips(clips); remotes.addClips(clips); });
     }, undefined, () => { /* mantém o corpo procedural */ });
     const motor = new PlayerMotor(hero.root, world.colliders);
     const cameraRig = new ThirdPersonCamera(camera, world);
@@ -584,13 +605,59 @@ export default function Game() {
     // modelos GLB chegam depois: quando todos terminarem, compila seus materiais em segundo plano (sem engasgo na 1ª aparição)
     THREE.DefaultLoadingManager.onLoad = () => { if (!disposed) precompile(true); };
     let isNearMarker = false, markerRemembered = false, shiftLockActive = false, castUntil = 0, attackUntil = 0, dodgeUntil = 0, hitUntil = 0, landUntil = 0, lastHealth = combat.health, deathTimer = 0, hudTick = 0, cycleTick = 0;
+    /* ==================================================================== TRAVAR ALVO (Tab)
+     * Prende a câmera e o personagem num inimigo ou jogador: a câmera gira para manter o alvo à frente,
+     * o herói encara o alvo mesmo andando de lado/para trás e todas as magias miram nele.
+     * Tab de novo troca para o próximo alvo; Tab sem alvos perto (ou alvo morto/longe) solta.
+     */
+    type Lock = { obj: THREE.Object3D; label: string; player: string | null };
+    let lock: Lock | null = null;
+    const lockPos = (l: Lock, out: THREE.Vector3) => {
+      if (l.player) { out.copy(l.obj.position); out.y += 1.25; } else l.obj.getWorldPosition(out);
+      return out;
+    };
+    const MOB_LABEL = { wolf: 'Lobo', bandit: 'Bandido', demon: 'Demônio' } as const;
+    const lockCandidates = (): Lock[] => {
+      const out: Lock[] = [];
+      for (const t of combat.targets) { const info = combat.targetInfo(t); if (info?.alive) out.push({ obj: t, label: MOB_LABEL[info.kind], player: null }); }
+      for (const s of remotes.active()) if (s.st.hp > 0) out.push({ obj: s.hero.root, label: s.st.name, player: s.id });
+      return out;
+    };
+    const lockValid = (l: Lock) => {
+      if (l.player) { const s = remotes.active().find(x => x.id === l.player); if (!s || s.st.hp <= 0) return false; }
+      else if (!combat.targetInfo(l.obj)?.alive) return false;
+      return lockPos(l, tmpLock).distanceTo(hero.root.position) < 40;
+    };
+    const tmpLock = new THREE.Vector3(), tmpLock2 = new THREE.Vector3();
+    /** Tab: trava no alvo mais perto do centro da tela; com alvo travado, passa para o próximo (da esquerda p/ direita). */
+    const cycleLock = () => {
+      camera.updateMatrixWorld();
+      const scored = lockCandidates().map(l => {
+        lockPos(l, tmpLock2); const d = tmpLock2.distanceTo(hero.root.position); tmpLock2.project(camera);
+        return { l, d, x: tmpLock2.x, onScreen: tmpLock2.z < 1 && Math.abs(tmpLock2.x) < 1.1 && Math.abs(tmpLock2.y) < 1.1, score: Math.hypot(tmpLock2.x, tmpLock2.y) + d * .012 };
+      }).filter(s => s.d < 32 && (s.onScreen || s.d < 8));
+      if (!scored.length) { if (lock) { lock = null; showHint('Alvo solto.'); } return; }
+      if (!lock) { scored.sort((a, b) => a.score - b.score); lock = scored[0].l; }
+      else {
+        scored.sort((a, b) => a.x - b.x);
+        const i = scored.findIndex(s => s.l.obj === lock!.obj);
+        lock = scored[(i + 1) % scored.length].l;
+        if (scored.length === 1 && i === 0) { lock = null; showHint('Alvo solto.'); return; }
+      }
+      ambient.sfx('ui'); showHint(`Alvo travado: ${lock.label} · Tab troca/solta`);
+    };
+    /** Ponto de mira das magias: o alvo travado ou o que a câmera/cursor aponta. */
+    const aimPoint = (out: THREE.Vector3) => {
+      if (lock && lockValid(lock)) return lockPos(lock, out);
+      return cameraRig.getAimPoint(out, combat.targets);
+    };
     const castAbility = (spell: SpellId) => {
       if (uiOpenRef.current || combat.health <= 0 || elapsed < cine.until || grab) return;
       if (magic.shieldActive && spell !== 'shield' && spell !== 'flight') { showHint('Solte o escudo (F) para usar outra habilidade.'); return; }
       ambient.start();
       hero.ensureStaff();
       hero.spellPoint.getWorldPosition(spellOrigin);
-      cameraRig.getAimPoint(spellAim, combat.targets);
+      aimPoint(spellAim);
       spellDirection.copy(spellAim).sub(spellOrigin).normalize();
       if (spell === 'flight' && cls().weapon !== 'staff') return;
       if (!progression.unlocked(spell)) { const n = unlockNode(progression.cls, spell); showHint(`Habilidade bloqueada · desbloqueie “${n?.name ?? spell}” na árvore de habilidades (,)`); return; }
@@ -602,6 +669,11 @@ export default function Game() {
       if (magic.cast(spell, spellOrigin, spellDirection, spellAim)) {
         hero.root.userData.castKind = spell;
         broadcastFx(spell, spellOrigin, spellDirection, spellAim); partyEffects(spell);
+        // Brado provoca: os inimigos em volta passam a mirar no guerreiro (no host; o cliente pede ao host)
+        if (spell === 'brado') {
+          const hp = hero.root.position;
+          if (combat.netRole === 'client') net.sendTo(net.host, { t: 'taunt', x: r2(hp.x), z: r2(hp.z) }); else combat.taunt(combat.selfId, hp.x, hp.z);
+        }
         if (spell === 'agarrao') { startGrab(); return; }
         if (spell === 'passoArcano') { blink(); return; }
         if (melee) {
@@ -620,7 +692,7 @@ export default function Game() {
     // Zoltraak carregável: segurar Q / clique esquerdo carrega; soltar dispara o raio.
     const aimNow = () => {
       hero.spellPoint.getWorldPosition(spellOrigin);
-      cameraRig.getAimPoint(spellAim, combat.targets);
+      aimPoint(spellAim);
       spellDirection.copy(spellAim).sub(spellOrigin).normalize();
       magic.setAim(spellOrigin, spellDirection);
     };
@@ -794,7 +866,10 @@ export default function Game() {
         questKill: () => combat.onKill('wolf'),
         npcTalk: () => { isNearNpc = true; talkToNpc(); },
         // multijogador (testes automatizados): rede, avatares remotos e papel no combate
-        net: netRef.current, mp: () => ({ status: netRef.current!.status, error: netRef.current!.error, id: netRef.current!.id, host: netRef.current!.host, peers: [...netRef.current!.peers.values()], role: combat.netRole, remotes: remotes.active().map(s => ({ id: s.id, name: s.st.name, cls: s.st.cls, x: s.hero.root.position.x, z: s.hero.root.position.z })), mobs: combat.snapshot().length, mob0: combat.snapshot()[0], health: combat.health, party: partyRef.current }),
+        net: netRef.current, mp: () => ({ status: netRef.current!.status, error: netRef.current!.error, id: netRef.current!.id, host: netRef.current!.host, peers: [...netRef.current!.peers.values()], role: combat.netRole, remotes: remotes.active().map(s => ({ id: s.id, name: s.st.name, cls: s.st.cls, x: s.hero.root.position.x, z: s.hero.root.position.z })), mobs: combat.snapshot(), mob0: combat.snapshot()[0], health: combat.health, party: partyRef.current, drops: combat.perfStats().drops, floaters: floatersRef.current ? [...floatersRef.current.children].filter(e => (e as HTMLElement).style.display !== 'none').map(e => e.className + ':' + e.textContent) : [], bars: mobBarsRef.current ? [...mobBarsRef.current.children].filter(e => (e as HTMLElement).style.display !== 'none').length : 0, downed: downedShown }),
+        kill: () => { combat.health = 0; },
+        lockInfo: () => ({ label: lock?.label ?? null, player: lock?.player ?? null, camYaw: cameraRig.yaw, heroYaw: hero.root.rotation.y, target: lock ? lockPos(lock, new THREE.Vector3()).toArray() : null, hero: hero.root.position.toArray() }),
+        pos: () => ({ x: hero.root.position.x, z: hero.root.position.z }),
       };
     }
     const interactMarker = () => {
@@ -843,7 +918,9 @@ export default function Game() {
     const vArr = (v: THREE.Vector3) => [r2(v.x), r2(v.y), r2(v.z)];
     const netBlock = (from: THREE.Vector3, to: THREE.Vector3) => magic.blockProjectile(from, to);
     // dano do cliente → host; golpe de inimigo do host → jogador remoto; Agarrão do cliente → host
-    combat.onHitRequest = (i, d, p, k) => net.sendTo(net.host, { t: 'hit', i, d: r2(d), p: vArr(p), k: r2(k) });
+    combat.onHitRequest = (i, d, p, k) => net.sendTo(net.host, { t: 'hit', i, d: r2(d), p: vArr(p), k: r2(k), th: combat.threatMult });
+    combat.isDodging = () => motor.dodging || elapsed < dodgeUntil;
+    combat.onDamageNumber = (at, amount, kind) => spawnFloater(at, amount, kind);
     combat.onRemoteStrike = (id, d, x, z) => net.sendTo(id, { t: 'strike', d: r2(d), x: r2(x), z: r2(z) });
     combat.onNetHold = (i, x, z, yaw, tilt, lift) => net.sendTo(net.host, { t: 'hold', i, x: r2(x), z: r2(z), y: r2(yaw), tl: r2(tilt), l: r2(lift) });
     combat.onNetRelease = (i, px, pz) => net.sendTo(net.host, { t: 'rel', i, x: r2(px), z: r2(pz) });
@@ -853,8 +930,18 @@ export default function Game() {
       const from = m.from ?? '';
       switch (m.t) {
         case 'st': remotes.setState(from, m as unknown as RemoteState, performance.now()); return;
-        case 'snap': if (combat.netRole === 'client' && from === net.host) combat.applySnapshot(m.m as number[][], elapsed); return;
-        case 'hit': if (combat.netRole === 'host') combat.netApplyHit(Number(m.i), Number(m.d), v3(m.p, tmpA), Number(m.k)); return;
+        case 'snap':
+          if (combat.netRole !== 'client' || from !== net.host) return;
+          combat.applySnapshot(m.m as (number | string)[][], elapsed);
+          // números de dano dos aliados (os meus já apareceram na hora do golpe)
+          for (const [i, d, who] of (m.h as [number, number, string][] | undefined) ?? []) { if (who === net.id) continue; const at = combat.mobHeadAt(i); if (at) spawnFloater(at, d, 'ally'); }
+          return;
+        case 'hit': if (combat.netRole === 'host') combat.netApplyHit(Number(m.i), Number(m.d), v3(m.p, tmpA), Number(m.k), from, Number(m.th) || 1); return;
+        case 'taunt': if (combat.netRole === 'host') combat.taunt(from, Number(m.x), Number(m.z)); return;
+        case 'revive':
+          if (combat.health > 0) return;
+          combat.health = combat.maxHealth * .4; deathTimer = 0; setDowned(false); magic.allyHeal(0, 3);
+          showHint(` reviveu você!`); return;
         case 'hold': if (combat.netRole === 'host') combat.netHold(Number(m.i), Number(m.x), Number(m.z), Number(m.y), Number(m.tl), Number(m.l)); return;
         case 'rel': if (combat.netRole === 'host') combat.netRelease(Number(m.i), Number(m.x), Number(m.z)); return;
         case 'strike': combat.receiveStrike(Number(m.d), Number(m.x), Number(m.z), hero.root.position, netBlock); return;
@@ -900,15 +987,19 @@ export default function Game() {
       combat.remotes = active.map(s => ({ id: s.id, pos: s.hero.root.position, alive: s.st.hp > 0 }));
       if (net.online && playing) {
         stateAcc += delta;
-        if (stateAcc >= 1 / 15) {
+        if (stateAcc >= 1 / 20) {
           stateAcc = 0;
           const hp = hero.root.position;
-          net.send({ t: 'st', x: r2(hp.x), y: r2(hp.y), z: r2(hp.z), yaw: r2(hero.root.rotation.y), pose: netPose, lp: netLoco, spd: r2(netSpeed),
+          net.send({ t: 'st', x: r2(hp.x), y: r2(hp.y), z: r2(hp.z), vx: r2(motor.velocity.x), vz: r2(motor.velocity.z), yaw: r2(hero.root.rotation.y), pose: netPose, lp: netLoco, spd: r2(netSpeed),
             ov: netOverlay, ck: (hero.root.userData.castKind as string | undefined) ?? null, hp: Math.round(combat.health), mhp: Math.round(combat.maxHealth),
             cls: heroChoiceRef.current.cls, look: heroChoiceRef.current.look, name: net.myName || mpNameRef.current, lvl: progression.level });
         }
       }
-      if (combat.netRole === 'host') { snapAcc += delta; if (snapAcc >= .1) { snapAcc = 0; net.send({ t: 'snap', m: combat.snapshot() }); } }
+      combat.selfId = net.online ? net.id : 'self';
+      combat.threatMult = heroChoiceRef.current.cls === 'guerreiro' ? 2 : 1; // o guerreiro é o tanque do grupo
+      if (combat.netRole === 'host') { snapAcc += delta; if (snapAcc >= .1) { snapAcc = 0; net.send({ t: 'snap', m: combat.snapshot(), h: combat.hitEvents }); combat.hitEvents = []; } }
+      else combat.hitEvents.length = 0;
+      updateOverlays(playing);
       // nomes sobre a cabeça dos outros jogadores (verde = do seu grupo)
       const plates = nameplatesRef.current;
       if (plates) {
@@ -939,6 +1030,49 @@ export default function Game() {
       }
     };
     let rosterKey = '';
+    let nearDownedId = '', reviveTarget = '', reviveUntil = 0;
+
+    /* ---- números de dano flutuantes (meu = dourado, aliado = cinza, recebido = vermelho) e barras dos inimigos */
+    const DOWN_TIME = 20;
+    let downedShown = false, respawnNow = false;
+    respawnRef.current = () => { respawnNow = true; };
+    const floaterState: { pos: THREE.Vector3; born: number; dx: number }[] = [];
+    let floaterCursor = 0;
+    function spawnFloater(at: THREE.Vector3, amount: number, kind: 'mine' | 'ally' | 'hurt' | 'dodge' | 'block') {
+      const box = floatersRef.current; if (!box || (amount <= 0 && kind !== 'dodge' && kind !== 'block')) return;
+      const slot = floaterCursor++ % box.children.length, el = box.children[slot] as HTMLDivElement;
+      el.textContent = kind === 'dodge' ? 'Esquivou' : kind === 'block' ? 'Bloqueado' : kind === 'hurt' ? `-${amount}` : String(amount);
+      el.className = `floater ${kind}${amount >= 60 ? ' big' : ''}`;
+      floaterState[slot] = { pos: at.clone(), born: performance.now(), dx: (Math.random() - .5) * 40 };
+    }
+    const fTmp = new THREE.Vector3();
+    const updateOverlays = (playing: boolean) => {
+      const box = floatersRef.current, bars = mobBarsRef.current, now = performance.now();
+      const w = renderer.domElement.clientWidth, h = renderer.domElement.clientHeight;
+      const place = (el: HTMLElement, p: THREE.Vector3, dy = 0) => {
+        fTmp.copy(p).project(camera);
+        if (fTmp.z > 1 || Math.abs(fTmp.x) > 1.2 || Math.abs(fTmp.y) > 1.2) return false;
+        el.style.transform = `translate(-50%, -100%) translate(${((fTmp.x + 1) / 2 * w).toFixed(1)}px, ${((1 - fTmp.y) / 2 * h + dy).toFixed(1)}px)`;
+        return true;
+      };
+      if (box) for (let i = 0; i < box.children.length; i++) {
+        const el = box.children[i] as HTMLDivElement, s = floaterState[i];
+        const age = s ? (now - s.born) / 1000 : 9;
+        if (!playing || age > 1) { if (el.style.display !== 'none') el.style.display = 'none'; continue; }
+        el.style.display = place(el, s.pos, -age * 46) ? '' : 'none';
+        el.style.opacity = String(age < .7 ? 1 : 1 - (age - .7) / .3);
+        el.style.marginLeft = `px`;
+      }
+      if (bars) {
+        const list = combat.mobBars();
+        for (let i = 0; i < bars.children.length; i++) {
+          const el = bars.children[i] as HTMLDivElement, b = list[i];
+          if (!playing || !b || !b.show || b.at.distanceTo(camera.position) > 45 || !place(el, b.at)) { if (el.style.display !== 'none') el.style.display = 'none'; continue; }
+          el.style.display = ''; el.classList.toggle('on-me', b.onMe);
+          (el.firstElementChild as HTMLElement).style.width = `%`;
+        }
+      }
+    };
     const onKeyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
       if (key === 'f3') { // painel de desempenho (desenvolvedor)
@@ -947,7 +1081,7 @@ export default function Game() {
         return;
       }
       if (titleRef.current) { if (key === 'enter' && !event.repeat) startRef.current(); return; }
-      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'shift', 'alt', 'escape', 'h', 'j', 'e', 'g', 'q', '1', '2', '3', '4', 'f', 'r', 'v', 'x', 't', 'control', ',', 'p'].includes(key)) event.preventDefault();
+      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'shift', 'alt', 'escape', 'h', 'j', 'e', 'g', 'q', '1', '2', '3', '4', 'f', 'r', 'v', 'x', 't', 'control', ',', 'p', 'tab'].includes(key)) event.preventDefault();
       if (event.repeat && ['escape', 'h', 'j', 'e', 'g', 'q', '1', '2', '3', '4', 'f', 'r', 'x', ' ', ',', 'p'].includes(key)) return;
       if (key === 'escape') {
         keys.clear();
@@ -970,11 +1104,19 @@ export default function Game() {
         }
         return;
       }
+      if (key === 'alt') { if (!event.repeat && !uiOpenRef.current) toggleSprint(); return; }
       if (key === 'h') { releaseMouse(); setHelp(value => !value); return; }
       if (key === 'j') { releaseMouse(); setQuestOpen(value => !value); return; }
       if (key === 'e') { toggleInventory(); return; }
       if (key === ',') { toggleSkills(); return; }
       if (key === 'p') { togglePlayers(); return; }
+      if (key === 'enter' && combat.health <= 0) { respawnNow = true; return; }
+      if (key === 'g' && nearDownedId && !uiOpenRef.current && combat.health > 0 && !reviveTarget) {
+        reviveTarget = nearDownedId; reviveUntil = elapsed + 1.4;
+        hero.root.userData.castKind = 'curaEquipe'; castUntil = elapsed + 1.4;
+        showHint(`Revivendo ${peerName(reviveTarget)}… fique perto`); ambient.sfx('cast');
+        return;
+      }
       if (key === 'g' && isNearNpc && !uiOpenRef.current) { talkToNpc(); return; }
       if (key === 'g' && isNearMarker && !uiOpenRef.current) {
         interactMarker();
@@ -989,17 +1131,19 @@ export default function Game() {
         return;
       }
       if (key === 'x') { dodgeRef.current(); return; }
+      if (key === 'tab') { if (!uiOpenRef.current && !event.repeat) cycleLock(); return; }
       if (key === 't' && !event.repeat) {
         if (uiOpenRef.current || combat.health <= 0 || elapsed < cine.until || magic.charging || magic.beamActive || magic.shieldActive) return;
         { const w = WEAPON_NAME[cls().weapon], W = w[0].toUpperCase() + w.slice(1), fem = WEAPON_ART[cls().weapon] === 'a';
           showHint((ambient.sfx('staffToggle'), hero.toggleStaff()) ? `${W} em mãos.` : `${W} guardad${fem ? 'a' : 'o'} nas costas.`); }
         return;
       }
-      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'alt', 'control', 'v'].includes(key)) {
+      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'control', 'v'].includes(key)) {
         ambient.start(); keys.add(key);
       }
     };
     const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === 'Alt') event.preventDefault(); // no Windows, soltar o Alt ativaria a barra de menus do navegador
       const key = event.key.toLowerCase();
       keys.delete(key);
       const ab = abilityFor(key);
@@ -1022,6 +1166,8 @@ export default function Game() {
     };
     const onPointerDown = (event: PointerEvent) => {
       if (uiOpenRef.current) return;
+      // botão do meio: trava/solta o alvo
+      if (event.button === 1) { event.preventDefault(); if (lock) { lock = null; showHint('Alvo solto.'); } else cycleLock(); return; }
       if (event.button !== 0 && event.button !== 2) return;
       ambient.start();
       if (event.pointerType === 'touch') {
@@ -1147,10 +1293,11 @@ export default function Game() {
         const side = inCine ? 0 : (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0) + touchMoveRef.current.side;
         if (grab && combat.health <= 0) endGrab();
         const grabSpeed = grab ? stepGrab(delta) : 0;
-        const moving = grab ? grabSpeed > .5 : combat.health > 0 && motor.update(delta, THREE.MathUtils.clamp(forward, -1, 1), THREE.MathUtils.clamp(side, -1, 1), keys.has('alt') || touchSprintRef.current, keys.has(' ') || touchJumpRef.current, cameraRig.yaw, magic.flying, Number(keys.has(' ') || touchJumpRef.current) - Number(keys.has('control')), cameraRig.pitch);
+        const moving = grab ? grabSpeed > .5 : combat.health > 0 && motor.update(delta, THREE.MathUtils.clamp(forward, -1, 1), THREE.MathUtils.clamp(side, -1, 1), touchSprintRef.current, keys.has(' ') || touchJumpRef.current, cameraRig.yaw, magic.flying, Number(keys.has(' ') || touchJumpRef.current) - Number(keys.has('control')), cameraRig.pitch);
         if (!grab) combat.pushPlayer(hero.root.position); // inimigos têm corpo sólido
-        if (!grab && combat.health > 0 && (shiftLockActive || Math.hypot(motor.velocity.x, motor.velocity.z) > .2)) {
-          hero.root.userData.facing = shiftLockActive ? cameraRig.yaw + Math.PI : Math.atan2(motor.velocity.x, motor.velocity.z);
+        if (!grab && combat.health > 0 && (lock || shiftLockActive || Math.hypot(motor.velocity.x, motor.velocity.z) > .2)) {
+          hero.root.userData.facing = lock ? Math.atan2(lockPos(lock, tmpLock).x - hero.root.position.x, tmpLock.z - hero.root.position.z)
+            : shiftLockActive ? cameraRig.yaw + Math.PI : Math.atan2(motor.velocity.x, motor.velocity.z);
         }
         // enquanto carrega/dispara, a câmera vai para o ombro (raio e mira ficam livres do corpo)
         if (zoltraakActive !== zoltraakFraming && !shiftLockActive) cameraRig.setShiftLock(zoltraakActive);
@@ -1165,7 +1312,13 @@ export default function Game() {
         if (combat.health <= 0) {
           magic.cancelCharge();
           deathTimer += delta;
-          if (deathTimer >= 2) {
+          // multijogador com aliados vivos: fica caído até 20 s esperando ser revivido (G de um aliado) ou Enter para renascer
+          const canBeRevived = net.online && remotes.active().some(s => s.st.hp > 0);
+          const wait = canBeRevived ? DOWN_TIME : 2;
+          if (canBeRevived && !downedShown) { downedShown = true; setDowned(true); }
+          if (downedRef.current) downedRef.current.textContent = String(Math.max(0, Math.ceil(wait - deathTimer)));
+          if (deathTimer >= wait || respawnNow) {
+            respawnNow = false; if (downedShown) { downedShown = false; setDowned(false); }
             hero.root.position.set(0, 0, 2);
             hero.root.rotation.set(0, Math.PI, 0);
             hero.root.userData.facing = Math.PI;
@@ -1173,11 +1326,11 @@ export default function Game() {
             combat.respawnPlayer();
             deathTimer = 0;
           }
-        } else deathTimer = 0;
+        } else { deathTimer = 0; if (downedShown) { downedShown = false; setDowned(false); } }
         if (!wasGrounded && motor.grounded) { landUntil = elapsed + .34; if (vyBefore < -3) ambient.sfx('land', THREE.MathUtils.clamp(-vyBefore / 14, .3, 1.3)); }
         if (wasGrounded && !motor.grounded && motor.verticalSpeed > 4) ambient.sfx('jump');
         if (motor.grounded && !magic.flying && moving) {
-          const sprinting = keys.has('alt') || touchSprintRef.current;
+          const sprinting = touchSprintRef.current;
           stepDist += Math.hypot(motor.velocity.x, motor.velocity.z) * delta;
           if (stepDist > (sprinting ? 2.2 : 1.55)) { stepDist = 0; ambient.sfx('step', sprinting ? 1.5 : 1); }
         }
@@ -1194,10 +1347,10 @@ export default function Game() {
         }
         lastHealth = combat.health;
         // pose de locomoção "por baixo" de ações de parte superior (magia em movimento/voo mantém pernas e inclinação)
-        hero.root.userData.locoPose = magic.flying ? 'fly' : !motor.grounded ? 'fall' : moving ? (keys.has('alt') || touchSprintRef.current ? 'run' : 'walk') : 'idle';
+        hero.root.userData.locoPose = magic.flying ? 'fly' : !motor.grounded ? 'fall' : moving ? (touchSprintRef.current ? 'run' : 'walk') : 'idle';
         const grabPose: HeroPose | null = grab ? (grab.phase === 'slam' ? (grab.slammed ? 'attack' : 'idle') : 'run') : null;
         if (grab) hero.root.userData.locoPose = grabPose;
-        const pose: HeroPose = grabPose ? grabPose : combat.health <= 0 ? 'defeat' : elapsed < hitUntil ? 'hit' : elapsed < castUntil ? 'cast' : elapsed < attackUntil ? 'attack' : elapsed < dodgeUntil ? 'dodge' : elapsed < landUntil ? 'land' : keys.has('v') ? 'guard' : magic.flying ? 'fly' : !motor.grounded ? (motor.verticalSpeed < -1 ? 'fall' : 'jump') : moving ? (keys.has('alt') || touchSprintRef.current ? 'run' : 'walk') : 'idle';
+        const pose: HeroPose = grabPose ? grabPose : combat.health <= 0 ? 'defeat' : elapsed < hitUntil ? 'hit' : elapsed < castUntil ? 'cast' : elapsed < attackUntil ? 'attack' : elapsed < dodgeUntil ? 'dodge' : elapsed < landUntil ? 'land' : keys.has('v') ? 'guard' : magic.flying ? 'fly' : !motor.grounded ? (motor.verticalSpeed < -1 ? 'fall' : 'jump') : moving ? (touchSprintRef.current ? 'run' : 'walk') : 'idle';
         const overlay = grab && !(grab.phase === 'slam' && grab.slammed) ? { mode: 'grab' as const, power: grab.phase === 'slam' ? Math.min(1, grab.t / GRAB.slamAt) : grab.phase === 'dash' ? .15 : 0 } : magic.charging ? { mode: 'charge' as const, power: magic.chargeLevel } : magic.beamActive ? { mode: 'beam' as const, power: magic.beamPower } : magic.shieldActive && elapsed > castUntil && !magic.flying ? { mode: 'shield' as const, power: magic.shieldDurability } : undefined;
         hero.update(elapsed, delta, pose, grab ? grabSpeed : Math.hypot(motor.velocity.x, motor.velocity.z), overlay);
         // o que os outros jogadores veem deste herói
@@ -1217,6 +1370,20 @@ export default function Game() {
         const distanceToMarker = Math.hypot(hero.root.position.x, hero.root.position.z + 12);
         const near = distanceToMarker < 4.6;
         if (near !== isNearMarker) { isNearMarker = near; setNearLandmark(near); }
+        // aliado caído por perto (G para reviver) e canal de reviver em curso
+        {
+          let best = 2.8, id = '';
+          for (const s of remotes.active()) { if (s.st.hp > 0) continue; const d = s.hero.root.position.distanceTo(hero.root.position); if (d < best) { best = d; id = s.id; } }
+          if (id !== nearDownedId) { nearDownedId = id; setNearDowned(id ? { id, name: peerName(id) } : null); }
+          if (reviveTarget) {
+            const s = remotes.active().find(x => x.id === reviveTarget);
+            if (!s || s.st.hp > 0 || s.hero.root.position.distanceTo(hero.root.position) > 3.4 || combat.health <= 0) { if (s && s.st.hp <= 0) showHint('Reviver interrompido.'); reviveTarget = ''; }
+            else if (elapsed >= reviveUntil) {
+              net.sendTo(reviveTarget, { t: 'revive' }); magic.remoteFx('curaEquipe', s.hero.root.position, spellDirection, s.hero.root.position);
+              showHint(`Você reviveu ${peerName(reviveTarget)}!`); reviveTarget = '';
+            }
+          }
+        }
         const nearN = combat.health > 0 && Math.hypot(hero.root.position.x - npc.position.x, hero.root.position.z - npc.position.z) < 3.3 && Math.abs(hero.root.position.y - npc.position.y) < 2.5;
         if (nearN !== isNearNpc) { isNearNpc = nearN; setNearNpc(nearN); }
         hudTick += delta;
@@ -1245,7 +1412,26 @@ export default function Game() {
       else cameraRig.aimNdc.set(0, 0);
       shellRef.current?.classList.toggle('free-cursor', free);
       if (aimReticleRef.current) { aimReticleRef.current.style.left = free ? `${mouse.x}px` : '50%'; aimReticleRef.current.style.top = free ? `${mouse.y}px` : '50%'; }
+      // alvo travado: a câmera gira para manter o alvo à frente; o marcador acompanha o alvo na tela
+      if (lock && (titleRef.current || combat.health <= 0 || !lockValid(lock))) { lock = null; if (!titleRef.current) showHint('Alvo perdido.'); }
+      if (lock) { lockPos(lock, tmpLock); cameraRig.turnToward(tmpLock.x - hero.root.position.x, tmpLock.z - hero.root.position.z, delta, 6); }
       cameraRig.update(hero.root, delta);
+      {
+        const mk = lockMarkerRef.current;
+        if (mk) {
+          if (!lock || uiOpenRef.current) { if (mk.style.display !== 'none') mk.style.display = 'none'; }
+          else {
+            lockPos(lock, tmpLock).project(camera);
+            if (tmpLock.z > 1) mk.style.display = 'none';
+            else {
+              mk.style.display = '';
+              mk.style.transform = `translate(-50%, -50%) translate(${((tmpLock.x + 1) / 2 * renderer.domElement.clientWidth).toFixed(1)}px, ${((1 - tmpLock.y) / 2 * renderer.domElement.clientHeight).toFixed(1)}px)`;
+              const lb = mk.lastElementChild as HTMLElement; if (lb.textContent !== lock.label) lb.textContent = lock.label;
+              mk.classList.toggle('is-player', !!lock.player);
+            }
+          }
+        }
+      }
       if (elapsed < grabCam.until) {
         // câmera do Agarrão: lateral e baixa, acompanhando o arrasto; na pancada chega mais perto e olha de baixo
         const hp = hero.root.position, d = grabCam.dir, s = grabCam.side, slam = grab?.phase === 'slam' ? 1 : 0;
@@ -1503,7 +1689,12 @@ export default function Game() {
     <pre ref={perfPanelRef} className="perf-panel" hidden />
     <div className="cine-bars" aria-hidden="true"><i /><i /></div>
     {/* nomes sobre a cabeça dos outros jogadores (um por avatar remoto; posicionados pelo loop) */}
+    <div ref={lockMarkerRef} className="lock-marker" aria-hidden="true" style={{ display: 'none' }}><i /><span /></div>
     <div ref={nameplatesRef} className="nameplates" aria-hidden="true">{[0, 1, 2].map(i => <div key={i} className="nameplate" style={{ display: 'none' }}><b /><span><i /></span></div>)}</div>
+    {/* números de dano flutuantes e barras de vida dos inimigos (posicionados pelo loop) */}
+    <div ref={mobBarsRef} className="mob-bars" aria-hidden="true">{Array.from({ length: 12 }, (_, i) => <div key={i} className="mob-bar" style={{ display: 'none' }}><i /></div>)}</div>
+    <div ref={floatersRef} className="floaters" aria-hidden="true">{Array.from({ length: 28 }, (_, i) => <div key={i} className="floater" style={{ display: 'none' }} />)}</div>
+    {playing && downed && <div className="downed" role="status"><strong>Você caiu</strong><span>Um aliado pode te reviver com <kbd>G</kbd> · renascendo no marco em <b ref={downedRef}>20</b> s</span><button type="button" className="mp-btn" onClick={() => respawnRef.current()}>Renascer agora (Enter)</button></div>}
     <input ref={importInputRef} type="file" accept=".json,application/json" hidden onChange={e => { void onImportFile(e.target.files?.[0]); e.target.value = ''; }} />
     <div ref={captionRef} className="spell-caption" aria-hidden="true"><small>INVOCAÇÃO DAS CHAMAS INFERNAIS</small><strong>Vollzanbel</strong></div>
 
@@ -1606,7 +1797,7 @@ export default function Game() {
               ? <button key={a.spell} type="button" className="touch-action" onPointerDown={() => shieldRef.current.start()} onPointerUp={() => shieldRef.current.release()} onPointerCancel={() => shieldRef.current.release()} onPointerLeave={() => shieldRef.current.release()}>{a.label}</button>
               : <button key={a.spell} type="button" className={`touch-action ${i === 0 ? 'touch-signature' : ''}`} onClick={() => castAbilityRef.current(a.spell)}>{a.label}</button>)}
           <button type="button" className="touch-action" onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); touchJumpRef.current = true; }} onPointerUp={() => { touchJumpRef.current = false; }} onPointerCancel={() => { touchJumpRef.current = false; }}>Pular</button>
-          <button type="button" className="touch-action touch-sprint" onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); touchSprintRef.current = true; }} onPointerUp={() => { touchSprintRef.current = false; }} onPointerCancel={() => { touchSprintRef.current = false; }}>Correr</button>
+          <button type="button" className={`touch-action touch-sprint ${sprintOn ? 'is-on' : ''}`} aria-pressed={sprintOn} onClick={() => toggleSprint(false)}>{sprintOn ? 'Correndo' : 'Correr'}</button>
           <button type="button" className="touch-action" onClick={() => setPaused(true)}>Menu</button>
         </div>
       </div>
@@ -1630,11 +1821,13 @@ export default function Game() {
         </div>
         <div className="status-line">
           {progressionHud.skillPoints > 0 && <button type="button" className="pill pill-gold" onClick={toggleSkills}>✦ {progressionHud.skillPoints} {progressionHud.skillPoints === 1 ? 'ponto' : 'pontos'} de habilidade</button>}
+          {sprintOn && <span className="pill">» Correndo</span>}
           <HudPills store={hudStore} />
         </div>
       </div>
       <div className="bottom-center">
-        {nearNpc && !npcDialog ? <div className="interaction"><span className="keycap">G</span><span>Falar com Aldren{wolfQuest.stage === 'ready' ? ' · entregar missão' : ''}</span></div>
+        {nearDowned ? <div className="interaction"><span className="keycap">G</span><span>Reviver {nearDowned.name}</span></div>
+          : nearNpc && !npcDialog ? <div className="interaction"><span className="keycap">G</span><span>Falar com Aldren{wolfQuest.stage === 'ready' ? ' · entregar missão' : ''}</span></div>
           : nearLandmark && <div className="interaction"><span className="keycap">G</span><span>Ouvir o Eco do marco</span></div>}
         <div className="hotbar">
           {classDef.abilities.map((a, i) => <SpellSlot key={a.spell} store={hudStore} spell={a.spell} hotkey={a.key} label={a.label} resource={classDef.resource} signature={i === 0} cast={castAbilityRef} lockedBy={isUnlocked(heroChoice.cls, progressionHud.ranks, a.spell) ? null : unlockNode(heroChoice.cls, a.spell)?.name} />)}

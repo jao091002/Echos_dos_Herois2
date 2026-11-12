@@ -108,10 +108,10 @@ export class PlayerMotor {
     this.verticalSpeed -= (this.verticalSpeed > 0 ? 22 : 31) * dt;
     this.verticalSpeed = Math.max(this.verticalSpeed, -38);
 
-    // aceleração: rápida no chão, inversão de direção ainda mais rápida, controle reduzido no ar
+    // aceleração: rápida no chão, inversão de direção ainda mais rápida (troca de lado em combate), controle no ar
     const tx = this.direction.x * speed, tz = this.direction.z * speed;
     const reversing = moving && this.velocity.x * tx + this.velocity.z * tz < 0;
-    const acceleration = !this.grounded ? 5.5 : reversing ? 26 : moving ? 16 : 20;
+    const acceleration = !this.grounded ? 8 : reversing ? 34 : moving ? 22 : 24;
     this.velocity.x = THREE.MathUtils.damp(this.velocity.x, tx, acceleration, dt);
     this.velocity.z = THREE.MathUtils.damp(this.velocity.z, tz, acceleration, dt);
 
@@ -190,7 +190,7 @@ export class ThirdPersonCamera {
 
   minPitch = -.42;
   maxPitch = .72;
-  followSharpness = 12;
+  followSharpness = 15;
   collisionReleaseSharpness = 7;
   collisionApproachSharpness = 18;
   minimumCollisionDistance = 3.8;
@@ -237,6 +237,13 @@ export class ThirdPersonCamera {
   }
 
   setShiftLock(enabled: boolean) { this.shiftLocked = enabled; }
+
+  /** Gira a câmera suavemente para olhar na direção (x, z) a partir do herói (alvo travado). */
+  turnToward(dx: number, dz: number, delta: number, sharpness = 7) {
+    if (Math.hypot(dx, dz) < .01) return;
+    const want = Math.atan2(-dx, -dz), diff = THREE.MathUtils.euclideanModulo(want - this.yaw + Math.PI, Math.PI * 2) - Math.PI;
+    this.yaw = THREE.MathUtils.euclideanModulo(this.yaw + diff * (1 - Math.exp(-delta * sharpness)) + Math.PI, Math.PI * 2) - Math.PI;
+  }
 
   rotate(dx: number, dy: number) {
     this.yaw -= dx * this.sensitivity;

@@ -15,7 +15,9 @@ export type RigJoints = {
   hipL: THREE.Object3D; kneeL: THREE.Object3D; ankleL: THREE.Object3D;
   hipR: THREE.Object3D; kneeR: THREE.Object3D; ankleR: THREE.Object3D;
 };
-export type Retarget = { update: () => void; holder: THREE.Object3D };
+/** Clipe por cima da pose procedural (ex.: corrida do Mixamo): tempo no clipe e peso 0..1. */
+export type ClipBlend = { clip: THREE.AnimationClip; time: number; weight: number };
+export type Retarget = { update: (blend?: ClipBlend) => void; holder: THREE.Object3D };
 
 const BIPED: Record<string, string> = {
   pelvis: 'Hips', spine: 'Spine', spine1: 'Spine1', spine2: 'Spine2', neck: 'Neck', head: 'Head',
@@ -133,10 +135,25 @@ export function retargetModel(frame: THREE.Object3D, model: THREE.Object3D, join
   const hipsAt = local('Hips');
   all.forEach((j, i) => j.rotation.copy(saved[i]));
 
+  // clipes já convertidos para este esqueleto (anim-library.ts): faixa → osso + interpolador, montados uma vez por clipe
+  const clipBones = new Map<THREE.AnimationClip, { bone: THREE.Object3D; interp: THREE.Interpolant }[]>();
+  const cq = new THREE.Quaternion();
+  const blendClip = (b: ClipBlend) => {
+    let list = clipBones.get(b.clip);
+    if (!list) {
+      list = [];
+      for (const t of b.clip.tracks) { const bone = model.getObjectByName(t.name.slice(0, t.name.lastIndexOf('.'))); if (bone) list.push({ bone, interp: new THREE.QuaternionLinearInterpolant(t.times, t.values, 4, new Float32Array(4)) }); }
+      clipBones.set(b.clip, list);
+    }
+    const time = THREE.MathUtils.euclideanModulo(b.time, b.clip.duration);
+    for (const e of list) { const v = e.interp.evaluate(time); cq.set(v[0], v[1], v[2], v[3]); e.bone.quaternion.slerp(cq, b.weight); }
+  };
+
   return {
     holder,
-    update() {
+    update(blend) {
       pose();
+      if (blend && blend.weight > 0.01) blendClip(blend);
       // o quadril do modelo acompanha a pelve do rig (balanço, queda ao morrer, recuo nos golpes)
       holder.position.set(joints.pelvis.position.x - hipsAt.x, joints.pelvis.position.y - hipsAt.y, joints.pelvis.position.z - hipsAt.z);
     },

@@ -15,6 +15,8 @@ import { terrainHeight } from './world';
 /** Estado que cada jogador envia ~15 vezes por segundo. */
 export type RemoteState = {
   x: number; y: number; z: number; yaw: number;
+  /** Velocidade (m/s) no chão: quem recebe projeta a posição até a próxima atualização. */
+  vx?: number; vz?: number;
   pose: HeroPose; lp: HeroPose; spd: number;
   ov: [string, number] | null; ck: string | null;
   hp: number; mhp: number; cls: HeroClass; look: Appearance; name: string;
@@ -39,6 +41,9 @@ export class RemotePlayers {
   attachBodies(gltf: { scene: THREE.Object3D; animations: THREE.AnimationClip[] }) {
     for (const s of this.slots) s.hero.attachBody({ scene: cloneSkinned(gltf.scene), animations: gltf.animations }, { plain: true });
   }
+
+  /** Animações da pasta public/animations (já convertidas para o Xbot): iguais às do herói local. */
+  addClips(clips: Parameters<HeroRig['addClips']>[0]) { for (const s of this.slots) s.hero.addClips(clips); }
 
   /** Atualiza (ou ocupa um avatar livre para) o jogador id. Retorna false se não há avatar livre. */
   setState(id: string, st: RemoteState, now: number) {
@@ -67,9 +72,11 @@ export class RemotePlayers {
       if (!s.id || !s.st) continue;
       if (now - s.seen > 15000) { this.remove(s.id); continue; }
       const st = s.st, root = s.hero.root;
-      this.target.set(st.x, st.y, st.z);
+      // previsão pela velocidade (no máx. 0,25 s à frente): o avatar aparece onde o jogador está agora, não onde estava
+      const ahead = Math.min(.25, (now - s.seen) / 1000);
+      this.target.set(st.x + (st.vx ?? 0) * ahead, st.y, st.z + (st.vz ?? 0) * ahead);
       if (root.position.distanceTo(this.target) > 8) root.position.copy(this.target); // teleporte (Passo Arcano, renascer)
-      else root.position.lerp(this.target, 1 - Math.exp(-dt * 12));
+      else root.position.lerp(this.target, 1 - Math.exp(-dt * 18));
       root.position.y = Math.max(root.position.y, terrainHeight(root.position.x, root.position.z) - .05);
       root.userData.facing = st.yaw; root.userData.castKind = st.ck ?? undefined; root.userData.locoPose = st.lp;
       const ov = st.ov ? { mode: st.ov[0] as 'charge' | 'beam' | 'shield' | 'grab', power: st.ov[1] } : undefined;
