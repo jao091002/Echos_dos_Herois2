@@ -1,5 +1,6 @@
 import type { HeroChoice } from './classes';
 import type { InventorySnapshot } from './progression';
+import type { StorySave } from './story';
 
 /* ============================================================================
  *  SAVE LOCAL — o progresso fica só na máquina do jogador
@@ -17,6 +18,8 @@ export type SaveData = {
   quest: { stage: string; kills: number; reward: number };
   markerRemembered: boolean;
   position: { x: number; y: number; z: number; yaw: number };
+  /** Modo história: missões concluídas e progresso das ativas (saves antigos não têm). */
+  story?: StorySave;
 };
 
 const KEY = 'ecos.save.v1';
@@ -63,5 +66,6 @@ function validate(v: unknown): SaveData | null {
     quest: { stage: String(d.quest?.stage ?? 'available'), kills: num(d.quest?.kills, 0), reward: num(d.quest?.reward, 0) },
     markerRemembered: !!d.markerRemembered,
     position: { x: num(d.position?.x, 0), y: num(d.position?.y, 0), z: num(d.position?.z, 2), yaw: num(d.position?.yaw, Math.PI) },
+    story: Array.isArray(d.story?.done) ? { done: d.story.done.filter(s => typeof s === 'string'), prog: typeof d.story.prog === 'object' && d.story.prog ? d.story.prog : {}, stats: typeof d.story.stats === 'object' && d.story.stats ? d.story.stats : {}, acc: Array.isArray(d.story.acc) ? d.story.acc.filter(s => typeof s === 'string') : [] } : undefined,
   };
 }

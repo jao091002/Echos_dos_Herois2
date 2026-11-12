@@ -3,6 +3,7 @@ import { terrainHeight } from './world';
 import type { SfxName } from './audio';
 import type { CombatSystem } from './combat';
 import type { PlayerProgression } from './progression';
+import { createChurch, type Church } from './sanctuary-church';
 
 export type SpellId = 'zoltraak' | 'vollzanbel' | 'judradjim' | 'shield' | 'flight'
   // guerreiro
@@ -552,6 +553,7 @@ export class MagicSystem {
     this.tex = { rune: sigilTexture('rune', 11), sun: sigilTexture('sun', 23), arc: sigilTexture('arc', 37), wind: sigilTexture('wind', 51), glow: glowTexture() };
     this.healTex = healSigilTexture();
     this.root.name = 'spell-effects'; scene.add(this.root); this.root.add(this.fx.points, this.soft.points);
+    this.church = createChurch(this.root);
     for (let i = 0; i < LIGHT_SLOTS; i++) {
       const light = new THREE.PointLight('#ffffff', 0, 10, 2); this.root.add(light);
       this.lights.push({ light, age: 0, life: 1, peak: 0, active: false, held: false });
@@ -685,12 +687,14 @@ export class MagicSystem {
       this.muzzleFx('zoltraak', far, FWD); this.muzzleFx('vollzanbel', far, FWD);
       this.spawnProjectile('zoltraak', far, FWD, far2); this.spawnProjectile('vollzanbel', far, FWD, far2);
       this.lightningFx(far, far2, 1); this.vollzanbelFx(far2.clone(), 1);
+      this.santuarioFx(); // Catedral de Luz: compila os materiais dela já na pose erguida
       renderer.compile(this.scene, camera);
       for (let i = 1; i <= 50; i++) { renderer.compile(this.root, camera, this.scene); this.update(.05, i * .05); }
     } finally {
       this.scene.remove(holder); mats.forEach(retire);
       this.projectiles.forEach(p => { p.object.removeFromParent(); disposeTree(p.object); this.releaseLight(p.light); }); this.projectiles = [];
       this.effects.forEach(e => { e.object.removeFromParent(); disposeTree(e.object); }); this.effects = [];
+      this.santuario = null; this.church.hide();
       this.lights.forEach(sl => this.releaseLight(sl));
       this.fx.clear(); this.soft.clear(); this.shake = 0;
       this.mana = manaBefore; Object.assign(this.cooldowns, cds);
@@ -781,6 +785,7 @@ export class MagicSystem {
     if (this.curaZoneT > 0) { this.curaZoneT = Math.max(0, this.curaZoneT - delta); this.healSelf(5 * delta); }
     if (this.bencaoT > 0) { this.bencaoT = Math.max(0, this.bencaoT - delta); this.healSelf(3 * delta); }
     this.updateSantuario(delta); this.updateDespertarAura();
+    if (this.church.active) { this.churchClock.t += delta; this.church.update(this.churchClock.t, this.churchClock.life, elapsed); }
     const dt = Math.min(delta, .05);
     this.updateShield(delta, elapsed);
     this.updateAura(delta, elapsed);
@@ -1164,7 +1169,20 @@ export class MagicSystem {
    * Efeito visual de uma habilidade lançada por outro jogador (sem dano: o dano já foi resolvido na máquina dele
    * e no host). Projéteis viram um rastro de luz até o alvo; habilidades em si mesmo, um selo e um clarão.
    */
+  /** Início (ms) dos Vollzanbel de outros jogadores em curso (limite de efeitos remotos pesados). */
+  private remoteVoll: number[] = [];
   remoteFx(spell: SpellId, origin: Vec3, dir: Vec3, target: Vec3) {
+    // Santuário de outro clérigo: a Catedral aparece (só visual), se a minha não estiver em uso
+    if (spell === 'santuario' && !this.santuario) { this.church.show(this.groundAt(origin), 6.5); this.churchClock.t = 0; this.churchClock.life = 8; return; }
+    // Vollzanbel: o efeito real (só visual) forma-se no cajado do outro jogador e voa até o alvo — legível no PvP.
+    // No máx. 2 simultâneos de outros jogadores (orçamento de efeitos); acima disso cai no rastro genérico abaixo.
+    const now = performance.now();
+    this.remoteVoll = this.remoteVoll.filter(t => now - t < 3700);
+    if (spell === 'vollzanbel' && this.remoteVoll.length < 2) {
+      this.remoteVoll.push(now);
+      this.vollzanbelFx(target, 1, origin.clone());
+      return;
+    }
     const color: THREE.Color =
       spell === 'vollzanbel' || spell === 'brado' || spell === 'fenda' ? C.fire
         : spell === 'judradjim' ? C.bolt
@@ -1291,15 +1309,22 @@ export class MagicSystem {
   }
   /** Santuário (clérigo): domo sagrado no chão — dentro dele: −35% de dano recebido e cura contínua. */
   private santuario: { center: THREE.Vector3; R: number; t: number; life: number; tick: number; dome: THREE.Mesh; mat: THREE.ShaderMaterial } | null = null;
+  /** Catedral de Luz (visual do Santuário): construída uma vez, reaproveitada a cada lançamento. */
+  private church!: Church;
+  private readonly churchClock = { t: 0, life: 8 };
+  /** Centro e raio do Santuário em curso (câmera da cutscene). */
+  get santuarioInfo() { const s = this.santuario; return s ? { center: s.center, R: s.R } : null; }
   get insideSantuario() { const s = this.santuario; if (!s) return false; const p = this.player.position; return Math.hypot(p.x - s.center.x, p.z - s.center.z) < s.R; }
   private santuarioFx() {
     if (this.santuario) this.santuario.t = this.santuario.life; // um novo substitui o anterior
-    const center = this.groundAt(this.player.position), R = 4.6 * this.progression.sizeMultiplier(), life = this.buffSecs(7);
+    // maior que antes (4,6 m) e com a Catedral de Luz erguendo-se em volta (ver sanctuary-church.ts)
+    const center = this.groundAt(this.player.position), R = 6.5 * this.progression.sizeMultiplier(), life = this.buffSecs(8);
+    this.church.show(center, R); this.churchClock.t = 0; this.churchClock.life = life;
     this.sigil(center, UP, 'sun', C.gold, R, life, { spin: .35, grow: 0, hold: .9 });
     this.sigil(center, UP, 'rune', C.mana, R * .6, life, { spin: -.6, grow: 0, hold: .9 });
     const mat = this.fresnelMaterial(C.paleGold, 2.2, .9, .5), dome = new THREE.Mesh(this.geo.sphere, mat);
     dome.position.copy(center); dome.scale.set(R, R * .7, R);
-    this.addEffect(dome, life, u => { mat.uniforms.uAlpha.value = Math.min(1, u * life / .3) * (u > .9 ? (1 - u) / .1 : 1) * .45; });
+    this.addEffect(dome, life, u => { mat.uniforms.uAlpha.value = Math.min(1, u * life / .3) * (u > .9 ? (1 - u) / .1 : 1) * .12; }); // domo discreto: a catedral é o destaque
     this.santuario = { center, R, t: 0, life, tick: 0, dome, mat };
     this.shock(center, UP, C.paleGold, R * 1.2, .5); this.flashLight(center.clone().setY(center.y + 1.5), C.gold, 6, .6, 10);
     this.burst(center, 40, 3, C.paleGold, C.mana, { up: 1.4, spread: 1.2, size: .22, life: 1.4, grav: -1.5 });
@@ -1646,7 +1671,8 @@ export class MagicSystem {
       if (obstacle) pos.copy(obstacle.point);
       const ground = pos.y < terrainHeight(pos.x, pos.z) + .15;
       const targetHit = pos.distanceTo(p.target) < Math.max(.35, p.speed * delta);
-      const enemyHit = this.combat.targets.some(target => { if (!target.visible) return false; target.updateMatrixWorld(); return this.box.setFromObject(target).expandByScalar(.42).containsPoint(pos); });
+      const enemyHit = this.combat.targets.some(target => { if (!target.visible) return false; target.updateMatrixWorld(); return this.box.setFromObject(target).expandByScalar(.42).containsPoint(pos); })
+        || this.combat.hitsPlayer(pos, .42); // PvP: jogadores hostis também param o projétil
       this.animateProjectile(p, prev, delta, elapsed);
       if (obstacle || enemyHit || targetHit || ground || p.age > (p.kind === 'vollzanbel' ? 2.5 : 1.35)) {
         const n = this.tN.set(0, 1, 0);
@@ -1940,7 +1966,8 @@ export class MagicSystem {
    *  Impacto: expansão violenta — clarão branco no centro, bola de fogo dourada/laranja, onda de choque
    *    rasante, fragmentos incandescentes em todas as direções, fumaça; a luz se apaga aos poucos.
    */
-  private vollzanbelFx(target: Vec3, size: number) {
+  /** remoteFrom: Vollzanbel de outro jogador (forma-se nesse ponto e não causa dano aqui). */
+  private vollzanbelFx(target: Vec3, size: number, remoteFrom?: Vec3) {
     const FORM = 1.2, TRAVEL = .3, LIFE = FORM + TRAVEL + 2.2, R = 4.8 * size;
     const to = target.clone(); to.y = Math.max(to.y, terrainHeight(to.x, to.z) + .6);
     const root = new THREE.Group(), mass = new THREE.Group(); root.add(mass);
@@ -1957,7 +1984,7 @@ export class MagicSystem {
 
     this.addEffect(root, LIFE, (t, dt) => {
       const time = t * LIFE;
-      const tip = this.staffTip ? this.staffTip.getWorldPosition(this.tC) : this.tC.copy(this.player.position).setY(this.player.position.y + 2);
+      const tip = remoteFrom ? this.tC.copy(remoteFrom) : this.staffTip ? this.staffTip.getWorldPosition(this.tC) : this.tC.copy(this.player.position).setY(this.player.position.y + 2);
       dir.copy(to).sub(tip).normalize();
       if (!started) { started = true; this.onSfx('fireCharge'); light = this.flashLight(tip, C.fireHot, 2, LIFE, R * 4, true); }
 
@@ -1998,7 +2025,7 @@ export class MagicSystem {
       if (!exploded) {
         exploded = true; mass.visible = false; this.onSfx('fireBoom');
         const ground = this.tA.copy(to).setY(terrainHeight(to.x, to.z) + .05);
-        { const crit = this.progression.rollCrit(), dmg = 110 * this.progression.damageMultiplier() * crit, n = this.combat.damageAt(to, R * 1.2, dmg); if (n > 0) { this.onConfirmedHit(); this.drain(dmg * n); if (crit > 1) this.critFx(to); } }
+        if (!remoteFrom) { const crit = this.progression.rollCrit(), dmg = 110 * this.progression.damageMultiplier() * crit, n = this.combat.damageAt(to, R * 1.2, dmg); if (n > 0) { this.onConfirmedHit(); this.drain(dmg * n); if (crit > 1) this.critFx(to); } }
         this.fireExplosion(to.clone(), UP.clone(), R);
         // centro branco ofuscante que se expande e some
         const flashMat = this.pBasic('b1377', { color: new THREE.Color(5, 4.6, 3.8), transparent: true, depthWrite: false, toneMapped: false });

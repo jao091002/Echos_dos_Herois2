@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 See [AGENTS.md](AGENTS.md): this Next.js version has breaking changes compared with older releases. Read the relevant guide in `node_modules/next/dist/docs/` before touching Next-specific code (routing, metadata, config).
 
+The Three.js skills in `.claude/skills/` (from CloudAI-X/threejs-skills, MIT) target three r186. This project uses three **0.177**: ignore their WebGPU/TSL sections and check any API newer than r177 against `node_modules/three` before using it.
+
 ## Commands
 
 - `npm run dev`: dev server
@@ -36,6 +38,9 @@ The game loop and React are bridged by refs, not by state:
 - `combat.ts`: `CombatSystem` handles mobs (wolf, bandit, demon), AI, player health and loot drops. It reports XP and loot through callbacks passed in from `Game.tsx`.
 - `magic.ts`: `MagicSystem` handles the spells (`zoltraak` charge beam, `vollzanbel`, `judradjim`, `shield`, `flight`), mana and cooldowns. It hits mobs through `CombatSystem` and scales its effects with `PlayerProgression`.
 - `progression.ts`: XP and levels, the inventory, and the skill tree data (`SKILL_NODES` and branches) that drives stats.
+- `pvp.ts`: PvP com flag global (K). Regra `canHarm`, cápsula de acerto dos jogadores, `pvpDamage` (teto suave) e `PvpGuard` (a vítima valida e aplica o golpe `phit`).
+- `story.ts`: modo história (capítulos; missão concluída dá a recompensa na hora e some), 3 diárias por data e conquistas. Salvo em `SaveData.story`.
+- `sanctuary-church.ts`: Catedral de Luz do Santuário do clérigo, construída uma vez e estacionada em y=-500, com cutscene via `startCinematic(..., church)`.
 - `audio.ts`: `AmbientAudio`, procedural Web Audio ambience and `sfx(name)`.
 - `rig-retarget.ts`: retargets Mixamo or Biped skeletons onto the procedural joint rigs. It also adds a loader plugin for legacy spec-gloss glTF materials (Sketchfab exports).
 

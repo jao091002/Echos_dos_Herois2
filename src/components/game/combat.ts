@@ -7,6 +7,7 @@ import { adoptFragments, bindSkin, computeSkin, placeAt, segDist, tearSeams, tex
 import { terrainHeight, type WorldCollider } from './world';
 import type { SfxName } from './audio';
 import type { LootItemId } from './progression';
+import { capsuleDistance, segmentCapsuleDistance, pvpDamage } from './pvp';
 
 export type MobKind = 'wolf' | 'bandit' | 'demon';
 type V3 = [number, number, number];
@@ -213,7 +214,9 @@ type Drop = { root: THREE.Group; kind: 'experience' | LootItemId; age: number; v
  * na cena, apenas apagada enquanto estão escondidos.
  */
 const DROP_LIGHTS = 3;
-type FillLight = { light: THREE.PointLight; mob: THREE.Object3D; base: number; offset: THREE.Vector3 };
+type FillLight = { mob: THREE.Object3D; color: THREE.Color; base: number; distance: number; offset: THREE.Vector3 };
+/** Luzes de preenchimento dos inimigos: pool fixo para os mais próximos do jogador (antes era 1 PointLight por inimigo). */
+const MOB_FILL_LIGHTS = 2;
 type Spawn = { kind: MobKind; x: number; z: number };
 
 const SPAWNS: Spawn[] = [
@@ -426,6 +429,8 @@ export class CombatSystem {
   private lightRoot = new THREE.Group();
   private fills: FillLight[] = [];
   private dropLights: THREE.PointLight[] = [];
+  private fillLights: THREE.PointLight[] = [];
+  private fillOrder: FillLight[] = [];
   private dropOrder: Drop[] = [];
   private geometries: THREE.BufferGeometry[] = [];
   private materials: THREE.Material[] = [];
@@ -469,6 +474,7 @@ export class CombatSystem {
     this.dropRoot.name = 'mob-drops'; scene.add(this.dropRoot);
     this.lightRoot.name = 'mob-lights'; scene.add(this.lightRoot);
     for (let i = 0; i < DROP_LIGHTS; i++) { const l = new THREE.PointLight('#ffffff', 0, 3); this.lightRoot.add(l); this.dropLights.push(l); }
+    for (let i = 0; i < MOB_FILL_LIGHTS; i++) { const l = new THREE.PointLight('#ffffff', 0, 3.2, 2); this.lightRoot.add(l); this.fillLights.push(l); }
     this.fxRoot.name = 'mob-fx'; scene.add(this.fxRoot);
     this.sphere = this.geometry(new THREE.SphereGeometry(1, 18, 12));
     this.unitCapsule = this.geometry(new THREE.CapsuleGeometry(.5, 1, 6, 12)); // radius .5, total height 2
@@ -553,7 +559,8 @@ export class CombatSystem {
     // tamanho final e pés no chão, antes de reduzir (a célula é relativa à altura)
     baked.rotateY(CombatSystem.DEMON_YAW); baked.scale(k, k, k); baked.computeBoundingBox();
     const bb = baked.boundingBox!; baked.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2);
-    const geo = CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.0045, 1 / 900);
+    // célula de ~3,7 cm: o modelo original tem ~1 milhão de triângulos (antes 1 cm mal reduzia: 1,08 mi por demônio)
+    const geo = CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.016, 1 / 160);
     baked.dispose();
     // o eixo do corpo (pernas, tronco) fica na origem; a caixa envolvente estava deslocada pela cauda do vestido
     geo.translate(0, 0, DEMON_DZ);
@@ -817,8 +824,34 @@ export class CombatSystem {
       if (this.tmpA.distanceTo(point) > radius + stats.radius) continue;
       this.applyHit(mob, point, damage, 1); count++;
     }
+    for (const t of this.pvpTargets) {
+      if (capsuleDistance(t.pos, point) > radius) continue;
+      this.hitPlayer(t, point, damage, radius, 1); count++;
+    }
     return count;
   }
+
+  /* ==================================================================== PvP (ver pvp.ts)
+   * Os mesmos testes de dano (área, segmento, primeiro contato) também valem para os jogadores hostis.
+   * O dano NÃO é aplicado aqui: onPlayerHit manda o golpe para a vítima, que valida e aplica.
+   */
+  /** Jogadores que posso ferir agora (flag PvP dos dois lados, fora do grupo, vivos). O jogo atualiza a cada quadro. */
+  pvpTargets: { id: string; pos: THREE.Vector3 }[] = [];
+  /** Meu golpe acertou o jogador id: o jogo envia `phit` para ele. */
+  onPlayerHit: (id: string, damage: number, point: THREE.Vector3, radius: number, knock: number) => void = () => {};
+  private readonly pvpKeys = new Map<string, object>();
+  private readonly pvpTmp = new THREE.Vector3();
+  /** Objeto estável por jogador (para o conjunto `once` dos projéteis que atravessam). */
+  private pvpKey(id: string) { let k = this.pvpKeys.get(id); if (!k) this.pvpKeys.set(id, k = { id }); return k; }
+  private hitPlayer(t: { id: string; pos: THREE.Vector3 }, point: THREE.Vector3, damage: number, radius: number, knock: number) {
+    this.onPlayerHit(t.id, damage, point, radius, knock);
+    // retorno imediato na tela do atacante (o número é uma previsão: sem esquiva/escudo/resistência da vítima)
+    this.onDamageNumber(new THREE.Vector3(t.pos.x, t.pos.y + 2.2, t.pos.z), Math.round(pvpDamage(damage)), 'mine');
+    this.onSfx('hitEnemy', damage / 60);
+    this.tmpD.set(t.pos.x, t.pos.y + 1, t.pos.z); this.particles.emit(this.tmpD, '#ff8a6a', 6 + Math.min(8, Math.floor(damage / 6)), 3.2, 1.8, .4, 1);
+  }
+  /** Algum jogador hostil a até pad da cápsula do ponto? (colisão de projéteis) */
+  hitsPlayer(point: THREE.Vector3, pad: number) { return this.pvpTargets.some(t => capsuleDistance(t.pos, point) <= pad); }
 
   /**
    * Primeiro inimigo vivo tocado pelo segmento from → to (raio radius + corpo do inimigo). Não causa dano:
@@ -835,6 +868,11 @@ export class CombatSystem {
       if (contact.distanceTo(this.tmpA) > radius + stats.radius) continue;
       const d = contact.distanceToSquared(from);
       if (d < best) { best = d; out.copy(contact); }
+    }
+    for (const t of this.pvpTargets) {
+      if (segmentCapsuleDistance(t.pos, from, to, this.pvpTmp) > radius) continue;
+      const d = this.pvpTmp.distanceToSquared(from);
+      if (d < best) { best = d; out.copy(this.pvpTmp); }
     }
     return best < Infinity ? out : null;
   }
@@ -857,6 +895,14 @@ export class CombatSystem {
       once?.add(mob);
       onHit?.(contact);
       this.applyHit(mob, contact, damage, knock); count++;
+    }
+    for (const t of this.pvpTargets) {
+      const key = this.pvpKey(t.id); if (once?.has(key)) continue;
+      if (segmentCapsuleDistance(t.pos, from, to, this.pvpTmp) > radius) continue;
+      once?.add(key);
+      const contact = this.pvpTmp.clone();
+      onHit?.(contact);
+      this.hitPlayer(t, contact, damage, radius, knock); count++;
     }
     return count;
   }
@@ -902,6 +948,8 @@ export class CombatSystem {
     }
   }
 
+  /** Dano recebido vindo de (x, z): o jogo mostra o indicador de direção. */
+  onHurtFrom: (x: number, z: number) => void = () => {};
   /** Durante a cutscene do Agarrão a heroína não recebe golpes. */
   invulnerable = false;
 
@@ -1047,6 +1095,7 @@ export class CombatSystem {
     if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
+    this.onHurtFrom(fromX, fromZ);
     this.tmpA.set(player.x, player.y + 1, player.z); this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
 
@@ -1282,9 +1331,15 @@ export class CombatSystem {
     }
 
     // luzes de contagem fixa (ver DROP_LIGHTS)
-    for (const f of this.fills) {
-      const on = f.mob.visible; f.light.intensity = on ? f.base : 0;
-      if (on) f.mob.localToWorld(f.light.position.copy(f.offset));
+    // preenchimento: o pool fixo (MOB_FILL_LIGHTS) vai para os inimigos visíveis mais próximos
+    const fo = this.fillOrder; fo.length = 0;
+    for (const f of this.fills) if (f.mob.visible) fo.push(f);
+    if (fo.length > MOB_FILL_LIGHTS) fo.sort((a, b) => a.mob.position.distanceToSquared(player) - b.mob.position.distanceToSquared(player));
+    for (let i = 0; i < MOB_FILL_LIGHTS; i++) {
+      const l = this.fillLights[i], f = fo[i];
+      if (!f) { l.intensity = 0; continue; }
+      l.intensity = f.base; l.color.copy(f.color); l.distance = f.distance;
+      f.mob.localToWorld(l.position.copy(f.offset));
     }
     const order = this.dropOrder; order.length = 0; order.push(...this.drops);
     if (order.length > DROP_LIGHTS) order.sort((a, b) => a.root.position.distanceToSquared(player) - b.root.position.distanceToSquared(player));
@@ -1496,6 +1551,7 @@ export class CombatSystem {
     if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = stats.damage * def.damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
+    this.onHurtFrom(root.position.x, root.position.z);
     this.tmpA.set(player.x, player.y + 1, player.z);
     this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
@@ -1763,7 +1819,9 @@ export class CombatSystem {
     root.position.set(spawn.x, terrainHeight(spawn.x, spawn.z), spawn.z); this.root.add(root);
     const rig = spawn.kind === 'wolf' ? this.buildWolf(root) : this.buildHumanoid(root, spawn.kind);
     for (const light of root.children.filter(c => (c as THREE.PointLight).isPointLight) as THREE.PointLight[]) {
-      this.fills.push({ light, mob: root, base: light.intensity, offset: light.position.clone() }); this.lightRoot.add(light);
+      // só guarda a configuração: a luz real vem do pool fixo (fillLights)
+      this.fills.push({ mob: root, color: light.color.clone(), base: light.intensity, distance: light.distance, offset: light.position.clone() });
+      light.removeFromParent(); light.dispose();
     }
     this.targets.push(rig.target);
 

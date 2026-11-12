@@ -23,6 +23,16 @@ export class PlayerMotor {
   speedScale = 1;
   /** Multiplicador da velocidade vertical no voo (subir/descer). */
   verticalScale = 1;
+  /** Velocidade de queda (m/s, positiva) no último toque no chão; o jogo consome (dano de queda, câmera) e zera. */
+  landingSpeed = 0;
+  /** Inclinação do chão sob o herói (0 plano … 1 vertical), para animação/som. */
+  slope = 0;
+  private readonly slopeN = new THREE.Vector3();
+  /** Normal do terreno por diferenças finitas. */
+  private groundNormal(x: number, z: number, out: THREE.Vector3) {
+    const e = .6;
+    return out.set(terrainHeight(x - e, z) - terrainHeight(x + e, z), 2 * e, terrainHeight(x, z - e) - terrainHeight(x, z + e)).normalize();
+  }
   constructor(private root: THREE.Group, private colliders: WorldCollider[]) {}
 
   reset() {
@@ -111,9 +121,19 @@ export class PlayerMotor {
     // aceleração: rápida no chão, inversão de direção ainda mais rápida (troca de lado em combate), controle no ar
     const tx = this.direction.x * speed, tz = this.direction.z * speed;
     const reversing = moving && this.velocity.x * tx + this.velocity.z * tz < 0;
-    const acceleration = !this.grounded ? 8 : reversing ? 34 : moving ? 22 : 24;
-    this.velocity.x = THREE.MathUtils.damp(this.velocity.x, tx, acceleration, dt);
-    this.velocity.z = THREE.MathUtils.damp(this.velocity.z, tz, acceleration, dt);
+    // inércia: o corpo tem peso (arranca e freia em ~0,2 s, mais rápido ao inverter em combate)
+    const acceleration = !this.grounded ? 6 : reversing ? 26 : moving ? 15 : 17;
+    let ttx = tx, ttz = tz;
+    // encostas: subir é mais lento; rampas muito íngremes (>~40°) fazem escorregar
+    if (this.grounded) {
+      const n = this.groundNormal(this.root.position.x, this.root.position.z, this.slopeN);
+      this.slope = 1 - n.y;
+      const uphill = -(n.x * ttx + n.z * ttz) / Math.max(speed, 1e-3); // >0 = andando morro acima
+      if (uphill > 0) { const k = 1 - Math.min(.45, uphill * this.slope * 2.2); ttx *= k; ttz *= k; }
+      if (n.y < .76) { const slide = (0.76 - n.y) * 40; ttx += n.x * slide; ttz += n.z * slide; }
+    } else this.slope = 0;
+    this.velocity.x = THREE.MathUtils.damp(this.velocity.x, ttx, acceleration, dt);
+    this.velocity.z = THREE.MathUtils.damp(this.velocity.z, ttz, acceleration, dt);
 
     if (this.dodgeTimer > 0) {
       this.dodgeTimer = Math.max(0, this.dodgeTimer - dt);
@@ -150,6 +170,7 @@ export class PlayerMotor {
     const ground = terrainHeight(this.root.position.x, this.root.position.z);
     if (this.root.position.y <= ground) {
       this.root.position.y = ground;
+      if (!this.grounded && this.verticalSpeed < -4) this.landingSpeed = -this.verticalSpeed;
       this.verticalSpeed = 0;
       this.grounded = true;
     } else this.grounded = false;
@@ -208,6 +229,24 @@ export class ThirdPersonCamera {
   private aimBlend = 0;
   private smoothY = NaN;
   private shakeTime = 0;
+  /* ---- realismo: o jogo informa a velocidade (0..1 da corrida, voo) e impactos */
+  /** Velocidade normalizada do herói (0 parado, 1 corrida); o jogo atualiza a cada quadro. */
+  speed01 = 0;
+  /** Voando (FOV mais aberto). */
+  flying = false;
+  /** Câmera cinemática (cutscene): quando não nula, substitui a câmera de terceira pessoa com transição suave. */
+  cinematic: { pos: THREE.Vector3; look: THREE.Vector3 } | null = null;
+  private cineBlend = 0;
+  private readonly cinePos = new THREE.Vector3();
+  private readonly cineLook = new THREE.Vector3();
+  private bobPhase = 0;
+  private roll = 0;
+  private lastYaw = 0;
+  /** Afundamento de aterrissagem (mola amortecida). */
+  private dip = 0;
+  private dipVel = 0;
+  /** Impacto de aterrissagem/queda: força 0..1 (afunda a câmera e treme). */
+  impact(strength: number) { this.dipVel -= 2.6 * Math.min(1, strength); this.shake = Math.max(this.shake, .5 * strength); }
   private readonly tmpV = new THREE.Vector3();
   private readonly tmpDir = new THREE.Vector3();
   private readonly losRay = new THREE.Raycaster();
@@ -293,6 +332,12 @@ export class ThirdPersonCamera {
     this.currentDistance = THREE.MathUtils.damp(this.currentDistance, this.collisionDistance, this.collisionApproachSharpness, delta);
 
     this.desired.copy(this.offset).setLength(this.currentDistance).add(this.target);
+    // balanço de passada (sutil, só no chão) e afundamento de aterrissagem com mola amortecida
+    const sp = this.flying ? 0 : this.speed01;
+    this.bobPhase += delta * (6 + 5 * sp) * (sp > .05 ? 1 : 0);
+    const bob = Math.sin(this.bobPhase * 2) * .045 * sp * (1 - aim);
+    this.dipVel += (-this.dip * 90 - this.dipVel * 14) * delta; this.dip += this.dipVel * delta;
+    this.desired.y += bob + this.dip * .35;
     this.desired.y = Math.max(this.desired.y, terrainHeight(this.desired.x, this.desired.z) + this.minimumCameraHeight);
     this.camera.position.lerp(this.desired, 1 - Math.exp(-delta * this.followSharpness));
 
@@ -309,11 +354,25 @@ export class ThirdPersonCamera {
       this.look.addScaledVector(this.right, -this.lockedScreenX * halfW * blend);
       this.look.addScaledVector(this.up, -this.lockedScreenY * halfH * blend);
     }
+    this.look.y += this.dip * .2;
+    // cutscene: mistura suave entre a câmera de jogo e o plano cinemático
+    this.cineBlend = THREE.MathUtils.damp(this.cineBlend, this.cinematic ? 1 : 0, 3.2, delta);
+    if (this.cinematic) { this.cinePos.copy(this.cinematic.pos); this.cineLook.copy(this.cinematic.look); }
+    if (this.cineBlend > .001) {
+      const k = this.cineBlend * this.cineBlend * (3 - 2 * this.cineBlend);
+      this.camera.position.lerp(this.cinePos, k); this.look.lerp(this.cineLook, k);
+    }
     this.camera.lookAt(this.look);
+    // inclinação (roll) leve ao girar a câmera em velocidade
+    let dyaw = this.yaw - this.lastYaw; this.lastYaw = this.yaw;
+    dyaw = THREE.MathUtils.euclideanModulo(dyaw + Math.PI, Math.PI * 2) - Math.PI;
+    const rollTarget = THREE.MathUtils.clamp(-dyaw / Math.max(delta, 1e-3) * .012 * (.3 + sp), -.05, .05) * (1 - this.cineBlend);
+    this.roll = THREE.MathUtils.damp(this.roll, rollTarget, 6, delta);
+    if (Math.abs(this.roll) > 1e-4) this.camera.rotateZ(this.roll);
 
-    // FOV fecha ao mirar; tremor curto e amortecido
-    const fov = this.baseFov - 7 * aim;
-    if (Math.abs(this.camera.fov - fov) > .01) { this.camera.fov = fov; this.camera.updateProjectionMatrix(); }
+    // FOV: fecha ao mirar, abre com a velocidade (corrida/voo); tremor curto e amortecido
+    const fov = this.baseFov - 7 * aim + (this.flying ? 9 : 5) * sp * (1 - aim);
+    if (Math.abs(this.camera.fov - fov) > .01) { this.camera.fov = THREE.MathUtils.damp(this.camera.fov, fov, 7, delta); this.camera.updateProjectionMatrix(); }
     if (this.shake > .001) {
       this.shakeTime += delta;
       const a = this.shake * this.shake * .05, t = this.shakeTime * 38;

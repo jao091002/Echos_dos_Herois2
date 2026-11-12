@@ -280,6 +280,8 @@
   animation: toast-in .4s var(--ease)
 }
 .toast span { margin-right: 10px; font-size: 15px; color: var(--gold) }
+/* toast fora do HUD (tela inicial): acima do menu */
+.toast.title-toast { z-index: 9; pointer-events: none }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, -8px) } to { opacity: 1; transform: translateX(-50%) } }
 
 .area-banner { position: absolute; left: 50%; top: 26%; transform: translateX(-50%); display: grid; justify-items: center; gap: 8px; text-align: center; animation: banner 4.6s var(--ease) both }
@@ -674,3 +676,38 @@
 .lock-marker span { margin-top: 12px; padding: 1px 8px; font: 600 11px var(--sans); letter-spacing: .08em; color: #ffd2c6; background: rgba(20, 8, 6, .7); white-space: nowrap }
 .lock-marker.is-player i { border-color: #ffb347; box-shadow: 0 0 10px rgba(255, 180, 70, .6) }
 @keyframes lock-pulse { 0%, 100% { transform: rotate(45deg) scale(1) } 50% { transform: rotate(45deg) scale(.86) } }
+
+/* PvP (flag global): selo no HUD e nomes de jogadores hostis */
+.pvp-badge { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 4; display: flex; gap: 8px; align-items: center; padding: 5px 12px; font: 600 11px var(--sans); letter-spacing: .14em; text-transform: uppercase; color: #ffd9cf; background: rgba(60, 14, 10, .72); border: 1px solid rgba(255, 110, 80, .55); pointer-events: none }
+.pvp-badge small { font-size: 9px; opacity: .7; border: 1px solid currentColor; padding: 0 4px }
+.pvp-badge.arming, .pvp-badge.disarming { color: #f3e1b8; border-color: rgba(240, 200, 120, .5); background: rgba(40, 30, 12, .72) }
+.nameplate.pvp b::before { content: '⚔ '; color: #ff8a6a }
+.nameplate.hostile b { color: #ff7d66 }
+.nameplate.hostile span i { background: #ff4a3a }
+
+/* modo história: rastreador de missões (direita) e seção do diário */
+.story-tracker { position: absolute; right: clamp(16px, 2.4vw, 34px); top: 232px; width: min(250px, calc(100vw - 32px)); display: grid; gap: 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(6px); pointer-events: none }
+.story-head { display: flex; justify-content: space-between; font: 600 9px var(--sans); letter-spacing: .24em; color: var(--gold) }
+.story-head small { color: #cfc6a8; letter-spacing: .08em }
+.story-q { display: grid; gap: 2px; padding-top: 6px; border-top: 1px solid var(--line) }
+.story-q small { font: 600 8px var(--sans); letter-spacing: .18em; text-transform: uppercase; color: #9fb7a8 }
+.story-q.daily small { color: #f0c870 }
+.story-q b { font: 600 13px var(--serif); color: #f4eedd }
+.story-q span { font: 400 11px/1.35 var(--serif); color: #cfc6b0 }
+.story-bar { display: block; height: 3px; margin-top: 3px; background: rgba(0, 0, 0, .45) }
+.story-bar em { display: block; height: 100%; background: var(--gold) }
+.story-journal { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line) }
+.story-journal h3 { margin: 0 0 6px; font: 600 12px var(--sans); letter-spacing: .2em; text-transform: uppercase; color: var(--gold) }
+.story-journal p { display: flex; flex-wrap: wrap; gap: 6px }
+.story-journal p span { padding: 2px 8px; border: 1px solid var(--line); font: 500 11px var(--serif); opacity: .6 }
+.story-journal p span.done { opacity: 1; border-color: var(--gold); color: var(--gold) }
+@media (max-width: 720px) { .story-tracker { display: none } }
+.pvp-kd { font-size: 10px; letter-spacing: .08em; color: #ffe6b0; text-transform: none }
+/* indicador de direção do dano: arco vermelho na borda de um círculo em volta do centro da tela */
+.hit-dir { position: absolute; left: 50%; top: 50%; width: min(46vh, 46vw); height: min(46vh, 46vw); z-index: 4; pointer-events: none; opacity: 0 }
+.hit-dir i { position: absolute; left: 50%; top: 0; width: 90px; height: 26px; transform: translateX(-50%); border-top: 5px solid #ff4a3a; border-radius: 50% 50% 0 0; filter: drop-shadow(0 0 6px #ff3020) }
+.hit-dir.on { animation: hit-dir 1s ease-out }
+@keyframes hit-dir { 0% { opacity: .95 } 100% { opacity: 0 } }
+.world-event { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); z-index: 4; padding: 4px 12px; font: 600 11px var(--sans); letter-spacing: .12em; color: #fff0c4; background: rgba(40, 32, 10, .72); border: 1px solid rgba(240, 200, 110, .55); pointer-events: none; animation: toast-in .4s var(--ease) }
+.story-q.go b { color: var(--gold-bright, #f6dd95) }
+.story-q.go b::before { content: '➜ '; color: var(--gold) }

@@ -56,7 +56,7 @@ export type HeroRig = {
 };
 
 /** Liga/desliga o contorno "anime" (casca invertida). Desligar economiza ~1/3 dos draw calls. */
-const OUTLINES = true;
+const OUTLINES = false; // visual realista (PBR): sem contorno cartoon — também economiza 1 draw por malha skinned
 
 type V3 = [number, number, number];
 type Key = readonly [number, number];
@@ -307,7 +307,7 @@ function arcPanel(r0: number, r1: number, len: number, arc: number, dir = 1, col
 
 /* ======================================================================== HERO */
 
-export function createHero(scene: THREE.Scene): HeroRig {
+export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {}): HeroRig {
   const root = new THREE.Group(); root.name = 'called-wanderer';
   const pivot = new THREE.Group(); pivot.name = 'hero-pivot'; pivot.position.y = PIV; root.add(pivot);
   const body = new THREE.Group(); body.name = 'articulated-rig'; body.position.y = -PIV; pivot.add(body);
@@ -316,7 +316,8 @@ export function createHero(scene: THREE.Scene): HeroRig {
   const toonRamp = new THREE.DataTexture(new Uint8Array([22, 86, 158, 232]), 4, 1, THREE.RedFormat);
   toonRamp.magFilter = THREE.NearestFilter; toonRamp.minFilter = THREE.NearestFilter; toonRamp.generateMipmaps = false; toonRamp.needsUpdate = true;
   scene.userData.gameTextures = [...(scene.userData.gameTextures ?? []), toonRamp];
-  const toon = (color: string, side: THREE.Side = THREE.FrontSide) => new THREE.MeshToonMaterial({ color, gradientMap: toonRamp, side });
+  // PBR (antes MeshToonMaterial): tecido/pele foscos; o ambiente (IBL) dá os reflexos
+  const toon = (color: string, side: THREE.Side = THREE.FrontSide) => new THREE.MeshStandardMaterial({ color, roughness: 0.68, metalness: 0, side });
   const mat = {
     suit: toon('#33454c'), cloth: toon('#42616a'), clothD: toon('#42616a', THREE.DoubleSide),
     coat: toon('#ddd5bd'), coatD: toon('#ddd5bd', THREE.DoubleSide), coatShade: toon('#cbc3aa', THREE.DoubleSide), coatDark: toon('#a5a18c'),
@@ -332,10 +333,10 @@ export function createHero(scene: THREE.Scene): HeroRig {
     silver: new THREE.MeshStandardMaterial({ color: '#d9dce3', roughness: 0.28, metalness: 0.85 }),
     bead: toon('#c7383a'),
     blush: new THREE.MeshBasicMaterial({ color: '#f29a9a', transparent: true, opacity: 0.22, depthWrite: false }),
-    glow: new THREE.MeshToonMaterial({ color: '#f2dca5', emissive: '#b58a3f', emissiveIntensity: 1.2, gradientMap: toonRamp }),
+    glow: new THREE.MeshStandardMaterial({ color: '#f2dca5', emissive: '#b58a3f', emissiveIntensity: 1.2, roughness: 0.4 }),
     halo: new THREE.MeshBasicMaterial({ color: '#f6e4ae', transparent: true, opacity: 0.75, depthWrite: false, side: THREE.DoubleSide }),
     // Xbot puro (cores personalizáveis) e armas das classes
-    xbSurface: toon('#c9ccd2'), xbJoint: toon('#a86bff'),
+    xbSurface: new THREE.MeshStandardMaterial({ color: '#c9ccd2', roughness: 0.42, metalness: 0.18 }), xbJoint: new THREE.MeshStandardMaterial({ color: '#a86bff', roughness: 0.3, metalness: 0.55 }),
     steel: new THREE.MeshStandardMaterial({ color: '#d4d9e2', roughness: 0.3, metalness: 0.8 }),
     gold: new THREE.MeshStandardMaterial({ color: '#d9b45a', roughness: 0.35, metalness: 0.75 }),
     grip: toon('#3d2c22'), shieldFace: toon('#7a2f26'), holyCloth: toon('#efe6cf'),
@@ -641,7 +642,8 @@ export function createHero(scene: THREE.Scene): HeroRig {
   const idleRingMat = new THREE.MeshBasicMaterial({ color: '#f6e4ae', transparent: true, opacity: 0.25, depthWrite: false, side: THREE.DoubleSide });
   const idleRing = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.0035, 5, 44), idleRingMat); idleRing.position.set(HEAD.x - 0.006, HEAD.y - 0.01, 0.01); staff.add(idleRing);
   const spellPoint = new THREE.Object3D(); spellPoint.position.set(HEAD.x + 0.002, HEAD.y + 0.04, 0.02); staff.add(spellPoint);
-  const aura = new THREE.PointLight('#efdba9', 0.85, 4, 2); aura.position.set(0.1, HEAD.y, 0.1); staff.add(aura);
+  // avatares remotos não têm a luz (orçamento fixo de PointLights): o objeto existe sem ir para a cena
+  const aura = new THREE.PointLight('#efdba9', 0.85, 4, 2); aura.position.set(0.1, HEAD.y, 0.1); if (opts.auraLight !== false) staff.add(aura);
   const haloA = new THREE.Mesh(new THREE.TorusGeometry(0.27, 0.008, 5, 32), mat.halo); haloA.position.set(0.12, HEAD.y - 0.02, 0); staff.add(haloA);
   const haloB = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.006, 5, 32), mat.halo); haloB.position.set(0.12, HEAD.y - 0.02, 0); staff.add(haloB);
   // cor atual das veias (segue o feitiço em uso) e luz da aura misturada a ela
@@ -715,7 +717,7 @@ export function createHero(scene: THREE.Scene): HeroRig {
     part(new THREE.BoxGeometry(0.05, 0.2, 0.008), mat.holyCloth, mace, [0.03, 0.32, 0.03], { rot: [0, 0, 0.15], shadow: false });
   }
   // livro sagrado do clérigo: aberto na mão, páginas que acendem em dourado com a magia
-  const pageMat = new THREE.MeshToonMaterial({ color: '#fff6d8', emissive: '#f3d27a', emissiveIntensity: 0.6, gradientMap: toonRamp, side: THREE.DoubleSide });
+  const pageMat = new THREE.MeshStandardMaterial({ color: '#fff6d8', emissive: '#f3d27a', emissiveIntensity: 0.6, roughness: 0.8, side: THREE.DoubleSide });
   const coverMat = toon('#4a3324');
   const book = new THREE.Group(); book.name = 'weapon-book'; staff.add(book);
   {

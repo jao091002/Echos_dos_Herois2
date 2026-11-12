@@ -18,12 +18,18 @@ import { PerfMonitor } from './perf-monitor';
 import { QuestGiver, type QuestStage } from './npc';
 import { NetClient, r2, defaultServer, listRooms, OFFICIAL_SERVER, isP2P, type NetMsg, type RoomInfo } from './net';
 import { RemotePlayers, type RemoteState } from './remote-players';
+import { PvpGuard, canHarm, pvpDamage, PVP_ARM_SECS, PVP_DISARM_SECS, PVP_KILL_XP } from './pvp';
+import { StoryLog, STORY, CHAPTERS, ACHIEVEMENTS, PLACES, type StoryView, type StoryOffer, type MobKind, type PlaceId } from './story';
+/** Diálogo da história: oferta de missão (id) ou fala de acompanhamento (id null). */
+type StoryDialog = Omit<StoryOffer, 'id'> & { id: string | null; npc: boolean };
 import { clipsFor } from './anim-library';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { readSave, writeSave, exportSave, importSave, type SaveData } from './save';
 
 /** Missão do Aldren: abater lobos perto do caminho do marco. */
 const WOLF_QUEST_GOAL = 3;
+/** Meia largura (m) da área com sombra do sol, centrada no jogador. */
+const SHADOW_R = 32;
 type WolfQuest = { stage: QuestStage; kills: number; reward: number };
 import { createWorld, setWorldQuality, terrainHeight, updateWorld, updateDayCycle, pondDist, streamDist, POND, type WorldParts } from './world';
 
@@ -83,7 +89,7 @@ const controlsFor = (def: ClassDef): [string[], string][] => [
   [['Alt'], def.weapon === 'staff' ? 'Ligar / desligar corrida (e voo rápido)' : 'Ligar / desligar corrida'], [['Espaço'], def.weapon === 'staff' ? 'Pular / subir voando' : 'Pular'], ...(def.weapon === 'staff' ? [[['Ctrl'], 'Descer voando'] as [string[], string]] : []),
   ...def.abilities.map(a => [[a.key], `${a.label} · ${ABILITY_HINT[a.spell]}`] as [string[], string]),
   [['Clique dir.'], `Golpe com ${WEAPON_ART[def.weapon]} ${WEAPON_NAME[def.weapon]} (sem arrastar)`], [['X'], 'Esquiva (invulnerável por um instante)'], [['Tab'], 'Travar alvo / trocar · Tab sem alvo solta'], [['Botão do meio'], 'Travar / soltar alvo'], [['T'], `Guardar / sacar ${WEAPON_ART[def.weapon]} ${WEAPON_NAME[def.weapon]}`], [['V'], 'Postura defensiva'],
-  [['E'], 'Inventário'], [[','], 'Habilidades'], [['P'], 'Jogadores e grupo (multijogador)'], [['G'], 'Ouvir o Marco'], [['J'], 'Diário de viagem'], [['Esc'], 'Pausar'],
+  [['E'], 'Inventário'], [[','], 'Habilidades'], [['P'], 'Jogadores e grupo (multijogador)'], [['K'], 'Ligar / desligar PvP (multijogador)'], [['G'], 'Ouvir o Marco'], [['J'], 'Diário de viagem'], [['Esc'], 'Pausar'],
 ];
 
 type HudStore = { get: () => CombatHud; set: (v: CombatHud) => void; subscribe: (l: () => void) => () => void };
@@ -161,6 +167,10 @@ export default function Game() {
   const mobBarsRef = useRef<HTMLDivElement>(null);
   /** Caído no multijogador (esperando um aliado reviver): contagem regressiva e renascer agora. */
   const [downed, setDowned] = useState(false);
+  /** PvP (flag global): estado mostrado no HUD; o loop é a fonte da verdade. */
+  const [pvpUi, setPvpUi] = useState<{ mode: 'off' | 'arming' | 'on' | 'disarming'; t: number; k: number; d: number }>({ mode: 'off', t: 0, k: 0, d: 0 });
+  const hitDirRef = useRef<HTMLDivElement>(null);
+  const togglePvpRef = useRef<() => void>(() => { });
   const downedRef = useRef<HTMLSpanElement>(null);
   const respawnRef = useRef<() => void>(() => {});
   const [nearDowned, setNearDowned] = useState<{ id: string; name: string } | null>(null);
@@ -220,6 +230,16 @@ export default function Game() {
   const [npcDialog, setNpcDialog] = useState(false);
   const [nearNpc, setNearNpc] = useState(false);
   const [wolfQuest, setWolfQuest] = useState<WolfQuest>({ stage: 'available', kills: 0, reward: 0 });
+  /** Modo história: missões visíveis (as concluídas somem) e quantas da história já foram feitas. */
+  const [storyView, setStoryView] = useState<StoryView>([]);
+  const [storyDone, setStoryDone] = useState(0);
+  const [achDone, setAchDone] = useState(0);
+  const [storyDialog, setStoryDialog] = useState<StoryDialog | null>(null);
+  const storyDialogRef = useRef(storyDialog); storyDialogRef.current = storyDialog;
+  /** Texto do prompt "G" de um local da história por perto. */
+  const [placePrompt, setPlacePrompt] = useState('');
+  /** Evento do mundo em curso (ex.: Lua de Caça, XP em dobro). */
+  const [worldEvent, setWorldEvent] = useState('');
   // classe e aparência escolhidas na criação de personagem (lidas do armazenamento local após montar, sem divergir do SSR)
   const [heroChoice, setHeroChoice] = useState<HeroChoice>({ cls: 'maga', look: { ...DEFAULT_APPEARANCE.maga } });
   const heroChoiceRef = useRef(heroChoice); heroChoiceRef.current = heroChoice;
@@ -247,7 +267,10 @@ export default function Game() {
     if (!file) return;
     const d = await importSave(file);
     if (!d) { setHint('Arquivo de save inválido.'); setTimeout(() => setHint(''), 2600); return; }
-    writeSave(d); setSavedGame(d); setHint(`Save importado: ${CLASSES[d.choice.cls].name} nível ${d.progression.level}.`); setTimeout(() => setHint(''), 2600);
+    writeSave(d); setSavedGame(d);
+    // jornada já em andamento: aplica agora (antes só valia no primeiro "Continuar", e o autosave apagava o importado)
+    if (hasStartedRef.current) loadSaveRef.current(d);
+    setHint(`Save carregado: ${CLASSES[d.choice.cls].name} nível ${d.progression.level}.`); setTimeout(() => setHint(''), 2600);
   };
 
   /* ================= MULTIJOGADOR ================= */
@@ -460,16 +483,36 @@ export default function Game() {
     const sky = new THREE.HemisphereLight('#f0f0dc', '#52614d', 2.05); scene.add(sky);
     const sun = new THREE.DirectionalLight('#ffebca', 3.05);
     sun.position.set(-34, 48, 22); sun.castShadow = true; sun.shadow.mapSize.set(quality === 'Alta' ? 2048 : 1024, quality === 'Alta' ? 2048 : 1024);
-    sun.shadow.camera.left = -48; sun.shadow.camera.right = 48; sun.shadow.camera.top = 48; sun.shadow.camera.bottom = -48; sun.shadow.bias = -.00035; scene.add(sun);
+    sun.shadow.camera.left = -SHADOW_R; sun.shadow.camera.right = SHADOW_R; sun.shadow.camera.top = SHADOW_R; sun.shadow.camera.bottom = -SHADOW_R; sun.shadow.bias = -.00035; scene.add(sun, sun.target);
     const fill = new THREE.DirectionalLight('#c5d7da', .72); fill.position.set(25, 22, -32); scene.add(fill);
+    /* Sombra que acompanha o jogador: o ciclo do dia define só a DIREÇÃO do sol (sunOffset); o frustum (±SHADOW_R)
+     * fica centrado no herói e ancorado em texels no espaço da luz, para as bordas não tremerem ao andar. */
+    const sunOffset = sun.position.clone().setLength(80);
+    const sunR = new THREE.Vector3(), sunU = new THREE.Vector3(), sunZ = new THREE.Vector3();
+    const followSun = (focus: THREE.Vector3) => {
+      sunZ.copy(sunOffset).normalize();
+      sunR.set(0, 1, 0).cross(sunZ); if (sunR.lengthSq() < 1e-6) sunR.set(1, 0, 0); sunR.normalize();
+      sunU.copy(sunZ).cross(sunR);
+      const texel = SHADOW_R * 2 / sun.shadow.mapSize.x, a = focus.dot(sunR), b = focus.dot(sunU);
+      sun.target.position.copy(focus).addScaledVector(sunR, Math.round(a / texel) * texel - a).addScaledVector(sunU, Math.round(b / texel) * texel - b);
+      sun.position.copy(sun.target.position).add(sunOffset);
+    };
 
-    const composer = new EffectComposer(renderer);
+    // MSAA no alvo do composer (a cena é desenhada nele, então o antialias do canvas não valia): 4× Alta, 2× Média
+    const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: quality === 'Alta' ? 4 : quality === 'Média' ? 2 : 0 }));
     composer.addPass(new RenderPass(scene, camera));
     const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), quality === 'Alta' ? .48 : .3, .26, .84);
     composer.addPass(bloom);
     composer.addPass(new OutputPass());
 
     const world: WorldParts = createWorld(scene);
+    /* Iluminação de ambiente (IBL) gerada do próprio céu: água, metal e armaduras refletem o céu do momento.
+     * Refeita a cada 20 s de jogo (o ciclo do dia leva 240 s); o tipo da textura não muda, então nada recompila. */
+    const pmrem = new THREE.PMREMGenerator(renderer), envScene = new THREE.Scene();
+    envScene.add(new THREE.Mesh(new THREE.SphereGeometry(100, 24, 12), (scene.userData.environment as { skyMaterial: THREE.ShaderMaterial }).skyMaterial));
+    let envRT: THREE.WebGLRenderTarget | null = null, envTick = 0;
+    const refreshEnv = () => { const rt = pmrem.fromScene(envScene, .04, .1, 300); envRT?.dispose(); envRT = rt; scene.environment = rt.texture; };
+    scene.environmentIntensity = .6; refreshEnv();
     qualityTargetsRef.current = { scene, sun, composer, bloom };
     basePixelRatioRef.current = renderer.getPixelRatio();
     let resScale = 1;
@@ -520,8 +563,8 @@ export default function Game() {
     };
     let elapsed = 0, reticleHitUntil = 0;
     /** Grupo: +10% de XP por membro além de você. */
-    const xpBonus = () => 1 + .1 * Math.max(0, (partyRef.current?.members.length ?? 1) - 1);
-    const combat = new CombatSystem(scene, amount => progression.recordExperience(Math.round(amount * xpBonus())), item => progression.addItem(item), showHint);
+    const xpBonus = () => (1 + .1 * Math.max(0, (partyRef.current?.members.length ?? 1) - 1)) * (elapsed < xpEventUntil ? 2 : 1);
+    const combat = new CombatSystem(scene, amount => progression.recordExperience(Math.round(amount * xpBonus())), item => { progression.addItem(item); story.loot(); }, showHint);
     const magic = new MagicSystem(scene, hero.root, combat, world.blockers, progression, () => { reticleHitUntil = elapsed + .28; });
     /** Classe atual (definida na criação de personagem). */
     const cls = () => CLASSES[heroChoiceRef.current.cls];
@@ -552,47 +595,63 @@ export default function Game() {
     let isNearNpc = false;
     /** XP que leva exatamente a 2 níveis acima do atual (o que falta para o próximo + o nível seguinte inteiro). */
     const twoLevelXp = () => (progression.nextLevelXp - progression.experience) + (100 + progression.level * 50);
-    combat.onKill = kind => {
-      if (kind !== 'wolf' || quest.stage !== 'active') return;
-      quest.kills = Math.min(WOLF_QUEST_GOAL, quest.kills + 1);
-      if (quest.kills >= WOLF_QUEST_GOAL) {
-        quest.stage = 'ready'; npc.setStage('ready');
-        showHint(`Lobos abatidos ${quest.kills}/${WOLF_QUEST_GOAL} · volte até ${npc.name}`);
-        ambient.sfx('ui');
-      } else showHint(`Lobos abatidos ${quest.kills}/${WOLF_QUEST_GOAL}`);
-      publishQuest();
+    /* ==================== MODO HISTÓRIA (story.ts): recompensa na hora, a missão some da lista */
+    const story = new StoryLog();
+    /** Aldren mostra "!" com missão nova, "?" com missão dele em curso, nada se não tiver o que dizer. */
+    const syncNpcMarker = () => { const s = story.npcState(); npc.setStage(s === 'offer' ? 'available' : s === 'active' ? 'active' : 'done'); };
+    story.onChange = () => { setStoryView(story.view()); setStoryDone(story.storyDone); setAchDone(story.achievementsDone); syncNpcMarker(); };
+    story.onAchievement = a => { progression.recordExperience(a.xp); setProgressionHud(progression.snapshot()); setAchDone(story.achievementsDone); ambient.sfx('levelUp'); showHint(`🏆 Conquista: ${a.title} · +${a.xp} XP`); };
+    /* evento periódico do mundo: a cada 6 min de jogo, 90 s de "Lua de Caça" (XP em dobro) — motivo para ficar mais um pouco */
+    let xpEventUntil = -1, nextXpEvent = 360;
+    // missão concluída: recompensa na hora e o aviso já aponta quem entrega a próxima
+    story.onComplete = (q, next) => {
+      progression.recordExperience(q.xp); q.items?.forEach(i => progression.addItem(i));
+      setProgressionHud(progression.snapshot()); ambient.sfx('levelUp');
+      const items = q.items?.length ? ` · ${q.items.map(i => LOOT_INFO[i].name).join(', ')}` : '';
+      showHint(`Missão concluída: ${q.title} · +${q.xp} XP${items}${next ? ` · Próxima missão: ${next === 'Aldren' ? 'com Aldren' : next}` : ''}`);
+      if (q.chapter >= 0 && 'npc' in q.giver) npc.play('cheer');
+    };
+    story.onChange();
+    let storyTick = 0, storyPlace: PlaceId | null = null;
+    combat.onKill = kind => { story.kill(kind as MobKind); };
+    /** Abre o diálogo de um doador (Aldren ou local). Sem oferta: fala de acompanhamento. */
+    const openDialog = (d: StoryDialog) => {
+      ambient.start(); ambient.sfx('ui'); keys.clear();
+      if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
+      shiftLockActive = false; cameraRig.setShiftLock(false); setShiftLocked(false);
+      setStoryDialog(d); setNpcDialog(true);
     };
     const talkToNpc = () => {
       if (!isNearNpc || uiOpenRef.current || combat.health <= 0) return;
       if (magic.flying) { showHint(`Pouse para falar com ${npc.name}.`); return; }
-      ambient.start(); ambient.sfx('ui');
-      keys.clear();
-      if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
-      shiftLockActive = false; cameraRig.setShiftLock(false); setShiftLocked(false);
       // a heroína vira para o NPC
       hero.root.userData.facing = Math.atan2(npc.position.x - hero.root.position.x, npc.position.z - hero.root.position.z);
-      if (quest.stage === 'ready') quest.reward = twoLevelXp();
-      publishQuest();
       npc.setTalking(true);
-      setNpcDialog(true);
+      const offer = story.offerAt({ npc: 'aldren' }), cur = story.current;
+      if (offer) { openDialog({ ...offer, npc: true }); return; }
+      const lines = cur && story.npcState() === 'active' ? [`Ainda está com aquilo em mente? "${cur.title}": ${cur.text}`, 'Volte quando tiver terminado. Eu não saio daqui.']
+        : cur && story.view()[0]?.step === 'goal' ? ['Os campos estão mais calmos com você por perto.', `Soube da sua tarefa: ${cur.text.charAt(0).toLowerCase()}${cur.text.slice(1)} Boa sorte.`]
+        : cur ? ['Os campos estão mais calmos com você por perto.', `Se procura o que fazer, ${'place' in cur.giver ? `dizem que há algo em ${PLACES[cur.giver.place].name}.` : 'volte mais tarde.'}`]
+          : ['O vale inteiro canta o seu nome, herdeiro. Que o vento esteja a seu favor.'];
+      openDialog({ id: null, speaker: 'Aldren', sub: 'Pastor dos Campos da Aurora', title: '', lines, objective: '', reward: '', npc: true });
+    };
+    /** G em um local da história: conclui objetivos "interagir" ali e mostra a próxima oferta, se ela vier dali. */
+    const interactPlace = (place: PlaceId) => {
+      if (magic.flying) { showHint('Pouse para interagir.'); return; }
+      story.interact(place);
+      const offer = story.offerAt({ place });
+      if (offer) openDialog({ ...offer, npc: false });
     };
     npcActionsRef.current = {
       accept: () => {
-        if (quest.stage !== 'available') return;
-        quest.stage = 'active'; quest.kills = 0; npc.setStage('active'); publishQuest();
-        setNpcDialog(false); npc.setTalking(false); npc.play('point');
-        ambient.sfx('ui');
-        showHint(`Missão aceita · abata ${WOLF_QUEST_GOAL} lobos na mata ao norte`);
+        const d = storyDialogRef.current; if (!d?.id) return;
+        story.accept(d.id); story.level(progression.level); // missão de nível já cumprida conclui na hora
+        setNpcDialog(false); setStoryDialog(null); npc.setTalking(false);
+        if (d.npc) npc.play('point');
+        ambient.sfx('ui'); showHint(`Missão aceita · ${d.title}`);
       },
-      turnIn: () => {
-        if (quest.stage !== 'ready') return;
-        const reward = twoLevelXp(), before = progression.level;
-        progression.recordExperience(reward);
-        quest.stage = 'done'; quest.reward = reward; npc.setStage('done'); publishQuest();
-        setNpcDialog(false); npc.setTalking(false); npc.play('cheer');
-        showHint(`Missão concluída · +${reward} XP · nível ${before} → ${progression.level}`);
-      },
-      close: () => { setNpcDialog(false); npc.setTalking(false); },
+      turnIn: () => {},
+      close: () => { setNpcDialog(false); setStoryDialog(null); npc.setTalking(false); },
     };
     // compila todos os shaders durante o carregamento (sem engasgos no primeiro feitiço/primeiro olhar)
     // compila os shaders já para o render target do pós-processamento (onde a cena é desenhada de fato):
@@ -621,6 +680,8 @@ export default function Game() {
       const out: Lock[] = [];
       for (const t of combat.targets) { const info = combat.targetInfo(t); if (info?.alive) out.push({ obj: t, label: MOB_LABEL[info.kind], player: null }); }
       for (const s of remotes.active()) if (s.st.hp > 0) out.push({ obj: s.hero.root, label: s.st.name, player: s.id });
+      // PvP ligado: jogadores hostis têm prioridade no Tab (os inimigos voltam quando não há nenhum)
+      if (pvp.on && combat.pvpTargets.length) { const hostile = out.filter(l => l.player && combat.pvpTargets.some(t => t.id === l.player)); if (hostile.length) return hostile; }
       return out;
     };
     const lockValid = (l: Lock) => {
@@ -669,6 +730,8 @@ export default function Game() {
       if (magic.cast(spell, spellOrigin, spellDirection, spellAim)) {
         hero.root.userData.castKind = spell;
         broadcastFx(spell, spellOrigin, spellDirection, spellAim); partyEffects(spell);
+        story.cast();
+        if (spell === 'santuario') { const s = magic.santuarioInfo; if (s) startCinematic('SANTUÁRIO · IGREJA DE LUZ', 'Catedral de Luz', 3.2, { c: s.center, R: s.R }); }
         // Brado provoca: os inimigos em volta passam a mirar no guerreiro (no host; o cliente pede ao host)
         if (spell === 'brado') {
           const hp = hero.root.position;
@@ -699,8 +762,10 @@ export default function Game() {
     let zoltraakFraming = false, faceAimUntil = 0;
     const shieldBarrier = { center: new THREE.Vector3(), normal: new THREE.Vector3(), half: 1 };
     // mini-cutscene do Vollzanbel: barras de cinema, nome do feitiço, câmera baixa girando em volta da maga
-    const cine = { start: -99, until: -99 };
-    const startCinematic = (small = 'INVOCAÇÃO DAS CHAMAS INFERNAIS', big = 'Vollzanbel', duration = 1.3) => {
+    const cine = { start: -99, until: -99, church: null as { c: THREE.Vector3; R: number; a0: number } | null };
+    const tmpCine = new THREE.Vector3();
+    const startCinematic = (small = 'INVOCAÇÃO DAS CHAMAS INFERNAIS', big = 'Vollzanbel', duration = 1.3, church: { c: THREE.Vector3; R: number } | null = null) => {
+      cine.church = church && { ...church, a0: cameraRig.yaw + .9 };
       cine.start = elapsed; cine.until = elapsed + duration;
       const cap = captionRef.current;
       if (cap) { cap.querySelector('small')!.textContent = small; cap.querySelector('strong')!.textContent = big; cap.style.animationDuration = `${duration}s`; }
@@ -808,7 +873,7 @@ export default function Game() {
     const releaseZoltraak = () => {
       if (!magic.charging) return;
       aimNow();
-      if (magic.releaseCharge()) broadcastFx('zoltraak', spellOrigin, spellDirection, spellAim);
+      if (magic.releaseCharge()) { broadcastFx('zoltraak', spellOrigin, spellDirection, spellAim); story.cast(); }
     };
     zoltraakRef.current = { start: startZoltraak, release: releaseZoltraak };
     const startShield = () => {
@@ -870,6 +935,10 @@ export default function Game() {
         kill: () => { combat.health = 0; },
         lockInfo: () => ({ label: lock?.label ?? null, player: lock?.player ?? null, camYaw: cameraRig.yaw, heroYaw: hero.root.rotation.y, target: lock ? lockPos(lock, new THREE.Vector3()).toArray() : null, hero: hero.root.position.toArray() }),
         pos: () => ({ x: hero.root.position.x, z: hero.root.position.z }),
+        // PvP (testes): estado do flag, alvos hostis e atalho para ligar sem a contagem
+        pvp: () => ({ mode: pvp.mode, on: pvp.on, targets: combat.pvpTargets.map(t => t.id), health: combat.health }),
+        pvpToggle: () => togglePvpRef.current(),
+        pvpForce: (on: boolean) => { pvp.mode = on ? 'on' : 'off'; pvp.arm = 0; },
       };
     }
     const interactMarker = () => {
@@ -892,6 +961,7 @@ export default function Game() {
         progression: { level: p.level, experience: p.experience, nextLevelXp: p.nextLevelXp, skillPoints: p.skillPoints, ranks: { ...p.ranks }, inventory: { ...p.inventory } },
         quest: { ...quest }, markerRemembered,
         position: { x: hero.root.position.x, y: hero.root.position.y, z: hero.root.position.z, yaw: hero.root.rotation.y },
+        story: story.save(),
       };
     };
     loadSaveRef.current = d => {
@@ -906,6 +976,10 @@ export default function Game() {
       hero.root.position.set(x, terrainHeight(x, z), z); hero.root.rotation.y = d.position.yaw; hero.root.userData.facing = d.position.yaw; motor.reset();
       if (d.name && !mpNameRef.current) mpNameRef.current = d.name;
       combat.health = combat.maxHealth;
+      story.restore(d.story);
+      // bônus de retorno: voltar depois de 4 h ou mais rende XP (sem punir quem ficou fora)
+      const away = (Date.now() - d.savedAt) / 3.6e6;
+      if (away >= 4) { const bonus = Math.round(40 * progression.level * Math.min(3, away / 8 + .5)); progression.recordExperience(bonus); setTimeout(() => showHint(`Bem-vindo de volta! Bônus de retorno: +${bonus} XP`), 1500); }
     };
     // fechar a aba / recarregar: salva antes (só se a jornada já começou)
     const onBeforeUnload = () => { const d = collectSaveRef.current(); if (d) writeSave(d); };
@@ -921,11 +995,64 @@ export default function Game() {
     combat.onHitRequest = (i, d, p, k) => net.sendTo(net.host, { t: 'hit', i, d: r2(d), p: vArr(p), k: r2(k), th: combat.threatMult });
     combat.isDodging = () => motor.dodging || elapsed < dodgeUntil;
     combat.onDamageNumber = (at, amount, kind) => spawnFloater(at, amount, kind);
+    // indicador de direção do dano (seta na borda da tela apontando para quem bateu)
+    combat.onHurtFrom = (x, z) => {
+      const el = hitDirRef.current; if (!el) return;
+      const dx = x - hero.root.position.x, dz = z - hero.root.position.z, y = cameraRig.yaw;
+      const ang = Math.atan2(dx * Math.cos(y) - dz * Math.sin(y), -dx * Math.sin(y) - dz * Math.cos(y));
+      el.style.transform = `translate(-50%, -50%) rotate(${ang.toFixed(3)}rad)`; el.classList.remove('on'); void el.offsetWidth; el.classList.add('on');
+    };
     combat.onRemoteStrike = (id, d, x, z) => net.sendTo(id, { t: 'strike', d: r2(d), x: r2(x), z: r2(z) });
     combat.onNetHold = (i, x, z, yaw, tilt, lift) => net.sendTo(net.host, { t: 'hold', i, x: r2(x), z: r2(z), y: r2(yaw), tl: r2(tilt), l: r2(lift) });
     combat.onNetRelease = (i, px, pz) => net.sendTo(net.host, { t: 'rel', i, x: r2(px), z: r2(pz) });
     const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
     const peerName = (id: string) => net.peers.get(id)?.name ?? 'Aliado';
+    /* ==================================================================== PvP (flag global, ver pvp.ts) */
+    const pvp = { on: false, mode: 'off' as 'off' | 'arming' | 'on' | 'disarming', arm: 0, lastCombat: -99, kills: 0, deaths: 0 };
+    const pvpGuard = new PvpGuard();
+    let pvpUiKey = '';
+    const publishPvp = () => { const t = Math.ceil(pvp.arm), k = `${pvp.mode}${t}|${pvp.kills}|${pvp.deaths}`; if (k !== pvpUiKey) { pvpUiKey = k; setPvpUi({ mode: pvp.mode, t, k: pvp.kills, d: pvp.deaths }); } };
+    togglePvpRef.current = () => {
+      if (!net.online) { showHint('O PvP só existe no multijogador (P para entrar numa sala).'); return; }
+      if (pvp.mode === 'off') { pvp.mode = 'arming'; pvp.arm = PVP_ARM_SECS; showHint(`PvP será ligado em ${PVP_ARM_SECS} s.`); }
+      else if (pvp.mode === 'arming') { pvp.mode = 'off'; pvp.arm = 0; showHint('PvP cancelado.'); }
+      else if (pvp.mode === 'on') { pvp.mode = 'disarming'; pvp.arm = PVP_DISARM_SECS; showHint(`PvP será desligado após ${PVP_DISARM_SECS} s sem combate.`); }
+      else { pvp.mode = 'on'; pvp.arm = 0; showHint('PvP continua ligado.'); }
+      publishPvp();
+    };
+    /** Contagens de ligar/desligar e lista de jogadores que posso ferir (atualizada todo quadro). */
+    const pvpStep = (delta: number, now: number, active: ReturnType<typeof remotes.active>) => {
+      if (!net.online && pvp.mode !== 'off') { pvp.mode = 'off'; pvp.arm = 0; }
+      if (pvp.mode === 'arming') {
+        pvp.arm -= delta;
+        if (pvp.arm <= 0) { pvp.mode = 'on'; pvp.arm = 0; showHint('PvP ligado: jogadores com PvP fora do seu grupo podem te atacar.'); }
+      } else if (pvp.mode === 'disarming') {
+        if (elapsed - pvp.lastCombat < 1) pvp.arm = PVP_DISARM_SECS; // combate PvP reinicia a contagem
+        pvp.arm -= delta;
+        if (pvp.arm <= 0) { pvp.mode = 'off'; pvp.arm = 0; showHint('PvP desligado.'); }
+      }
+      pvp.on = pvp.mode === 'on' || pvp.mode === 'disarming';
+      publishPvp();
+      pvpGuard.record(now, hero.root.position);
+      const party = partyRef.current?.members, list = combat.pvpTargets; list.length = 0;
+      if (pvp.on && combat.health > 0) {
+        for (const s of active) if (s.st.hp > 0 && canHarm(true, !!s.st.pvp, !!party?.includes(s.id))) list.push({ id: s.id, pos: s.hero.root.position });
+      }
+    };
+    // meu golpe acertou um jogador: a vítima valida e aplica
+    combat.onPlayerHit = (id, d, p, radius, k) => { pvp.lastCombat = elapsed; net.sendTo(id, { t: 'phit', d: r2(d), p: vArr(p), r: r2(radius), k: r2(k) }); };
+    /** Golpe PvP recebido: confere flag/grupo/distância/taxa e aplica como golpe de inimigo (esquiva, escudo, resistência). */
+    const receivePvpHit = (from: string, m: NetMsg) => {
+      const s = remotes.active().find(x => x.id === from);
+      if (!pvp.on || !s || !s.st.pvp || partyRef.current?.members.includes(from) || combat.health <= 0) return;
+      const d = Number(m.d), at = v3(m.p, tmpA), src = s.hero.root.position;
+      const why = pvpGuard.check(performance.now(), from, d, at, Number(m.r) || 1, src);
+      if (why) { if (process.env.NODE_ENV !== 'production') console.warn('[pvp] golpe recusado de', from, why); return; }
+      pvp.lastCombat = elapsed;
+      const before = combat.health;
+      combat.receiveStrike(pvpDamage(d), src.x, src.z, hero.root.position, netBlock);
+      if (before > 0 && combat.health <= 0) { pvp.deaths++; net.send({ t: 'pkill', k: from }); showHint(`⚔ ${peerName(from)} derrotou você em combate PvP.`); }
+    };
     net.onMessage = m => {
       const from = m.from ?? '';
       switch (m.t) {
@@ -945,6 +1072,13 @@ export default function Game() {
         case 'hold': if (combat.netRole === 'host') combat.netHold(Number(m.i), Number(m.x), Number(m.z), Number(m.y), Number(m.tl), Number(m.l)); return;
         case 'rel': if (combat.netRole === 'host') combat.netRelease(Number(m.i), Number(m.x), Number(m.z)); return;
         case 'strike': combat.receiveStrike(Number(m.d), Number(m.x), Number(m.z), hero.root.position, netBlock); return;
+        case 'phit': receivePvpHit(from, m); return;
+        case 'pkill': {
+          const killer = String(m.k ?? '');
+          if (killer === net.id) { progression.recordExperience(PVP_KILL_XP); story.pvpKill(); pvp.kills++; showHint(`⚔ Você derrotou ${peerName(from)} em combate PvP. +${PVP_KILL_XP} XP`); }
+          else showHint(`⚔ ${peerName(killer)} derrotou ${peerName(from)} em combate PvP.`);
+          return;
+        }
         case 'fx': {
           const o = v3(m.o, tmpA); if (o.distanceTo(hero.root.position) > 70) return;
           magic.remoteFx(m.s as SpellId, o, v3(m.d, tmpB), v3(m.g, tmpC)); return;
@@ -985,6 +1119,7 @@ export default function Game() {
       remotes.update(elapsed, delta, now);
       const active = remotes.active();
       combat.remotes = active.map(s => ({ id: s.id, pos: s.hero.root.position, alive: s.st.hp > 0 }));
+      pvpStep(delta, now, active);
       if (net.online && playing) {
         stateAcc += delta;
         if (stateAcc >= 1 / 20) {
@@ -992,7 +1127,7 @@ export default function Game() {
           const hp = hero.root.position;
           net.send({ t: 'st', x: r2(hp.x), y: r2(hp.y), z: r2(hp.z), vx: r2(motor.velocity.x), vz: r2(motor.velocity.z), yaw: r2(hero.root.rotation.y), pose: netPose, lp: netLoco, spd: r2(netSpeed),
             ov: netOverlay, ck: (hero.root.userData.castKind as string | undefined) ?? null, hp: Math.round(combat.health), mhp: Math.round(combat.maxHealth),
-            cls: heroChoiceRef.current.cls, look: heroChoiceRef.current.look, name: net.myName || mpNameRef.current, lvl: progression.level });
+            cls: heroChoiceRef.current.cls, look: heroChoiceRef.current.look, name: net.myName || mpNameRef.current, lvl: progression.level, pvp: pvp.on ? 1 : 0 });
         }
       }
       combat.selfId = net.online ? net.id : 'self';
@@ -1013,6 +1148,8 @@ export default function Game() {
           el.style.display = '';
           el.style.transform = `translate(-50%, -100%) translate(${((tmpA.x + 1) / 2 * renderer.domElement.clientWidth).toFixed(1)}px, ${((1 - tmpA.y) / 2 * renderer.domElement.clientHeight).toFixed(1)}px)`;
           el.classList.toggle('party', !!p?.members.includes(s.id));
+          el.classList.toggle('hostile', pvp.on && !!s.st.pvp && !p?.members.includes(s.id));
+          el.classList.toggle('pvp', !!s.st.pvp);
           const nameEl = el.firstElementChild as HTMLElement, bar = el.lastElementChild?.firstElementChild as HTMLElement | null;
           const label = `${CLASSES[s.st.cls]?.glyph ?? ''} ${s.st.name}`;
           if (nameEl.textContent !== label) nameEl.textContent = label;
@@ -1083,6 +1220,7 @@ export default function Game() {
       if (titleRef.current) { if (key === 'enter' && !event.repeat) startRef.current(); return; }
       if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'shift', 'alt', 'escape', 'h', 'j', 'e', 'g', 'q', '1', '2', '3', '4', 'f', 'r', 'v', 'x', 't', 'control', ',', 'p', 'tab'].includes(key)) event.preventDefault();
       if (event.repeat && ['escape', 'h', 'j', 'e', 'g', 'q', '1', '2', '3', '4', 'f', 'r', 'x', ' ', ',', 'p'].includes(key)) return;
+      if (key === 'escape' && elapsed < cine.until) { cine.until = elapsed; return; } // Esc pula a cutscene
       if (key === 'escape') {
         keys.clear();
         if (npcDialogRef.current) { npcActionsRef.current.close(); return; }
@@ -1110,6 +1248,7 @@ export default function Game() {
       if (key === 'e') { toggleInventory(); return; }
       if (key === ',') { toggleSkills(); return; }
       if (key === 'p') { togglePlayers(); return; }
+      if (key === 'k' && !event.repeat) { togglePvpRef.current(); return; }
       if (key === 'enter' && combat.health <= 0) { respawnNow = true; return; }
       if (key === 'g' && nearDownedId && !uiOpenRef.current && combat.health > 0 && !reviveTarget) {
         reviveTarget = nearDownedId; reviveUntil = elapsed + 1.4;
@@ -1118,6 +1257,7 @@ export default function Game() {
         return;
       }
       if (key === 'g' && isNearNpc && !uiOpenRef.current) { talkToNpc(); return; }
+      if (key === 'g' && storyPlace && !uiOpenRef.current) { if (storyPlace === 'marco') interactMarker(); interactPlace(storyPlace); return; }
       if (key === 'g' && isNearMarker && !uiOpenRef.current) {
         interactMarker();
         return;
@@ -1253,8 +1393,8 @@ export default function Game() {
         magic.update(delta, elapsed);
         updateWorld(world, elapsed);
         cycleTick += delta;
-        if (cycleTick >= 1 || firstFrame) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); setDayLabel(cycle.label); }
-        if (renderer.shadowMap.enabled && frameCount % 3 === 0) renderer.shadowMap.needsUpdate = true;
+        if (cycleTick >= 1 || firstFrame) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); sunOffset.copy(sun.position).setLength(80); if (++envTick >= 20) { envTick = 0; refreshEnv(); } setDayLabel(cycle.label); }
+        if (renderer.shadowMap.enabled && frameCount % 3 === 0) { followSun(hero.root.position); renderer.shadowMap.needsUpdate = true; }
         netStep(delta, false);
         perf.render(draw);
         if (firstFrame) { firstFrame = false; setReady(true); }
@@ -1295,6 +1435,20 @@ export default function Game() {
         const grabSpeed = grab ? stepGrab(delta) : 0;
         const moving = grab ? grabSpeed > .5 : combat.health > 0 && motor.update(delta, THREE.MathUtils.clamp(forward, -1, 1), THREE.MathUtils.clamp(side, -1, 1), touchSprintRef.current, keys.has(' ') || touchJumpRef.current, cameraRig.yaw, magic.flying, Number(keys.has(' ') || touchJumpRef.current) - Number(keys.has('control')), cameraRig.pitch);
         if (!grab) combat.pushPlayer(hero.root.position); // inimigos têm corpo sólido
+        storyTick += delta; if (storyTick > .5) {
+          storyTick = 0;
+          const pl = combat.health > 0 ? story.placeAt(hero.root.position.x, hero.root.position.z) : null;
+          if (pl !== storyPlace) { storyPlace = pl; setPlacePrompt(pl ? PLACES[pl].verb : ''); }
+          if (elapsed >= nextXpEvent) { nextXpEvent = elapsed + 360; xpEventUntil = elapsed + 90; setWorldEvent('Lua de Caça · XP em dobro'); showHint('🌕 Lua de Caça! Todo XP de inimigos vale o dobro por 90 s.'); }
+          else if (xpEventUntil > 0 && elapsed >= xpEventUntil) { xpEventUntil = -1; setWorldEvent(''); }
+        }
+        // câmera realista: FOV/balanço pela velocidade; aterrissagem afunda a câmera e quedas altas ferem
+        cameraRig.speed01 = Math.min(1, Math.hypot(motor.velocity.x, motor.velocity.z) / 8.2); cameraRig.flying = magic.flying;
+        if (motor.landingSpeed > 0) {
+          const v = motor.landingSpeed; motor.landingSpeed = 0;
+          cameraRig.impact(Math.min(1, (v - 4) / 16));
+          if (v > 17 && combat.health > 0) { const dmg = (v - 17) * 4.5 * (1 - combat.resist); combat.health = Math.max(0, combat.health - dmg); spawnFloater(tmpLock.set(hero.root.position.x, hero.root.position.y + 2.2, hero.root.position.z), Math.round(dmg), 'hurt'); ambient.sfx('hurt'); }
+        }
         if (!grab && combat.health > 0 && (lock || shiftLockActive || Math.hypot(motor.velocity.x, motor.velocity.z) > .2)) {
           hero.root.userData.facing = lock ? Math.atan2(lockPos(lock, tmpLock).x - hero.root.position.x, tmpLock.z - hero.root.position.z)
             : shiftLockActive ? cameraRig.yaw + Math.PI : Math.atan2(motor.velocity.x, motor.velocity.z);
@@ -1366,7 +1520,7 @@ export default function Game() {
         npc.update(delta, elapsed, hero.root.position);
         updateWorld(world, elapsed);
         cycleTick += delta;
-        if (cycleTick >= 1) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); setDayLabel(cycle.label); daylightNow = cycle.daylight; }
+        if (cycleTick >= 1) { cycleTick = 0; const cycle = updateDayCycle(scene, sun, sky, elapsed); sunOffset.copy(sun.position).setLength(80); if (++envTick >= 20) { envTick = 0; refreshEnv(); } setDayLabel(cycle.label); daylightNow = cycle.daylight; }
         const distanceToMarker = Math.hypot(hero.root.position.x, hero.root.position.z + 12);
         const near = distanceToMarker < 4.6;
         if (near !== isNearMarker) { isNearMarker = near; setNearLandmark(near); }
@@ -1397,7 +1551,7 @@ export default function Game() {
           const hudKey = JSON.stringify(hud);
           if (hudKey !== lastHudKey) { lastHudKey = hudKey; hudStore.set(hud); }
           const snap = progression.snapshot(), snapKey = JSON.stringify(snap);
-          if (snap.level > lastLevel) ambient.sfx('levelUp'); lastLevel = snap.level;
+          if (snap.level > lastLevel) { ambient.sfx('levelUp'); story.level(snap.level); } lastLevel = snap.level;
           if (snapKey !== lastSnapKey) { lastSnapKey = snapKey; setProgressionHud(snap); }
         }
         const low = combat.health > 0 && combat.health <= combat.maxHealth * .3;
@@ -1442,6 +1596,11 @@ export default function Game() {
         grabLook.set(mx, hp.y + 1 + slam * .5, mz);
         camera.position.lerp(grabCamPos, grabCam.blend < 1 ? grabCam.blend * .3 : 1 - Math.exp(-delta * 9));
         camera.lookAt(grabLook);
+      } else if (elapsed < cine.until && cine.church) {
+        // cutscene da Catedral de Luz: plano aberto girando em volta da igreja enquanto ela se ergue
+        const k = (elapsed - cine.start) / (cine.until - cine.start), { c, R, a0 } = cine.church, f = a0 + k * 1.4, d = R * (2.7 - k * .8);
+        camera.position.lerp(tmpCine.set(c.x + Math.sin(f) * d, c.y + R * (.3 + k * .55), c.z + Math.cos(f) * d), k < .12 ? k / .12 * .25 : 1 - Math.exp(-delta * 6));
+        camera.lookAt(c.x, c.y + R * (.7 + k * .25), c.z);
       } else if (elapsed < cine.until) {
         const k = (elapsed - cine.start) / (cine.until - cine.start), h = hero.root.position, f = hero.root.rotation.y + 2.25 - k * 1.1;
         const ease = k < .15 ? k / .15 : 1, d = 4.6 - k * .8;
@@ -1467,11 +1626,13 @@ export default function Game() {
       }
       if (compassNeedleRef.current) compassNeedleRef.current.style.transform = `rotate(${-cameraRig.yaw}rad)`;
       if (compassPinRef.current) {
-        const markerAngle = Math.atan2(-hero.root.position.x, -(hero.root.position.z + 12)) - cameraRig.yaw;
+        // a bússola aponta para o doador da próxima missão (ou o local/área do objetivo); sem destino, o marco
+        const goal = story.target(npc.position) ?? { x: 0, z: -12 };
+        const markerAngle = Math.atan2(goal.x - hero.root.position.x, goal.z - hero.root.position.z) - cameraRig.yaw;
         compassPinRef.current.style.left = `${42 + Math.sin(markerAngle) * 14}px`;
         compassPinRef.current.style.top = `${42 - Math.cos(markerAngle) * 14}px`;
       }
-      if (renderer.shadowMap.enabled && (qualityRef.current === 'Alta' || frameCount % 2 === 0)) renderer.shadowMap.needsUpdate = true;
+      if (renderer.shadowMap.enabled && (qualityRef.current === 'Alta' || frameCount % 2 === 0)) { followSun(hero.root.position); renderer.shadowMap.needsUpdate = true; }
       perf.render(draw);
     };
     const clock = new THREE.Clock();
@@ -1490,12 +1651,14 @@ export default function Game() {
       window.removeEventListener('beforeunload', onBeforeUnload);
       net.onMessage = () => {}; net.onRoster = () => {}; remotes.clear();
       collectSaveRef.current = () => null; loadSaveRef.current = () => {};
+      envRT?.dispose(); pmrem.dispose(); envScene.clear();
       magic.dispose(); combat.dispose(); ambient.dispose(); composer.dispose(); audioRef.current = null; rendererRef.current = null;
       qualityTargetsRef.current = null;
       cameraRigRef.current = null;
       progressionRef.current = null;
       castSpellRef.current = () => {};
       castAbilityRef.current = () => {};
+      togglePvpRef.current = () => {};
       zoltraakRef.current = { start: () => {}, release: () => {} };
       interactRef.current = () => {};
       npc.dispose();
@@ -1522,6 +1685,10 @@ export default function Game() {
     applyPixelRatioRef.current();
     const targets = qualityTargetsRef.current;
     if (targets) { targets.bloom.enabled = quality !== 'Baixa'; targets.bloom.strength = quality === 'Alta' ? .48 : .3; }
+    if (targets) {
+      const samples = quality === 'Alta' ? 4 : quality === 'Média' ? 2 : 0;
+      for (const rt of [targets.composer.renderTarget1, targets.composer.renderTarget2]) if (rt.samples !== samples) { rt.samples = samples; rt.dispose(); }
+    }
     renderer.shadowMap.enabled = quality !== 'Baixa';
     renderer.shadowMap.needsUpdate = true;
     if (targets) {
@@ -1690,11 +1857,14 @@ export default function Game() {
     <div className="cine-bars" aria-hidden="true"><i /><i /></div>
     {/* nomes sobre a cabeça dos outros jogadores (um por avatar remoto; posicionados pelo loop) */}
     <div ref={lockMarkerRef} className="lock-marker" aria-hidden="true" style={{ display: 'none' }}><i /><span /></div>
+    {playing && pvpUi.mode !== 'off' && <div className={`pvp-badge ${pvpUi.mode}`} role="status">⚔ PvP {pvpUi.mode === 'on' ? 'ligado' : pvpUi.mode === 'arming' ? `ligando em ${pvpUi.t} s` : `desligando em ${pvpUi.t} s`}<small>K</small></div>}
     <div ref={nameplatesRef} className="nameplates" aria-hidden="true">{[0, 1, 2].map(i => <div key={i} className="nameplate" style={{ display: 'none' }}><b /><span><i /></span></div>)}</div>
     {/* números de dano flutuantes e barras de vida dos inimigos (posicionados pelo loop) */}
     <div ref={mobBarsRef} className="mob-bars" aria-hidden="true">{Array.from({ length: 12 }, (_, i) => <div key={i} className="mob-bar" style={{ display: 'none' }}><i /></div>)}</div>
     <div ref={floatersRef} className="floaters" aria-hidden="true">{Array.from({ length: 28 }, (_, i) => <div key={i} className="floater" style={{ display: 'none' }} />)}</div>
     {playing && downed && <div className="downed" role="status"><strong>Você caiu</strong><span>Um aliado pode te reviver com <kbd>G</kbd> · renascendo no marco em <b ref={downedRef}>20</b> s</span><button type="button" className="mp-btn" onClick={() => respawnRef.current()}>Renascer agora (Enter)</button></div>}
+    {/* avisos fora do jogo (o toast do HUD fica oculto na tela inicial): ex. confirmação de save importado */}
+    {!playing && hint && <div className="toast title-toast" role="status"><span>✦</span>{hint}</div>}
     <input ref={importInputRef} type="file" accept=".json,application/json" hidden onChange={e => { void onImportFile(e.target.files?.[0]); e.target.value = ''; }} />
     <div ref={captionRef} className="spell-caption" aria-hidden="true"><small>INVOCAÇÃO DAS CHAMAS INFERNAIS</small><strong>Vollzanbel</strong></div>
 
@@ -1722,7 +1892,7 @@ export default function Game() {
             <button type="button" className="title-btn" onClick={() => setTitlePanel('multi')}><span className="tb-mark">◇</span>Multijogador{net.online && <small className="tb-save">online · {net.peers.size + 1} na sala</small>}</button>
             <button type="button" className="title-btn" onClick={() => setTitlePanel('options')}><span className="tb-mark">◇</span>Opções</button>
             <button type="button" className="title-btn" onClick={() => setTitlePanel('controls')}><span className="tb-mark">◇</span>Controles</button>
-            <button type="button" className="text-btn" onClick={() => importInputRef.current?.click()}>⇪ Importar save (.json)</button>
+            <button type="button" className="text-btn" onClick={() => importInputRef.current?.click()}>⇪ Carregar save (.json)</button>
           </nav>
         </> : titlePanel === 'hero' ? <div className="title-panel hero-create">
           <h2>Escolha seu herói</h2>
@@ -1779,7 +1949,11 @@ export default function Game() {
         </div>
       </header>
       <section className="quest-card"><div className="quest-kicker"><span className="tiny-star">✦</span> MEMÓRIA ESQUECIDA</div><h2>O Que Permanece</h2><p>Encontre o Marco do Herói e desperte o Eco que repousa nas pedras.</p><div className="quest-progress"><span style={{ width: `${status.discovered * 100}%` }} /></div><div className="quest-count">{status.discovered ? '1' : '0'} <span>/ 1 memória encontrada</span></div></section>
-      {(wolfQuest.stage === 'active' || wolfQuest.stage === 'ready') && <section className={`quest-card quest-card-side ${wolfQuest.stage === 'ready' ? 'is-ready' : ''}`}><div className="quest-kicker"><span className="tiny-star">✦</span> PEDIDO DE ALDREN</div><h2>Uivos no Caminho</h2><p>{wolfQuest.stage === 'ready' ? 'Os lobos foram afastados. Volte até Aldren, perto do ponto de partida.' : 'Abata lobos na mata ao norte do caminho do marco.'}</p><div className="quest-progress"><span style={{ width: `${wolfQuest.kills / WOLF_QUEST_GOAL * 100}%` }} /></div><div className="quest-count">{wolfQuest.kills} <span>/ {WOLF_QUEST_GOAL} lobos abatidos</span></div></section>}
+      {/* modo história: missões ativas (as concluídas somem na hora, com a recompensa) */}
+      {storyView.length > 0 && <section className="story-tracker" aria-label="Missões">
+        <div className="story-head"><span>✦ MODO HISTÓRIA</span><small>{storyDone}/{STORY.length}</small></div>
+        {storyView.map(q => <div key={q.id} className={`story-q ${q.daily ? 'daily' : ''} ${q.step === 'go' ? 'go' : ''}`}><small>{q.chapter}</small><b>{q.title}</b><span>{q.text}</span>{q.max > 1 && <i className="story-bar"><em style={{ width: `${q.cur / q.max * 100}%` }} /></i>}</div>)}
+      </section>}
       <div className="compass"><div className="compass-ring"><span className="compass-n">N</span><span ref={compassNeedleRef} className="compass-needle">◆</span><span ref={compassPinRef} className="compass-pin">✦</span><span className="compass-s">S</span></div><div className="compass-label"><span>◷</span> {dayLabel}</div></div>
       {shiftLocked && <div className="shift-lock-indicator">SHIFT LOCK <span>ATIVO</span></div>}
       <div className="touch-controls" aria-label="Controles de toque">
@@ -1827,7 +2001,8 @@ export default function Game() {
       </div>
       <div className="bottom-center">
         {nearDowned ? <div className="interaction"><span className="keycap">G</span><span>Reviver {nearDowned.name}</span></div>
-          : nearNpc && !npcDialog ? <div className="interaction"><span className="keycap">G</span><span>Falar com Aldren{wolfQuest.stage === 'ready' ? ' · entregar missão' : ''}</span></div>
+          : nearNpc && !npcDialog ? <div className="interaction"><span className="keycap">G</span><span>Falar com Aldren</span></div>
+        : placePrompt ? <div className="interaction"><span className="keycap">G</span><span>{placePrompt}</span></div>
           : nearLandmark && <div className="interaction"><span className="keycap">G</span><span>Ouvir o Eco do marco</span></div>}
         <div className="hotbar">
           {classDef.abilities.map((a, i) => <SpellSlot key={a.spell} store={hudStore} spell={a.spell} hotkey={a.key} label={a.label} resource={classDef.resource} signature={i === 0} cast={castAbilityRef} lockedBy={isUnlocked(heroChoice.cls, progressionHud.ranks, a.spell) ? null : unlockNode(heroChoice.cls, a.spell)?.name} />)}
@@ -1842,27 +2017,15 @@ export default function Game() {
     </div>
 
     {/* ======================= DIÁLOGO COM NPC ======================= */}
-    {playing && npcDialog && <div className="npc-dialog" role="dialog" aria-modal="true" aria-label="Conversa com Aldren">
+    {playing && npcDialog && storyDialog && <div className="npc-dialog" role="dialog" aria-modal="true" aria-label={`Conversa: ${storyDialog.speaker}`}>
       <div className="npc-dialog-box">
-        <div className="npc-speaker"><span className="npc-badge">✦</span><div><strong>Aldren</strong><small>Pastor dos Campos da Aurora</small></div></div>
-        {wolfQuest.stage === 'available' ? <>
-          <p>Ei, viajante! Espere um instante. Os lobos desceram da mata e rondam o caminho do marco. Esta semana já levaram duas das minhas ovelhas, e eu não tenho mais pernas para enfrentá-los.</p>
-          <p>Se você abater <b>{WOLF_QUEST_GOAL} lobos</b>, divido com você tudo o que aprendi andando por estes campos. Para alguém no começo da jornada, isso vale muito.</p>
-          <div className="npc-reward"><span>RECOMPENSA</span>Experiência para subir 2 níveis</div>
+        <div className="npc-speaker"><span className="npc-badge">{storyDialog.npc ? '✦' : '◈'}</span><div><strong>{storyDialog.speaker}</strong><small>{storyDialog.sub}</small></div></div>
+        {storyDialog.lines.map((l, i) => <p key={i}>{l}</p>)}
+        {storyDialog.id ? <>
+          <div className="npc-reward"><span>{storyDialog.title.toUpperCase()}</span>{storyDialog.objective}</div>
+          <div className="npc-reward"><span>RECOMPENSA</span>{storyDialog.reward} · entregue na hora ao concluir</div>
           <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.accept()}>ACEITAR MISSÃO <span>→</span></button><button type="button" className="menu-line" onClick={() => npcActionsRef.current.close()}>Agora não</button></div>
-        </> : wolfQuest.stage === 'active' ? <>
-          <p>Ainda ouço os uivos lá do norte, perto das árvores além do marco. Cuidado: eles atacam em bando e mordem rápido.</p>
-          <div className="npc-reward"><span>PROGRESSO</span>{wolfQuest.kills} / {WOLF_QUEST_GOAL} lobos abatidos</div>
-          <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.close()}>ESTOU A CAMINHO <span>→</span></button></div>
-        </> : wolfQuest.stage === 'ready' ? <>
-          <p>Os uivos pararam... Você conseguiu! Faz muito tempo que alguém não protegia estes campos como os heróis de antigamente.</p>
-          <p>Tome. Não é ouro, mas é o que um velho pastor tem de mais valioso: o que aprendi em uma vida inteira.</p>
-          <div className="npc-reward"><span>RECOMPENSA</span>+{wolfQuest.reward} XP · nível {progressionHud.level} → {progressionHud.level + 2}</div>
-          <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.turnIn()}>RECEBER RECOMPENSA <span>→</span></button></div>
-        </> : <>
-          <p>Os campos estão mais tranquilos graças a você. As ovelhas voltaram a pastar perto do marco. Que o vento esteja a seu favor, viajante.</p>
-          <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.close()}>ATÉ LOGO <span>→</span></button></div>
-        </>}
+        </> : <div className="npc-actions"><button type="button" className="continue" onClick={() => npcActionsRef.current.close()}>ATÉ LOGO <span>→</span></button></div>}
       </div>
     </div>}
 
@@ -1877,6 +2040,7 @@ export default function Game() {
             <button type="button" className="continue" onClick={closeMenus}>RETOMAR A JORNADA <span>→</span></button>
             <button type="button" className="menu-line" onClick={() => saveNow()}>Salvar jogo{savedGame && <small> · último: {new Date(savedGame.savedAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</small>}</button>
             <button type="button" className="menu-line" onClick={() => { const d = collectSaveRef.current(); if (d) { writeSave(d); setSavedGame(d); exportSave(d); } }}>Exportar save (.json)</button>
+            <button type="button" className="menu-line" onClick={() => importInputRef.current?.click()}>Carregar save (.json)<small> · substitui o progresso atual</small></button>
             <button type="button" className="menu-line" onClick={() => { setPaused(false); setPlayersOpen(true); }}>Jogadores e grupo{net.online ? ` · ${net.peers.size + 1} na sala` : ''}</button>
             <button type="button" className="menu-line" onClick={() => setPausePanel('options')}>Opções</button>
             <button type="button" className="menu-line" onClick={() => setPausePanel('controls')}>Controles</button>
@@ -1887,7 +2051,8 @@ export default function Game() {
         : help ? <><span className="modal-kicker">CAMINHOS DO VIAJANTE</span><h2>Um passo de cada vez.</h2><p>Enfrente lobos, bandidos e demônios. A mira central indica o alvo; aproxime-se dos cristais para recolher XP e itens raros.</p>{controlsPanel()}<button type="button" className="continue" onClick={closeMenus}>CONTINUAR A JORNADA <span>→</span></button></>
         : inventoryOpen ? <><span className="modal-kicker">PERTENCES DO VIAJANTE</span><h2>Inventário</h2><p>Recolha os cristais de experiência e os itens deixados pelos inimigos.</p><div className="inventory-grid"><article className="inventory-item"><span className="item-glyph">✧</span><div><strong>Fragmento de Eco</strong><small>Resíduo de energia arcana</small></div><b>{progressionHud.inventory.echoFragment}</b></article><article className="inventory-item"><span className="item-glyph">◇</span><div><strong>Núcleo de sentinela</strong><small>Material deixado pelos Ecos</small></div><b>{progressionHud.inventory.sentinelCore}</b></article>{(Object.keys(LOOT_INFO) as LootItemId[]).map(item => <article className={`inventory-item loot-${LOOT_INFO[item].rarity.toLowerCase()}`} key={item}><span className="item-glyph">{LOOT_INFO[item].rarity === 'Épico' ? '✦' : LOOT_INFO[item].rarity === 'Raro' ? '⬡' : '◇'}</span><div><strong>{LOOT_INFO[item].name}</strong><small>{LOOT_INFO[item].rarity} · {LOOT_INFO[item].source}</small></div><b>{progressionHud.inventory[item]}</b></article>)}</div><div className="inventory-footer">Nível {progressionHud.level} <span>·</span> {progressionHud.experience}/{progressionHud.nextLevelXp} XP <span>·</span> {progressionHud.skillPoints} pontos de habilidade</div><button type="button" className="continue" onClick={closeMenus}>VOLTAR À JORNADA <span>→</span></button></>
         : skillsOpen ? skillTree()
-        : <><span className="modal-kicker">DIÁRIO DE VIAGEM · 01</span><h2>O Que Permanece</h2><p>Quase mil anos se passaram desde a derrota de Valkhor. A relva tomou os velhos caminhos, e os nomes dos heróis já não são lembrados.</p><p>Um marco de pedra repousa além do prado, coberto de musgo. Talvez ainda guarde uma lembrança.</p><div className="quest-objective"><span>✦</span>{status.discovered ? 'Memória do Marco do Herói despertada' : 'Encontre o Marco do Herói nos campos'}</div>{wolfQuest.stage !== 'available' && <div className="quest-objective"><span>{wolfQuest.stage === 'done' ? '✓' : '✦'}</span>{wolfQuest.stage === 'done' ? `Uivos no Caminho · concluída (+${wolfQuest.reward} XP)` : wolfQuest.stage === 'ready' ? 'Uivos no Caminho · fale com Aldren para receber a recompensa' : `Uivos no Caminho · ${wolfQuest.kills}/${WOLF_QUEST_GOAL} lobos abatidos`}</div>}</>}
+        : <><span className="modal-kicker">DIÁRIO DE VIAGEM · 01</span><h2>O Que Permanece</h2><p>Quase mil anos se passaram desde a derrota de Valkhor. A relva tomou os velhos caminhos, e os nomes dos heróis já não são lembrados.</p><p>Um marco de pedra repousa além do prado, coberto de musgo. Talvez ainda guarde uma lembrança.</p><div className="quest-objective"><span>✦</span>{status.discovered ? 'Memória do Marco do Herói despertada' : 'Encontre o Marco do Herói nos campos'}</div>{wolfQuest.stage !== 'available' && <div className="quest-objective"><span>{wolfQuest.stage === 'done' ? '✓' : '✦'}</span>{wolfQuest.stage === 'done' ? `Uivos no Caminho · concluída (+${wolfQuest.reward} XP)` : wolfQuest.stage === 'ready' ? 'Uivos no Caminho · fale com Aldren para receber a recompensa' : `Uivos no Caminho · ${wolfQuest.kills}/${WOLF_QUEST_GOAL} lobos abatidos`}</div>}
+          <div className="story-journal"><h3>Modo História · {storyDone}/{STORY.length} missões · 🏆 {achDone}/{ACHIEVEMENTS.length} conquistas</h3><p>{CHAPTERS.map((c, i) => <span key={c} className={(() => { const open = storyView.find(v => !v.daily); return !open || CHAPTERS.indexOf(open.chapter) > i ? 'done' : ''; })()}>{c}</span>)}</p>{storyView.map(q => <div key={q.id} className="quest-objective"><span>{q.daily ? '☀' : '✦'}</span>{q.title} · {q.text}{q.max > 1 ? ` (${q.cur}/${q.max})` : ''}</div>)}</div></>}
     </div></div>}
   </main>;
 }

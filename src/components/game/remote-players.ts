@@ -7,12 +7,12 @@ import { terrainHeight } from './world';
 /* ============================================================================
  *  JOGADORES REMOTOS — avatares dos outros jogadores da sala
  *
- *  Pool FIXO de avatares criado no início (máx. 3 outros jogadores por sala de 4): cada herói tem uma
- *  PointLight (aura da arma) e o número de luzes visíveis precisa ficar constante — criar um avatar novo no
- *  meio do jogo recompilaria todos os materiais. Avatares livres ficam estacionados bem abaixo do mapa.
+ *  Pool FIXO de avatares criado no início (máx. 3 outros jogadores por sala de 4). Os avatares remotos NÃO têm
+ *  a PointLight da aura (orçamento fixo de luzes); mesmo assim, criar heróis em runtime compilaria materiais. Avatares
+ *  livres ficam ocultos (sem desenho nem skinning) e estacionados abaixo do mapa.
  * ========================================================================== */
 
-/** Estado que cada jogador envia ~15 vezes por segundo. */
+/** Estado que cada jogador envia ~20 vezes por segundo. */
 export type RemoteState = {
   x: number; y: number; z: number; yaw: number;
   /** Velocidade (m/s) no chão: quem recebe projeta a posição até a próxima atualização. */
@@ -20,6 +20,8 @@ export type RemoteState = {
   pose: HeroPose; lp: HeroPose; spd: number;
   ov: [string, number] | null; ck: string | null;
   hp: number; mhp: number; cls: HeroClass; look: Appearance; name: string;
+  /** PvP ligado (1) ou desligado (0/ausente). */
+  pvp?: number;
 };
 
 type Slot = { hero: HeroRig; id: string | null; st: RemoteState | null; cls: HeroClass | null; look: string; seen: number };
@@ -31,8 +33,8 @@ export class RemotePlayers {
 
   constructor(scene: THREE.Scene, count = 3) {
     for (let i = 0; i < count; i++) {
-      const hero = createHero(scene);
-      hero.root.position.set(i * 3, PARK_Y, 0); hero.root.name = `remote-player-${i}`;
+      const hero = createHero(scene, { auraLight: false });
+      hero.root.position.set(i * 3, PARK_Y, 0); hero.root.visible = false; hero.root.name = `remote-player-${i}`;
       this.slots.push({ hero, id: null, st: null, cls: null, look: '', seen: 0 });
     }
   }
@@ -51,7 +53,7 @@ export class RemotePlayers {
     if (!s) {
       s = this.slots.find(x => !x.id); if (!s) return false;
       s.id = id; s.st = null; s.cls = null; s.look = '';
-      s.hero.root.position.set(st.x, st.y, st.z); s.hero.root.rotation.y = st.yaw;
+      s.hero.root.position.set(st.x, st.y, st.z); s.hero.root.rotation.y = st.yaw; s.hero.root.visible = true;
     }
     if (s.cls !== st.cls) { s.cls = st.cls; s.hero.setWeapon(CLASSES[st.cls]?.weapon ?? 'staff'); s.hero.ensureStaff(); }
     const lookKey = `${st.look.body}|${st.look.joints}`;
@@ -62,7 +64,7 @@ export class RemotePlayers {
 
   remove(id: string) {
     const s = this.slots.find(x => x.id === id); if (!s) return;
-    s.id = null; s.st = null; s.hero.root.position.set(0, PARK_Y, 0);
+    s.id = null; s.st = null; s.hero.root.position.set(0, PARK_Y, 0); s.hero.root.visible = false;
   }
   clear() { for (const s of this.slots) if (s.id) this.remove(s.id); }
 

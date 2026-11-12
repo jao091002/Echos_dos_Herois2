@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { createProps, updateProps, type PropsState } from './world-props';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 export type WorldCollider = { x: number; z: number; radius: number };
 export type WorldParts = { ground: THREE.Mesh; blockers: THREE.Object3D[]; colliders: WorldCollider[]; rune: THREE.Group };
@@ -241,6 +242,85 @@ function flapMaterial(speed: number, amp: number, key: string) {
   return m;
 }
 
+/* ───────────── otimização: mesclar estáticos e dividir instâncias em blocos ───────────── */
+/** Junta os filhos Mesh estáticos de parent que dividem o mesmo material num único Mesh (1 draw por material). */
+function mergeChildren(parent: THREE.Object3D) {
+  const groups = new Map<THREE.Material, THREE.Mesh[]>();
+  for (const c of parent.children) {
+    const m = c as THREE.Mesh;
+    if (!m.isMesh || Array.isArray(m.material) || m.children.length) continue;
+    const list = groups.get(m.material) ?? []; list.push(m); groups.set(m.material, list);
+  }
+  for (const [mat, list] of groups) {
+    if (list.length < 2) continue;
+    let geos = list.map(m => { m.updateMatrix(); return m.geometry.clone().applyMatrix4(m.matrix); });
+    if (geos.some(g => !g.index)) geos = geos.map(g => (g.index ? g.toNonIndexed() : g));
+    const merged = mergeGeometries(geos);
+    geos.forEach(g => g.dispose());
+    if (!merged) continue;
+    const mesh = new THREE.Mesh(merged, mat);
+    mesh.castShadow = list.some(m => m.castShadow); mesh.receiveShadow = list.some(m => m.receiveShadow); mesh.name = `${parent.name}-merged`;
+    for (const m of list) { m.removeFromParent(); m.geometry.dispose(); }
+    parent.add(mesh);
+  }
+}
+/**
+ * Divide um InstancedMesh em blocos de size×size m (mesma geometria e material). Cada bloco ganha bounding sphere
+ * própria e frustum culling: o que está atrás da câmera deixa de ser desenhado.
+ */
+function chunkInstances(mesh: THREE.InstancedMesh, size = 32): THREE.InstancedMesh[] {
+  const parent = mesh.parent;
+  if (!parent || mesh.count < 64) return [mesh];
+  const groups = new Map<string, number[]>(), mtx = new THREE.Matrix4(), p = new THREE.Vector3(), c = new THREE.Color();
+  for (let i = 0; i < mesh.count; i++) {
+    mesh.getMatrixAt(i, mtx); p.setFromMatrixPosition(mtx);
+    const k = `${Math.floor(p.x / size)},${Math.floor(p.z / size)}`, list = groups.get(k) ?? []; list.push(i); groups.set(k, list);
+  }
+  if (groups.size < 2) return [mesh];
+  const out: THREE.InstancedMesh[] = [];
+  for (const idx of groups.values()) {
+    const ch = new THREE.InstancedMesh(mesh.geometry, mesh.material, idx.length);
+    idx.forEach((src, j) => { mesh.getMatrixAt(src, mtx); ch.setMatrixAt(j, mtx); if (mesh.instanceColor) { mesh.getColorAt(src, c); ch.setColorAt(j, c); } });
+    ch.name = mesh.name; ch.castShadow = mesh.castShadow; ch.receiveShadow = mesh.receiveShadow; ch.renderOrder = mesh.renderOrder;
+    ch.computeBoundingSphere(); ch.userData.maxInstances = idx.length;
+    parent.add(ch); out.push(ch);
+  }
+  mesh.removeFromParent(); mesh.dispose();
+  return out;
+}
+
+/* ───────────── texturas de detalhe do terreno (procedurais, repetíveis) ───────────── */
+/** Ruído periódico (repete a cada p células): textura sem emenda. */
+function pnoise(x: number, y: number, p: number) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy, u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const r = (a: number, b: number) => seeded(((a % p) + p) % p + (((b % p) + p) % p) * 131 + p * 7);
+  const a = r(ix, iy), b = r(ix + 1, iy), c = r(ix, iy + 1), d = r(ix + 1, iy + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function makeGroundDetail(n = 256) {
+  const h = new Float32Array(n * n);
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    let s = 0, amp = .5;
+    for (const f of [4, 8, 16, 32, 64]) { s += pnoise(x / n * f, y / n * f, f) * amp; amp *= .55; }
+    h[y * n + x] = s;
+  }
+  const at = (x: number, y: number) => h[((y + n) % n) * n + ((x + n) % n)];
+  const mk = () => { const c = document.createElement('canvas'); c.width = c.height = n; return c; };
+  const ca = mk(), cn = mk(), ga = ca.getContext('2d')!, gn = cn.getContext('2d')!;
+  const ia = ga.createImageData(n, n), inn = gn.createImageData(n, n), nv = new THREE.Vector3();
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const i = (y * n + x) * 4, v = h[y * n + x];
+    const g = Math.round(255 * Math.min(1, .7 + v * .38)); ia.data[i] = g; ia.data[i + 1] = g; ia.data[i + 2] = Math.round(g * .97); ia.data[i + 3] = 255;
+    nv.set((at(x - 1, y) - at(x + 1, y)) * 9, (at(x, y - 1) - at(x, y + 1)) * 9, 1).normalize();
+    inn.data[i] = (nv.x * .5 + .5) * 255; inn.data[i + 1] = (nv.y * .5 + .5) * 255; inn.data[i + 2] = (nv.z * .5 + .5) * 255; inn.data[i + 3] = 255;
+  }
+  ga.putImageData(ia, 0, 0); gn.putImageData(inn, 0, 0);
+  const map = new THREE.CanvasTexture(ca), normalMap = new THREE.CanvasTexture(cn);
+  map.colorSpace = THREE.SRGBColorSpace;
+  for (const t of [map, normalMap]) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(80, 80); t.anisotropy = 8; }
+  return { map, normalMap };
+}
+
 /* ───────────── monumento ───────────── */
 function makeLandmark(scene: THREE.Scene, stoneMat: THREE.Material, colliders: WorldCollider[], blockers: THREE.Object3D[]) {
   const group = new THREE.Group();
@@ -290,17 +370,21 @@ function makeLandmark(scene: THREE.Scene, stoneMat: THREE.Material, colliders: W
   const ringMaterial = new THREE.MeshBasicMaterial({ color: '#7ad8c0', transparent: true, opacity: .18, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
   const ring = new THREE.Mesh(new THREE.RingGeometry(3.15, 3.95, 56), ringMaterial); ring.rotation.x = -Math.PI / 2; ring.position.y = .06; group.add(ring);
 
-  const stoneLight = new THREE.PointLight('#d9c78e', .65, 9, 2); stoneLight.position.set(0, 2.8, 1.5); group.add(stoneLight);
+  // uma luz só no monumento (antes cristal + pedra): menos uma PointLight em todos os shaders
+  const stoneLight = crystalLight;
 
   // círculo de pedras erguidas (abre passagem para a trilha)
+  const circle = new THREE.Group(); circle.name = 'stone-circle';
   for (let k = 0; k < 9; k++) {
     const a = k / 9 * Math.PI * 2 + .3;
     if (Math.abs(Math.cos(a)) < .3) continue;
     const x = Math.cos(a) * 7, z = -12 + Math.sin(a) * 7, hgt = 1.7 + seeded(k + 40) * 1.2;
     const m = new THREE.Mesh(stoneify(new THREE.BoxGeometry(.75, hgt, .55, 2, 4, 2), .12, '#8e8e80', .5), stoneMat);
     m.position.set(x, terrainHeight(x, z) + hgt / 2 - .1, z); m.rotation.set((seeded(k + 70) - .5) * .12, seeded(k + 80) * 3, (seeded(k + 90) - .5) * .14);
-    m.castShadow = m.receiveShadow = true; scene.add(m); blockers.push(m); colliders.push({ x, z, radius: .5 });
+    m.castShadow = m.receiveShadow = true; circle.add(m); colliders.push({ x, z, radius: .5 });
   }
+  mergeChildren(circle); scene.add(circle); blockers.push(circle);
+  mergeChildren(group); // degraus, fuste, glifos e ouro: 1 draw por material
   scene.add(group);
   return { group, rune, crystal, orbit, crystalMaterial, glyphMaterial, ringMaterial, stoneLight };
 }
@@ -331,16 +415,11 @@ export function createWorld(scene: THREE.Scene): WorldParts {
     gc[i * 3] = col.r; gc[i * 3 + 1] = col.g; gc[i * 3 + 2] = col.b;
   }
   gg.setAttribute('color', new THREE.BufferAttribute(gc, 3));
-  const groundMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: .97 });
-  groundMaterial.onBeforeCompile = shader => {
-    shader.vertexShader = `varying vec3 vMeadowPosition;\n${shader.vertexShader}`.replace('#include <begin_vertex>', '#include <begin_vertex>\nvMeadowPosition = (modelMatrix * vec4(position, 1.0)).xyz;');
-    shader.fragmentShader = `varying vec3 vMeadowPosition;\n${shader.fragmentShader}`.replace('#include <color_fragment>', `#include <color_fragment>
-      float broad = sin(vMeadowPosition.x * .19 + sin(vMeadowPosition.z * .13)) * cos(vMeadowPosition.z * .16);
-      float fine = sin(vMeadowPosition.x * 2.7 + vMeadowPosition.z * 1.9) * cos(vMeadowPosition.z * 2.4 - vMeadowPosition.x * .7);
-      float grain = fract(sin(dot(floor(vMeadowPosition.xz * 12.0), vec2(12.9898, 78.233))) * 43758.5453);
-      diffuseColor.rgb *= 0.95 + broad * .05 + fine * .02 + grain * .07;`);
-  };
-  groundMaterial.customProgramCacheKey = () => 'aurora-meadow-v3';
+  // realismo barato: textura de detalhe (albedo) + normal map repetidos a cada ~3 m sobre a cor por vértice
+  // (antes: ruído por pixel em senos, mais caro e sem relevo de luz)
+  const detail = makeGroundDetail();
+  const groundMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: .95, map: detail.map, normalMap: detail.normalMap, normalScale: new THREE.Vector2(.85, .85) });
+  groundMaterial.color.setScalar(1.12); // compensa o escurecimento médio da textura de detalhe
   const ground = new THREE.Mesh(gg, groundMaterial);
   ground.name = 'ground'; ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
 
@@ -566,7 +645,7 @@ export function createWorld(scene: THREE.Scene): WorldParts {
   const pathMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   const path = makeRibbon(pathPoints, widths, pathMat, '#9c8a66', '#7f8a5c'); path.name = 'waystone-trail'; path.receiveShadow = true; scene.add(path);
   const pebbles = new THREE.InstancedMesh(stoneify(new THREE.IcosahedronGeometry(.12, 0), .05, '#ffffff'), rockMat.clone(), 110);
-  pebbles.material.alphaHash = false; pebbles.castShadow = pebbles.receiveShadow = true;
+  pebbles.material.alphaHash = false; pebbles.castShadow = false; pebbles.receiveShadow = true; // pequenas demais para valer o shadow pass
   for (let i = 0; i < 110; i++) {
     const t = seeded(i + 9000), z = 10 - t * 31, x = pathX(z) + (seeded(i + 9100) > .5 ? 1 : -1) * (1.55 + seeded(i + 9200) * .5), s = .6 + seeded(i + 9300) * 1.2;
     temp.position.set(x, terrainHeight(x, z) + .04, z); temp.scale.set(s, s * .6, s); temp.rotation.set(0, seeded(i + 9400) * 6, 0); temp.updateMatrix();
@@ -585,7 +664,7 @@ export function createWorld(scene: THREE.Scene): WorldParts {
   block(.75, .5, .75, 1.65, 1.95, .1, .15, .5, .35, .5);
   block(4.2, .55, .85, .2, 2.65, 0, 0, 0, -.5, .5);
   block(1.7, .4, .65, 2.8, .2, 1.4, 0, .3, .1); block(.7, .7, .7, -2.6, .35, 1.2, 0, .6, 0); block(1.3, .25, 1.1, 0, .12, 1.8, 0, .2, 0, .5);
-  scene.add(ruin); blockers.push(ruin); colliders.push({ x: -13.6, z: -21, radius: .65 }, { x: -10.4, z: -21, radius: .65 });
+  mergeChildren(ruin); scene.add(ruin); blockers.push(ruin); colliders.push({ x: -13.6, z: -21, radius: .65 }, { x: -10.4, z: -21, radius: .65 });
 
   // vagalumes / poeira luminosa
   const motePositions: number[] = [];
@@ -624,6 +703,9 @@ export function createWorld(scene: THREE.Scene): WorldParts {
 
   const props = createProps(scene, stoneMat, colliders, blockers);
   props.scalable.forEach(keepMax);
+  // vegetação miúda em blocos de 32 m: cada bloco tem bounding sphere própria e o frustum culling volta a valer
+  const chunked = scalable.flatMap(m => chunkInstances(m));
+  scalable.length = 0; scalable.push(...chunked);
 
   const env: Environment = {
     grass, grassMaterial, bloomMeshes: [heads, stems], moteMaterial, motes, skyMaterial, sunDisc, moon, scalable,
@@ -696,7 +778,7 @@ export function updateDayCycle(scene: THREE.Scene, sun: THREE.DirectionalLight, 
   sun.position.set(Math.cos(phase) * 46, 14 + sunArc * 43, Math.sin(phase * .5) * 19);
   sun.intensity = .16 + daylight * 2.72;
   sun.color.set('#fff0d9').lerp(cycleSunset, dusk * .55);
-  sky.intensity = .52 + daylight * 1.45;
+  sky.intensity = .42 + daylight * 1.1; // o ambiente (IBL) do céu completa a luz indireta
   sky.color.copy(cycleSkyColor).lerp(cycleDawn, dusk * .42);
   sky.groundColor.set('#26303d').lerp(cycleGroundDay, daylight * .62);
   cycleSky.copy(cycleNight).lerp(cycleDawn, Math.max(dusk, .06)).lerp(cycleDay, daylight);
@@ -713,7 +795,7 @@ export function updateDayCycle(scene: THREE.Scene, sun: THREE.DirectionalLight, 
     env.sunDisc.position.copy(tmpV).multiplyScalar(168); env.sunDisc.visible = sunArc > -.1;
     env.moon.position.copy(tmpV).multiplyScalar(-168); env.moon.visible = sunArc < .1;
     env.glow = .45 + (1 - daylight) * 1.7;
-    env.stoneLight.intensity = .4 + (1 - daylight) * 1.8;
+    env.stoneLight.intensity = .7 + (1 - daylight) * 1.6;
     env.moteMaterial.opacity = .25 + (1 - daylight) * .7;
     env.butterflies.visible = daylight > .2; env.birds.visible = daylight > .15;
   }
