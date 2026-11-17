@@ -80,6 +80,12 @@ export const CLEARINGS = [
   { x: -19, z: -45, r: 7 },   // acampamento dos bandidos
   { x: 42, z: -46, r: 7.5 },  // torre em ruínas
   { x: 3, z: 8.5, r: 1.6 },   // placa
+  // locais novos (as construções ficam em activities.ts → LANDMARKS: mantenha as posições iguais)
+  { x: 34, z: 30, r: 8 },     // Círculo das Pedras
+  { x: -30, z: -8, r: 5 },    // Poço dos Sussurros
+  { x: -40, z: 46, r: 7.5 },  // Árvore Anciã
+  { x: 52, z: -6, r: 6.5 },   // Portal Arruinado
+  { x: 10, z: -72, r: 6.5 },  // Obelisco do Norte
 ];
 export function inClearing(x: number, z: number, pad = 0) { return CLEARINGS.some(c => Math.hypot(x - c.x, z - c.z) < c.r + pad); }
 

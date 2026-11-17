@@ -720,11 +720,13 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
   const pageMat = new THREE.MeshStandardMaterial({ color: '#fff6d8', emissive: '#f3d27a', emissiveIntensity: 0.6, roughness: 0.8, side: THREE.DoubleSide });
   const coverMat = toon('#4a3324');
   const book = new THREE.Group(); book.name = 'weapon-book'; staff.add(book);
+  /** Metades do livro (índice 0 = esquerda, 1 = direita): giram na lombada para abrir/fechar. */
+  const bookHalves: THREE.Group[] = [];
   {
-    // segurado pela lombada, aberto em "V" voltado para a frente
+    // segurado pela lombada; abre em "V" voltado para a frente só ao conjurar (ver BOOK_OPEN/BOOK_SHUT)
     book.position.set(0.02, 0.06, 0.08); book.rotation.set(-0.35, 0, 0);
     for (const s of [-1, 1] as const) {
-      const half = new THREE.Group(); half.rotation.y = s * 0.32; book.add(half);
+      const half = new THREE.Group(); half.rotation.y = s * 0.32; book.add(half); bookHalves.push(half);
       part(new THREE.BoxGeometry(0.17, 0.25, 0.012), coverMat, half, [s * 0.088, 0, -0.004], { outline: true });               // capa
       part(new THREE.BoxGeometry(0.155, 0.23, 0.02), pageMat, half, [s * 0.082, 0, 0.012], { shadow: false });                 // bloco de páginas
       part(new THREE.BoxGeometry(0.008, 0.25, 0.016), mat.gold, half, [s * 0.172, 0, 0.0], { shadow: false });                 // canto dourado
@@ -811,16 +813,45 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
   let blinkWait = 2.4, blinkP = 0, earWait = 3;
   // ociosidade: pequenos gestos ("fidgets") e passinhos ao girar parada
   let idleClock = 0, fidget = -1, fidgetKind = 2, fidgetT = 0, nextFidget = 7;
-  // cajado: em mãos ou preso nas costas (diagonal); troca animada
+  // arma: em mãos ou guardada (troca animada). Cajado e machado vão nas costas em diagonal; o livro, fechado,
+  // pendurado no quadril esquerdo (a mão direita cruza o corpo para sacar, como uma espada na cintura)
   let staffEquipped = true, swapT = -1, swapTo = true, staffPlant = 0;
-  const sv1 = new THREE.Vector3(), sv2 = new THREE.Vector3(), sv3 = new THREE.Vector3();
+  /** Livro: 0 = fechado, 1 = aberto (abre ao conjurar). Cajado: quanto a mão desce na haste ao correr (m). */
+  let bookOpen = 0, staffSlide = 0, slideWant = 0;
+  const sv1 = new THREE.Vector3(), sv2 = new THREE.Vector3(), sv3 = new THREE.Vector3(), sv4 = new THREE.Vector3();
   const backMount = new THREE.Group(); backMount.name = 'staff-back-mount';
   backMount.position.set(0.02, 0.16, -0.2); backMount.rotation.set(0.12, 0, 0.62); chest.add(backMount);
+  const hipMount = new THREE.Group(); hipMount.name = 'weapon-hip-mount';
+  hipMount.position.set(0.3, -0.02, 0.02); pelvis.add(hipMount);
+  /**
+   * Como cada arma fica guardada (no espaço do encaixe). Cajado: diagonal mais fechada que o encaixe, para a
+   * ponta não passar do joelho. Machado: girado 90° na haste para as lâminas ficarem rentes às costas (antes
+   * atravessavam o tronco), cabeça logo acima do ombro direito. Livro: fechado, capa rente à lateral do quadril.
+   */
+  const STOW: Record<WeaponKind, { mount: 'back' | 'hip'; pos: [number, number, number]; rot: [number, number, number] }> = {
+    staff: { mount: 'back', pos: [-0.05, -0.3, -0.01], rot: [0, 0, -0.24] },
+    axe: { mount: 'back', pos: [-0.08, -0.5, -0.03], rot: [0, PI / 2, -0.3] },
+    mace: { mount: 'hip', pos: [0.01, -0.12, 0], rot: [PI, 0, 0.12] },
+    book: { mount: 'hip', pos: [0, -0.02, 0.04], rot: [0.12, 0, 0] },
+  };
   const placeStaff = (inHand: boolean) => {
     if (inHand) { staffMount.add(staff); staff.position.set(0, 0, 0); }
-    else { backMount.add(staff); staff.position.set(0, -0.42, 0); staff.quaternion.identity(); }
+    else {
+      const s = STOW[weapon];
+      (s.mount === 'hip' ? hipMount : backMount).add(staff);
+      staff.position.set(...s.pos); staff.rotation.set(s.rot[0], s.rot[1], s.rot[2], 'ZYX'); // gira na haste, depois inclina
+      staffPlant = 0; staffSlide = 0;
+    }
     staffEquipped = inHand;
   };
+  /** Livro aberto (o) ou fechado na mão/no quadril: metades giram na lombada e o livro sobe para a frente ao abrir. */
+  const poseBook = (o: number) => {
+    const e = o * o * (3 - 2 * o);
+    bookHalves.forEach((h, i) => { h.rotation.y = (i === 0 ? -1 : 1) * lerp(PI / 2 - 0.05, 0.32, e); });
+    book.position.set(lerp(0, 0.02, e), lerp(-0.03, 0.06, e), lerp(0.05, 0.08, e)); // fechado: a mão segura as capas pelo meio
+    book.rotation.set(lerp(0, -0.35, e), 0, 0);
+  };
+  poseBook(0);
   // olhos: pequenas sacadas (movimentos rápidos e naturais do olhar)
   let saccadeWait = 1.5; const saccade = { x: 0, y: 0, tx: 0, ty: 0 };
   // reação a dano: lado aleatório a cada golpe
@@ -1072,6 +1103,7 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
     const socket = (key: string) => { const obj = new THREE.Group(); body.add(obj); sockets.push({ obj, idx: idxOf.get(byName[key])! }); return obj; };
     const handR = socket(`${sideR}Hand`), chestS = socket('Spine2');
     chestS.add(backMount); backMount.position.set(0.02, 0.12, -0.16);
+    socket('Hips').add(hipMount); hipMount.position.set(0.21, -0.03, 0.0); // quadril esquerdo do Xbot
     handR.add(staffMount); staffMount.position.set(0.0, -0.085, 0.0);
     const handL = socket(`${sideL}Hand`); handL.add(offhand); offhand.position.set(0, -0.05, 0);
     const keep = new Set<THREE.Object3D>([staffMount, holder, ...sockets.map(sk => sk.obj)]);
@@ -1210,7 +1242,7 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
     shieldPoint,
     attachBody,
     addClips,
-    setWeapon(kind) { weapon = kind; applyWeapon(); },
+    setWeapon(kind) { weapon = kind; applyWeapon(); if (!staffEquipped) placeStaff(false); },
     setAppearance(look) { mat.xbSurface.color.set(look.body); mat.xbJoint.color.set(look.joints); },
     toggleStaff() { if (swapT < 0) { swapT = 0; swapTo = !staffEquipped; } return swapTo; },
     ensureStaff() { swapT = -1; if (!staffEquipped) placeStaff(true); },
@@ -1246,7 +1278,7 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
       if (pose === 'jump' || pose === 'fall') airMinVy = min(airMinVy, sVel.y);
 
       /* ---- alvos da pose */
-      resetTargets();
+      resetTargets(); slideWant = 0;
       const A_LEAN = clamp(aL.z * 0.004, -0.12, 0.12);
 
       /**
@@ -1315,6 +1347,33 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
         setJ('armR', lerp(-0.08 - sin(lagP) * B * 0.3, -0.25 - sin(lagP) * 0.3, g), 0, lerp(0.1, 0.12, g));
         setJ('elbowR', lerp(-0.5 - max(0, sin(lagP)) * 0.12, -1.0, g)); setJ('wristR', -0.4);
         P.staffP.t = lerp(0.04 - sin(lagP) * 0.06, -0.62, g); P.staffR.t = lerp(-0.06, -0.22, g);
+        // como cada arma vai na corrida (só com ela em mãos)
+        if (staffEquipped && swapT < 0) {
+          if (weapon === 'staff') {
+            // cajado "à lança": quase na horizontal ao lado do corpo, cabeça à frente e um pouco erguida, a mão no
+            // ponto de equilíbrio da haste (a arma desce pela mão). O braço balança solto, com metade da amplitude do
+            // esquerdo (peso), e o cajado acompanha com atraso: a ponta mergulha quando o braço vai à frente.
+            // Antes ele ficava congelado num ângulo só, com a ponta de baixo apontada para o chão à frente.
+            const sw = sin(lagP) * B * (0.6 + 0.4 * abs(fwd));
+            slideWant = -0.28 * g;
+            setJ('armR', lerp(J.armR.x.t, -sw * 0.45 + 0.05, g), 0, lerp(J.armR.z.t, 0.16, g));
+            setJ('elbowR', lerp(J.elbowR.x.t, -0.75 - max(0, sw) * 0.25, g)); setJ('wristR', lerp(-0.4, -0.05, g));
+            P.staffP.t = lerp(P.staffP.t, 1.28 + sin(lagP - 0.5) * 0.06 + sw * 0.18, g);
+            P.staffR.t = lerp(P.staffR.t, 0.04, g); P.staffY.t = lerp(0, -0.07, g); P.curlR.t = 1;
+          } else if (weapon === 'axe') {
+            // porte de batalha: haste em diagonal à frente do corpo, cabeça junto ao ombro esquerdo, as duas mãos
+            // nela (a esquerda por IK); o machado sacode com a passada em vez de ser arrastado como um cajado
+            setJ('armR', lerp(J.armR.x.t, -0.5 + sin(lagP) * 0.05, g), 0, lerp(J.armR.z.t, 0.2, g));
+            setJ('elbowR', lerp(J.elbowR.x.t, -1.3, g)); setJ('wristR', lerp(-0.4, -0.15, g));
+            P.staffP.t = lerp(P.staffP.t, -0.02 + sin(phi * 2) * 0.03, g); P.staffY.t = 0.12 * g; P.staffR.t = lerp(P.staffR.t, 0.85, g);
+            P.gripL.t = g; P.gripY.t = 0.5; P.curlL.t = lerp(P.curlL.t, 1, g);
+          } else if (weapon === 'book') {
+            // livro fechado: o braço direito balança como o esquerdo (espelhado) e o livro acompanha a mão
+            const sw = sin(lagP) * B * (0.6 + 0.4 * abs(fwd));
+            setJ('armR', -sw * 0.85, 0, lerp(0.1, 0.12, g)); setJ('elbowR', J.elbowL.x.t * 0.9); setJ('wristR', 0.1);
+            P.staffP.t = -sw * 0.7; P.staffR.t = -0.06; P.curlR.t = 1;
+          }
+        }
         // inclinação: para frente ao avançar, levemente para trás de costas, rolagem no strafe
         const lean = lerp(0.03, 0.16, g) + clamp(planar * lerp(0.02, 0.012, g), 0, lerp(0.12, 0.1, g));
         P.pitch.t = lean * (back ? -0.45 : 0.3 + 0.7 * abs(fwd));
@@ -1796,10 +1855,17 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
       if (swapT >= 0) {
         swapT += dt;
         const u = clamp(swapT / 0.6, 0, 1);
-        // mão direita alcança por cima do ombro, agarra/solta o cajado e volta
-        setJ('armR', kf(u, [[0, -0.1], [0.42, -2.55], [0.55, -2.5], [1, -0.2]]), 0, kf(u, [[0, 0.1], [0.42, -0.35], [0.55, -0.3], [1, 0.1]]));
-        setJ('elbowR', kf(u, [[0, -0.4], [0.42, -2.1], [0.55, -2.0], [1, -0.45]])); setJ('wristR', kf(u, [[0, 0], [0.42, -0.4], [1, -0.3]]));
-        addJ('chest', 0, kf(u, [[0, 0], [0.42, 0.28], [1, 0]]), kf(u, [[0, 0], [0.42, -0.08], [1, 0]])); addJ('head', 0, kf(u, [[0, 0], [0.42, 0.35], [1, 0]]));
+        if (STOW[weapon].mount === 'hip') {
+          // arma na cintura (livro): a mão direita cruza o corpo até o quadril esquerdo, o tronco gira e olha para baixo
+          setJ('armR', kf(u, [[0, -0.1], [0.42, -0.3], [0.55, -0.28], [1, -0.2]]), 0, kf(u, [[0, 0.1], [0.42, -0.62], [0.55, -0.58], [1, 0.1]]));
+          setJ('elbowR', kf(u, [[0, -0.4], [0.42, -1.05], [0.55, -1.0], [1, -0.45]])); setJ('wristR', kf(u, [[0, 0], [0.42, 0.25], [1, 0.1]]));
+          addJ('chest', kf(u, [[0, 0], [0.42, 0.14], [1, 0]]), kf(u, [[0, 0], [0.42, -0.3], [1, 0]])); addJ('head', kf(u, [[0, 0], [0.42, 0.3], [1, 0]]), kf(u, [[0, 0], [0.42, -0.25], [1, 0]]));
+        } else {
+          // mão direita alcança por cima do ombro, agarra/solta a arma e volta
+          setJ('armR', kf(u, [[0, -0.1], [0.42, -2.55], [0.55, -2.5], [1, -0.2]]), 0, kf(u, [[0, 0.1], [0.42, -0.35], [0.55, -0.3], [1, 0.1]]));
+          setJ('elbowR', kf(u, [[0, -0.4], [0.42, -2.1], [0.55, -2.0], [1, -0.45]])); setJ('wristR', kf(u, [[0, 0], [0.42, -0.4], [1, -0.3]]));
+          addJ('chest', 0, kf(u, [[0, 0], [0.42, 0.28], [1, 0]]), kf(u, [[0, 0], [0.42, -0.08], [1, 0]])); addJ('head', 0, kf(u, [[0, 0], [0.42, 0.35], [1, 0]]));
+        }
         P.curlR.t = kf(u, [[0, 1], [0.35, 0.1], [0.5, 1], [1, 1]]); P.gripL.t = 0;
         if (u >= 0.5 && staffEquipped !== swapTo) placeStaff(swapTo);
         if (u >= 1) swapT = -1;
@@ -1864,6 +1930,14 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
         hd.thumb.rotation.z = (i === 0 ? -1 : 1) * (0.5 - c * 0.25);
       });
 
+      /* ---- livro: abre ao conjurar (ou sustentar uma magia) com ele em mãos; fechado no resto do tempo */
+      if (weapon === 'book') {
+        const want = staffEquipped && swapT < 0 && (pose === 'cast' || !!overlay) ? 1 : 0;
+        const before = bookOpen;
+        bookOpen += (want - bookOpen) * (1 - Math.exp(-dt * (want ? 11 : 6)));
+        if (abs(bookOpen - before) > 1e-4 || (want === 0 && bookOpen > 0 && bookOpen < 1e-3)) poseBook(bookOpen < 1e-3 ? 0 : bookOpen);
+      }
+
       /* ---- cajado: orientação em espaço-mundo, independente da lag das molas do braço */
       if (staff.parent === staffMount) {
         staffMount.getWorldQuaternion(qParent);
@@ -1884,11 +1958,14 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
           shift = clamp(terrainHeight(butt.x, butt.z) + 0.03 + lift - butt.y, -0.4, 0.4);
         }
         staffPlant += (shift - staffPlant) * (1 - Math.exp(-dt * (shift !== 0 ? 14 : 7)));
+        // a mão desliza pela haste (corrida com o cajado): a arma sobe ao longo do próprio eixo
+        staffSlide += (slideWant - staffSlide) * (1 - Math.exp(-dt * 8));
+        const slide = sv4.set(0, staffSlide, 0).applyQuaternion(staff.quaternion);
         if (abs(staffPlant) > 1e-4) {
           staffMount.updateWorldMatrix(true, false); staffMount.getWorldPosition(sv1);
           const a = staffMount.worldToLocal(sv2.copy(sv1)), b = staffMount.worldToLocal(sv3.copy(sv1).setY(sv1.y + staffPlant));
-          staff.position.copy(b).sub(a);
-        } else staff.position.set(0, 0, 0);
+          staff.position.copy(b).sub(a).add(slide);
+        } else staff.position.copy(slide);
       }
 
       /* ---- IK da mão esquerda segurando o cajado */

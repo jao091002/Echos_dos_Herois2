@@ -711,3 +711,16 @@
 .world-event { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); z-index: 4; padding: 4px 12px; font: 600 11px var(--sans); letter-spacing: .12em; color: #fff0c4; background: rgba(40, 32, 10, .72); border: 1px solid rgba(240, 200, 110, .55); pointer-events: none; animation: toast-in .4s var(--ease) }
 .story-q.go b { color: var(--gold-bright, #f6dd95) }
 .story-q.go b::before { content: '➜ '; color: var(--gold) }
+
+/* atividades do mundo: evento cronometrado no topo do rastreador e missões de exploração em linha compacta */
+.story-q.event { padding: 0 0 8px; border-top: 0; border-bottom: 1px solid var(--line); animation: event-in .5s ease-out }
+.story-q.event small { color: #ffd98a }
+.story-q.event b { color: #fff3cf }
+.event-timer { font: 700 11px var(--sans); font-style: normal; letter-spacing: .06em; color: #fff }
+.event-timer.low { color: #ff8a7a; animation: event-pulse .5s steps(2) infinite }
+.story-q.mini { grid-template-columns: 1fr auto; align-items: baseline; gap: 2px 8px }
+.story-q.mini b { font-size: 12px }
+.story-q.mini small { color: #cfc6a8; letter-spacing: .06em }
+.story-q.mini .story-bar { grid-column: 1 / -1 }
+@keyframes event-in { from { opacity: 0; transform: translateX(14px) } to { opacity: 1; transform: none } }
+@keyframes event-pulse { 50% { opacity: .35 } }

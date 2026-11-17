@@ -1,6 +1,7 @@
 import type { HeroChoice } from './classes';
 import type { InventorySnapshot } from './progression';
 import type { StorySave } from './story';
+import type { ActivitySave } from './activities';
 
 /* ============================================================================
  *  SAVE LOCAL — o progresso fica só na máquina do jogador
@@ -20,6 +21,8 @@ export type SaveData = {
   position: { x: number; y: number; z: number; yaw: number };
   /** Modo história: missões concluídas e progresso das ativas (saves antigos não têm). */
   story?: StorySave;
+  /** Atividades do mundo: ecos e baús já recolhidos, locais descobertos (saves antigos não têm). */
+  activities?: ActivitySave;
 };
 
 const KEY = 'ecos.save.v1';
@@ -53,6 +56,7 @@ export async function importSave(file: File): Promise<SaveData | null> {
 function validate(v: unknown): SaveData | null {
   const d = v as SaveData;
   if (!d || d.version !== 1 || typeof d.progression?.level !== 'number' || !d.choice?.cls || !d.choice?.look) return null;
+  const ints = (a: unknown) => (Array.isArray(a) ? a.filter((n): n is number => Number.isInteger(n)) : []);
   const num = (x: unknown, def: number) => (typeof x === 'number' && Number.isFinite(x) ? x : def);
   return {
     version: 1, savedAt: num(d.savedAt, Date.now()), name: String(d.name ?? '').slice(0, 16),
@@ -67,5 +71,6 @@ function validate(v: unknown): SaveData | null {
     markerRemembered: !!d.markerRemembered,
     position: { x: num(d.position?.x, 0), y: num(d.position?.y, 0), z: num(d.position?.z, 2), yaw: num(d.position?.yaw, Math.PI) },
     story: Array.isArray(d.story?.done) ? { done: d.story.done.filter(s => typeof s === 'string'), prog: typeof d.story.prog === 'object' && d.story.prog ? d.story.prog : {}, stats: typeof d.story.stats === 'object' && d.story.stats ? d.story.stats : {}, acc: Array.isArray(d.story.acc) ? d.story.acc.filter(s => typeof s === 'string') : [] } : undefined,
+    activities: d.activities && typeof d.activities === 'object' ? { echoes: ints(d.activities.echoes), chests: ints(d.activities.chests), places: Array.isArray(d.activities.places) ? d.activities.places.filter(p => typeof p === 'string') : [] } : undefined,
   };
 }

@@ -66,6 +66,8 @@ const zeroCooldowns =() => Object.fromEntries(SPELL_IDS.map(id => [id, 0])) as R
 /* ------------------------------------------------------------------ *
  *  Tunables / helpers
  * ------------------------------------------------------------------ */
+/** Raio (m) do Santuário do clérigo antes do multiplicador de tamanho. */
+const SANTUARIO_R = 9.5;
 const TAU = Math.PI * 2;
 const UP = new THREE.Vector3(0, 1, 0);
 const FWD = new THREE.Vector3(0, 0, 1);
@@ -1173,7 +1175,7 @@ export class MagicSystem {
   private remoteVoll: number[] = [];
   remoteFx(spell: SpellId, origin: Vec3, dir: Vec3, target: Vec3) {
     // Santuário de outro clérigo: a Catedral aparece (só visual), se a minha não estiver em uso
-    if (spell === 'santuario' && !this.santuario) { this.church.show(this.groundAt(origin), 6.5); this.churchClock.t = 0; this.churchClock.life = 8; return; }
+    if (spell === 'santuario' && !this.santuario) { this.church.show(this.groundAt(origin), SANTUARIO_R); this.churchClock.t = 0; this.churchClock.life = 8; return; }
     // Vollzanbel: o efeito real (só visual) forma-se no cajado do outro jogador e voa até o alvo — legível no PvP.
     // No máx. 2 simultâneos de outros jogadores (orçamento de efeitos); acima disso cai no rastro genérico abaixo.
     const now = performance.now();
@@ -1307,8 +1309,8 @@ export class MagicSystem {
     this.flashLight(origin, C.gold, 5, .3, 8);
     this.onSfx('lightning', .5);
   }
-  /** Santuário (clérigo): domo sagrado no chão — dentro dele: −35% de dano recebido e cura contínua. */
-  private santuario: { center: THREE.Vector3; R: number; t: number; life: number; tick: number; dome: THREE.Mesh; mat: THREE.ShaderMaterial } | null = null;
+  /** Santuário (clérigo): domínio sagrado no chão — dentro dele: −35% de dano recebido e cura contínua. */
+  private santuario: { center: THREE.Vector3; R: number; t: number; life: number; tick: number } | null = null;
   /** Catedral de Luz (visual do Santuário): construída uma vez, reaproveitada a cada lançamento. */
   private church!: Church;
   private readonly churchClock = { t: 0, life: 8 };
@@ -1317,15 +1319,11 @@ export class MagicSystem {
   get insideSantuario() { const s = this.santuario; if (!s) return false; const p = this.player.position; return Math.hypot(p.x - s.center.x, p.z - s.center.z) < s.R; }
   private santuarioFx() {
     if (this.santuario) this.santuario.t = this.santuario.life; // um novo substitui o anterior
-    // maior que antes (4,6 m) e com a Catedral de Luz erguendo-se em volta (ver sanctuary-church.ts)
-    const center = this.groundAt(this.player.position), R = 6.5 * this.progression.sizeMultiplier(), life = this.buffSecs(8);
+    // invocação em forma de domínio: a barreira se expande a partir do clérigo, o selo se abre no piso e a
+    // Catedral de Luz se materializa dentro dela (barreira, selo e catedral ficam em sanctuary-church.ts)
+    const center = this.groundAt(this.player.position), R = SANTUARIO_R * this.progression.sizeMultiplier(), life = this.buffSecs(8);
     this.church.show(center, R); this.churchClock.t = 0; this.churchClock.life = life;
-    this.sigil(center, UP, 'sun', C.gold, R, life, { spin: .35, grow: 0, hold: .9 });
-    this.sigil(center, UP, 'rune', C.mana, R * .6, life, { spin: -.6, grow: 0, hold: .9 });
-    const mat = this.fresnelMaterial(C.paleGold, 2.2, .9, .5), dome = new THREE.Mesh(this.geo.sphere, mat);
-    dome.position.copy(center); dome.scale.set(R, R * .7, R);
-    this.addEffect(dome, life, u => { mat.uniforms.uAlpha.value = Math.min(1, u * life / .3) * (u > .9 ? (1 - u) / .1 : 1) * .12; }); // domo discreto: a catedral é o destaque
-    this.santuario = { center, R, t: 0, life, tick: 0, dome, mat };
+    this.santuario = { center, R, t: 0, life, tick: 0 };
     this.shock(center, UP, C.paleGold, R * 1.2, .5); this.flashLight(center.clone().setY(center.y + 1.5), C.gold, 6, .6, 10);
     this.burst(center, 40, 3, C.paleGold, C.mana, { up: 1.4, spread: 1.2, size: .22, life: 1.4, grav: -1.5 });
     this.onSfx('shieldUp');

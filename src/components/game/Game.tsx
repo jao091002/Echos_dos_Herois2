@@ -19,6 +19,7 @@ import { QuestGiver, type QuestStage } from './npc';
 import { NetClient, r2, defaultServer, listRooms, OFFICIAL_SERVER, isP2P, type NetMsg, type RoomInfo } from './net';
 import { RemotePlayers, type RemoteState } from './remote-players';
 import { PvpGuard, canHarm, pvpDamage, PVP_ARM_SECS, PVP_DISARM_SECS, PVP_KILL_XP } from './pvp';
+import { WorldActivities, type ActivityView } from './activities';
 import { StoryLog, STORY, CHAPTERS, ACHIEVEMENTS, PLACES, type StoryView, type StoryOffer, type MobKind, type PlaceId } from './story';
 /** Diálogo da história: oferta de missão (id) ou fala de acompanhamento (id null). */
 type StoryDialog = Omit<StoryOffer, 'id'> & { id: string | null; npc: boolean };
@@ -233,6 +234,9 @@ export default function Game() {
   /** Modo história: missões visíveis (as concluídas somem) e quantas da história já foram feitas. */
   const [storyView, setStoryView] = useState<StoryView>([]);
   const [storyDone, setStoryDone] = useState(0);
+  /** Atividades do mundo (activities.ts): evento em curso e missões de exploração; as concluídas somem. */
+  const [sideView, setSideView] = useState<ActivityView>([]);
+  const eventTimerRef = useRef<HTMLElement | null>(null);
   const [achDone, setAchDone] = useState(0);
   const [storyDialog, setStoryDialog] = useState<StoryDialog | null>(null);
   const storyDialogRef = useRef(storyDialog); storyDialogRef.current = storyDialog;
@@ -613,7 +617,23 @@ export default function Game() {
     };
     story.onChange();
     let storyTick = 0, storyPlace: PlaceId | null = null;
-    combat.onKill = kind => { story.kill(kind as MobKind); };
+    /* ==================== ATIVIDADES DO MUNDO (activities.ts): locais novos, ecos, baús e eventos cronometrados */
+    const activities = new WorldActivities(scene, world.colliders);
+    activities.onChange = () => setSideView(activities.view());
+    activities.onNotice = m => showHint(m);
+    activities.onReward = r => {
+      progression.recordExperience(r.xp); r.items.forEach(i => progression.addItem(i));
+      setProgressionHud(progression.snapshot()); ambient.sfx(r.big ? 'levelUp' : 'pickup');
+      showHint(r.items.length ? `${r.message} · ${r.items.map(i => LOOT_INFO[i].name).join(', ')}` : r.message);
+    };
+    activities.onChange();
+    /** Sequência de abates: derrotar inimigos com menos de 8 s de intervalo rende XP extra crescente. */
+    let streak = 0, streakUntil = 0;
+    combat.onKill = kind => {
+      streak = elapsed < streakUntil ? streak + 1 : 1; streakUntil = elapsed + 8;
+      if (streak >= 2) { const bonus = Math.min(60, streak * 10); progression.recordExperience(bonus); showHint(`Sequência x${streak}! +${bonus} XP`); }
+      story.kill(kind as MobKind); activities.kill();
+    };
     /** Abre o diálogo de um doador (Aldren ou local). Sem oferta: fala de acompanhamento. */
     const openDialog = (d: StoryDialog) => {
       ambient.start(); ambient.sfx('ui'); keys.clear();
@@ -731,7 +751,7 @@ export default function Game() {
         hero.root.userData.castKind = spell;
         broadcastFx(spell, spellOrigin, spellDirection, spellAim); partyEffects(spell);
         story.cast();
-        if (spell === 'santuario') { const s = magic.santuarioInfo; if (s) startCinematic('SANTUÁRIO · IGREJA DE LUZ', 'Catedral de Luz', 3.2, { c: s.center, R: s.R }); }
+        if (spell === 'santuario') { const s = magic.santuarioInfo; if (s) startCinematic('DOMÍNIO SAGRADO · SANTUÁRIO', 'Catedral de Luz', 3.6, { c: s.center, R: s.R }); }
         // Brado provoca: os inimigos em volta passam a mirar no guerreiro (no host; o cliente pede ao host)
         if (spell === 'brado') {
           const hp = hero.root.position;
@@ -764,6 +784,7 @@ export default function Game() {
     // mini-cutscene do Vollzanbel: barras de cinema, nome do feitiço, câmera baixa girando em volta da maga
     const cine = { start: -99, until: -99, church: null as { c: THREE.Vector3; R: number; a0: number } | null };
     const tmpCine = new THREE.Vector3();
+    let debugCam: { from: THREE.Vector3; to: THREE.Vector3 } | null = null;
     const startCinematic = (small = 'INVOCAÇÃO DAS CHAMAS INFERNAIS', big = 'Vollzanbel', duration = 1.3, church: { c: THREE.Vector3; R: number } | null = null) => {
       cine.church = church && { ...church, a0: cameraRig.yaw + .9 };
       cine.start = elapsed; cine.until = elapsed + duration;
@@ -917,7 +938,12 @@ export default function Game() {
         perf, scene, start: () => startRef.current(),
         teleport: (x: number, z: number, yaw?: number) => { hero.root.position.set(x, terrainHeight(x, z), z); motor.reset(); if (yaw !== undefined) cameraRig.yaw = yaw; },
         spin: (dy: number) => { cameraRig.yaw += dy; },
+        look: (yaw: number, pitch: number, distance?: number) => { cameraRig.yaw = yaw; cameraRig.pitch = pitch; if (distance !== undefined) cameraRig.distance = distance; },
         recharge: () => magic.debugRecharge(),
+        combat, // inimigos (testes de animação)
+        /** Câmera fixa no espaço local da heroína (de → para); sem argumentos volta à câmera normal. */
+        cam: (from?: [number, number, number], to?: [number, number, number]) => { debugCam = from && to ? { from: new THREE.Vector3(...from), to: new THREE.Vector3(...to) } : null; },
+        activities, // atividades do mundo (testes): view(), save() e, em dev, forçar o próximo evento via nextEvent
         cast: (spell: SpellId, tx: number, tz: number) => {
           hero.ensureStaff(); hero.spellPoint.getWorldPosition(from);
           at.set(tx, terrainHeight(tx, tz) + 1, tz); dir.copy(at).sub(from).normalize();
@@ -961,7 +987,7 @@ export default function Game() {
         progression: { level: p.level, experience: p.experience, nextLevelXp: p.nextLevelXp, skillPoints: p.skillPoints, ranks: { ...p.ranks }, inventory: { ...p.inventory } },
         quest: { ...quest }, markerRemembered,
         position: { x: hero.root.position.x, y: hero.root.position.y, z: hero.root.position.z, yaw: hero.root.rotation.y },
-        story: story.save(),
+        story: story.save(), activities: activities.save(),
       };
     };
     loadSaveRef.current = d => {
@@ -976,7 +1002,7 @@ export default function Game() {
       hero.root.position.set(x, terrainHeight(x, z), z); hero.root.rotation.y = d.position.yaw; hero.root.userData.facing = d.position.yaw; motor.reset();
       if (d.name && !mpNameRef.current) mpNameRef.current = d.name;
       combat.health = combat.maxHealth;
-      story.restore(d.story);
+      story.restore(d.story); activities.restore(d.activities);
       // bônus de retorno: voltar depois de 4 h ou mais rende XP (sem punir quem ficou fora)
       const away = (Date.now() - d.savedAt) / 3.6e6;
       if (away >= 4) { const bonus = Math.round(40 * progression.level * Math.min(3, away / 8 + .5)); progression.recordExperience(bonus); setTimeout(() => showHint(`Bem-vindo de volta! Bônus de retorno: +${bonus} XP`), 1500); }
@@ -1435,8 +1461,12 @@ export default function Game() {
         const grabSpeed = grab ? stepGrab(delta) : 0;
         const moving = grab ? grabSpeed > .5 : combat.health > 0 && motor.update(delta, THREE.MathUtils.clamp(forward, -1, 1), THREE.MathUtils.clamp(side, -1, 1), touchSprintRef.current, keys.has(' ') || touchJumpRef.current, cameraRig.yaw, magic.flying, Number(keys.has(' ') || touchJumpRef.current) - Number(keys.has('control')), cameraRig.pitch);
         if (!grab) combat.pushPlayer(hero.root.position); // inimigos têm corpo sólido
+        activities.xpScale = 1 + (progression.level - 1) * .12;
+        activities.update(delta, elapsed, hero.root.position.x, hero.root.position.z, combat.health > 0);
         storyTick += delta; if (storyTick > .5) {
           storyTick = 0;
+          const left = activities.timeLeft;
+          if (eventTimerRef.current && left !== null) { eventTimerRef.current.textContent = `${Math.floor(left / 60)}:${String(Math.floor(left % 60)).padStart(2, '0')}`; eventTimerRef.current.classList.toggle('low', left < 10); }
           const pl = combat.health > 0 ? story.placeAt(hero.root.position.x, hero.root.position.z) : null;
           if (pl !== storyPlace) { storyPlace = pl; setPlacePrompt(pl ? PLACES[pl].verb : ''); }
           if (elapsed >= nextXpEvent) { nextXpEvent = elapsed + 360; xpEventUntil = elapsed + 90; setWorldEvent('Lua de Caça · XP em dobro'); showHint('🌕 Lua de Caça! Todo XP de inimigos vale o dobro por 90 s.'); }
@@ -1597,16 +1627,18 @@ export default function Game() {
         camera.position.lerp(grabCamPos, grabCam.blend < 1 ? grabCam.blend * .3 : 1 - Math.exp(-delta * 9));
         camera.lookAt(grabLook);
       } else if (elapsed < cine.until && cine.church) {
-        // cutscene da Catedral de Luz: plano aberto girando em volta da igreja enquanto ela se ergue
-        const k = (elapsed - cine.start) / (cine.until - cine.start), { c, R, a0 } = cine.church, f = a0 + k * 1.4, d = R * (2.7 - k * .8);
-        camera.position.lerp(tmpCine.set(c.x + Math.sin(f) * d, c.y + R * (.3 + k * .55), c.z + Math.cos(f) * d), k < .12 ? k / .12 * .25 : 1 - Math.exp(-delta * 6));
-        camera.lookAt(c.x, c.y + R * (.7 + k * .25), c.z);
+        // cutscene da Catedral de Luz: plano aberto, por fora da barreira, girando enquanto o domínio se fecha e a igreja se materializa
+        const k = (elapsed - cine.start) / (cine.until - cine.start), { c, R, a0 } = cine.church, f = a0 + k * 1.4, d = R * (2.5 - k * .7);
+        camera.position.lerp(tmpCine.set(c.x + Math.sin(f) * d, c.y + R * (.25 + k * .45), c.z + Math.cos(f) * d), k < .12 ? k / .12 * .25 : 1 - Math.exp(-delta * 6));
+        camera.lookAt(c.x, c.y + R * (.8 + k * .15), c.z);
       } else if (elapsed < cine.until) {
         const k = (elapsed - cine.start) / (cine.until - cine.start), h = hero.root.position, f = hero.root.rotation.y + 2.25 - k * 1.1;
         const ease = k < .15 ? k / .15 : 1, d = 4.6 - k * .8;
         camera.position.lerp(new THREE.Vector3(h.x + Math.sin(f) * d, h.y + .7 + k * .5, h.z + Math.cos(f) * d), ease);
         camera.lookAt(h.x, h.y + 1.9 + k * .2, h.z);
       } else if (shellRef.current?.classList.contains('cinematic')) shellRef.current.classList.remove('cinematic');
+      // câmera de teste (dev): pontos no espaço local da heroína, para enquadrar mãos/armas de perto
+      if (debugCam) { camera.position.copy(hero.root.localToWorld(tmpCine.copy(debugCam.from))); camera.lookAt(hero.root.localToWorld(tmpCine.copy(debugCam.to))); }
       if (aimReticleRef.current) {
         aimReticleRef.current.classList.toggle('is-casting', elapsed < castUntil || magic.charging || magic.beamActive);
         aimReticleRef.current.classList.toggle('is-hit', elapsed < reticleHitUntil);
@@ -1626,8 +1658,8 @@ export default function Game() {
       }
       if (compassNeedleRef.current) compassNeedleRef.current.style.transform = `rotate(${-cameraRig.yaw}rad)`;
       if (compassPinRef.current) {
-        // a bússola aponta para o doador da próxima missão (ou o local/área do objetivo); sem destino, o marco
-        const goal = story.target(npc.position) ?? { x: 0, z: -12 };
+        // a bússola aponta para o evento em curso; sem evento, para o doador da próxima missão (ou o local/área do objetivo); sem destino, o marco
+        const goal = activities.target() ?? story.target(npc.position) ?? { x: 0, z: -12 };
         const markerAngle = Math.atan2(goal.x - hero.root.position.x, goal.z - hero.root.position.z) - cameraRig.yaw;
         compassPinRef.current.style.left = `${42 + Math.sin(markerAngle) * 14}px`;
         compassPinRef.current.style.top = `${42 - Math.cos(markerAngle) * 14}px`;
@@ -1948,11 +1980,13 @@ export default function Game() {
           <button type="button" className="icon-button" onClick={() => { releaseMouse(); setPaused(true); }} aria-label="Menu" title="Menu (Esc)">≡</button>
         </div>
       </header>
-      <section className="quest-card"><div className="quest-kicker"><span className="tiny-star">✦</span> MEMÓRIA ESQUECIDA</div><h2>O Que Permanece</h2><p>Encontre o Marco do Herói e desperte o Eco que repousa nas pedras.</p><div className="quest-progress"><span style={{ width: `${status.discovered * 100}%` }} /></div><div className="quest-count">{status.discovered ? '1' : '0'} <span>/ 1 memória encontrada</span></div></section>
+      {!status.discovered && <section className="quest-card"><div className="quest-kicker"><span className="tiny-star">✦</span> MEMÓRIA ESQUECIDA</div><h2>O Que Permanece</h2><p>Encontre o Marco do Herói e desperte o Eco que repousa nas pedras.</p><div className="quest-progress"><span style={{ width: `${status.discovered * 100}%` }} /></div><div className="quest-count">{status.discovered ? '1' : '0'} <span>/ 1 memória encontrada</span></div></section>}
       {/* modo história: missões ativas (as concluídas somem na hora, com a recompensa) */}
-      {storyView.length > 0 && <section className="story-tracker" aria-label="Missões">
+      {(storyView.length > 0 || sideView.length > 0) && <section className="story-tracker" aria-label="Missões">
+        {sideView.filter(q => q.timed).map(q => <div key={q.id} className="story-q event"><small>{q.kicker} · <i ref={eventTimerRef} className="event-timer">–:––</i></small><b>{q.title}</b><span>{q.text}</span>{q.max > 1 && <i className="story-bar"><em style={{ width: `${q.cur / q.max * 100}%` }} /></i>}</div>)}
         <div className="story-head"><span>✦ MODO HISTÓRIA</span><small>{storyDone}/{STORY.length}</small></div>
         {storyView.map(q => <div key={q.id} className={`story-q ${q.daily ? 'daily' : ''} ${q.step === 'go' ? 'go' : ''}`}><small>{q.chapter}</small><b>{q.title}</b><span>{q.text}</span>{q.max > 1 && <i className="story-bar"><em style={{ width: `${q.cur / q.max * 100}%` }} /></i>}</div>)}
+        {sideView.filter(q => !q.timed).map(q => <div key={q.id} className="story-q mini" title={q.text}><b>{q.title}</b><small>{q.cur}/{q.max}</small><i className="story-bar"><em style={{ width: `${q.cur / q.max * 100}%` }} /></i></div>)}
       </section>}
       <div className="compass"><div className="compass-ring"><span className="compass-n">N</span><span ref={compassNeedleRef} className="compass-needle">◆</span><span ref={compassPinRef} className="compass-pin">✦</span><span className="compass-s">S</span></div><div className="compass-label"><span>◷</span> {dayLabel}</div></div>
       {shiftLocked && <div className="shift-lock-indicator">SHIFT LOCK <span>ATIVO</span></div>}
