@@ -18,7 +18,8 @@ import { PerfMonitor } from './perf-monitor';
 import { QuestGiver, type QuestStage } from './npc';
 import { NetClient, r2, defaultServer, listRooms, OFFICIAL_SERVER, isP2P, type NetMsg, type RoomInfo } from './net';
 import { RemotePlayers, type RemoteState } from './remote-players';
-import { PvpGuard, canHarm, pvpDamage, PVP_ARM_SECS, PVP_DISARM_SECS, PVP_KILL_XP } from './pvp';
+import { LiebBoss, LIEB_POINTS } from './lieb';
+import { PvpGuard, canHarm, pvpDamage, capsuleDistance, PVP_ARM_SECS, PVP_DISARM_SECS, PVP_KILL_XP, PLAYER_HIT_RADIUS, PLAYER_HIT_LOW, PLAYER_HIT_HIGH } from './pvp';
 import { WorldActivities, type ActivityView } from './activities';
 import { StoryLog, STORY, CHAPTERS, ACHIEVEMENTS, PLACES, type StoryView, type StoryOffer, type MobKind, type PlaceId } from './story';
 /** Diálogo da história: oferta de missão (id) ou fala de acompanhamento (id null). */
@@ -180,6 +181,8 @@ export default function Game() {
   /** Marcador do alvo travado (Tab). */
   const lockMarkerRef = useRef<HTMLDivElement>(null);
   const captionRef = useRef<HTMLDivElement>(null);
+  const bossBarRef = useRef<HTMLDivElement>(null);
+  const bossCapRef = useRef<HTMLDivElement>(null);
   const damageRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef(true);
   const hasStartedRef = useRef(false);
@@ -540,7 +543,7 @@ export default function Game() {
       const rest = cloneSkinned(gltf.scene);
       remotes.attachBodies(gltf); // clona antes: o herói local reaproveita a cena original
       hero.attachBody(gltf, { plain: true });
-      void clipsFor(rest).then(clips => { if (disposed) return; hero.addClips(clips); remotes.addClips(clips); });
+      void clipsFor(rest).then(clips => { if (disposed) return; hero.addClips(clips); remotes.addClips(clips); boss.addClips(clips); });
     }, undefined, () => { /* mantém o corpo procedural */ });
     const motor = new PlayerMotor(hero.root, world.colliders);
     const cameraRig = new ThirdPersonCamera(camera, world);
@@ -627,6 +630,66 @@ export default function Game() {
       showHint(r.items.length ? `${r.message} · ${r.items.map(i => LOOT_INFO[i].name).join(', ')}` : r.message);
     };
     activities.onChange();
+    /* ==================== LIEB, o Senhor do Sangue (raid, lieb.ts): arena pelo Portal Arruinado, pilar inicia a luta */
+    const bossCaption = (small: string, big: string) => {
+      const el = bossCapRef.current; if (!el) return;
+      el.querySelector('small')!.textContent = small; el.querySelector('strong')!.textContent = big;
+      el.classList.remove('show'); void el.offsetWidth; el.classList.add('show');
+    };
+    const boss = new LiebBoss(scene, {
+      role: () => combat.netRole,
+      selfId: () => (net.online ? net.id : 'self'),
+      players: () => [
+        { id: net.online ? net.id : 'self', pos: hero.root.position, alive: combat.health > 0, vx: motor.velocity.x, vz: motor.velocity.z },
+        ...remotes.active().map(s => ({ id: s.id, pos: s.hero.root.position, alive: s.st.hp > 0, vx: s.st.vx ?? 0, vz: s.st.vz ?? 0 })),
+      ],
+      localAir: () => hero.root.position.y - terrainHeight(hero.root.position.x, hero.root.position.z),
+      hurt: (d, fx, fz) => combat.receiveStrike(d, fx, fz, hero.root.position, netBlock),
+      send: m => net.send(m as NetMsg),
+      sendHost: m => net.sendTo(net.host, m as NetMsg),
+      damageNumber: (at, n, k) => combat.onDamageNumber(at, n, k),
+      sfx: (n, g) => ambient.sfx(n, g),
+      hint: m => showHint(m),
+      intro: (c, secs) => { startCinematic('SENHOR DO SANGUE · RAID', 'Lieb', secs, { c, R: 2.4 }); ambient.sfx('fireCharge', 1.2); },
+      caption: bossCaption,
+      defeated: () => {
+        progression.recordExperience(900); setProgressionHud(progression.snapshot()); ambient.sfx('levelUp');
+        startCinematic('O SANGUE SE AQUIETA', 'Lieb foi derrotado', 3.2);
+        showHint('🩸 Lieb, o Senhor do Sangue, foi derrotado! +900 XP · ele volta ao trono em 90 s');
+      },
+      shake: p => cameraRig.impact(p),
+    });
+    world.colliders.push(...boss.colliders);
+    cameraRig.addSurfaces(boss.surfaces);
+    combat.targets.push(boss.target);
+    combat.extraTargets.push(boss.extra);
+    let portalCd = 0, pillarPrompt = false;
+    const heroFace = (yaw: number) => { hero.root.rotation.y = yaw; hero.root.userData.facing = yaw; cameraRig.yaw = yaw + Math.PI; };
+    /** Portais: Portal Arruinado ↔ arena do Lieb. */
+    const portalStep = () => {
+      if (combat.health <= 0 || grab || elapsed < portalCd) return;
+      const where = LiebBoss.portalAt(hero.root.position); if (!where) return;
+      portalCd = elapsed + 1.5; motor.reset();
+      if (where === 'enter') {
+        hero.root.position.copy(LIEB_POINTS.entry); heroFace(Math.PI);
+        boss.load(); ambient.sfx('fireBoom', .6); showHint('🩸 Você atravessou o véu de sangue. Toque o cristal no pilar (G) para despertar o Lieb.');
+      } else {
+        const p = LiebBoss.returnPoint(new THREE.Vector3()); hero.root.position.set(p.x, terrainHeight(p.x, p.z), p.z);
+        heroFace(Math.atan2(p.x - LiebBoss.portalCenter.x, p.z - LiebBoss.portalCenter.z)); showHint('Você voltou aos Campos da Aurora.');
+      }
+    };
+    /** Barra do chefe (só muda o DOM quando os números mudam). */
+    let bossHudKey = '';
+    const bossHud = () => {
+      const el = bossBarRef.current; if (!el) return;
+      const h = boss.hud(), here = LiebBoss.inArena(hero.root.position), key = h.show && here ? `${Math.ceil(h.hp)}|${h.max}|${Math.ceil(h.shield)}|${h.stagger}|${h.enraged}` : '';
+      if (key === bossHudKey) return; bossHudKey = key;
+      el.style.display = key ? '' : 'none'; if (!key) return;
+      (el.querySelector('.boss-hp') as HTMLElement).style.width = `${(h.hp / Math.max(1, h.max)) * 100}%`;
+      (el.querySelector('.boss-shield') as HTMLElement).style.width = `${h.shieldMax > 0 ? (h.shield / h.shieldMax) * 100 : 0}%`;
+      (el.querySelector('.boss-num') as HTMLElement).textContent = `${Math.ceil(h.hp).toLocaleString('pt-BR')} / ${h.max.toLocaleString('pt-BR')}${h.shield > 0 ? ` · escudo ${Math.ceil(h.shield)}` : ''}`;
+      el.classList.toggle('stagger', h.stagger); el.classList.toggle('enraged', h.enraged);
+    };
     /** Sequência de abates: derrotar inimigos com menos de 8 s de intervalo rende XP extra crescente. */
     let streak = 0, streakUntil = 0;
     combat.onKill = kind => {
@@ -700,13 +763,14 @@ export default function Game() {
       const out: Lock[] = [];
       for (const t of combat.targets) { const info = combat.targetInfo(t); if (info?.alive) out.push({ obj: t, label: MOB_LABEL[info.kind], player: null }); }
       for (const s of remotes.active()) if (s.st.hp > 0) out.push({ obj: s.hero.root, label: s.st.name, player: s.id });
+      if (boss.alive) out.push({ obj: boss.target, label: 'Lieb', player: null });
       // PvP ligado: jogadores hostis têm prioridade no Tab (os inimigos voltam quando não há nenhum)
       if (pvp.on && combat.pvpTargets.length) { const hostile = out.filter(l => l.player && combat.pvpTargets.some(t => t.id === l.player)); if (hostile.length) return hostile; }
       return out;
     };
     const lockValid = (l: Lock) => {
       if (l.player) { const s = remotes.active().find(x => x.id === l.player); if (!s || s.st.hp <= 0) return false; }
-      else if (!combat.targetInfo(l.obj)?.alive) return false;
+      else if (l.obj === boss.target ? !boss.alive : !combat.targetInfo(l.obj)?.alive) return false;
       return lockPos(l, tmpLock).distanceTo(hero.root.position) < 40;
     };
     const tmpLock = new THREE.Vector3(), tmpLock2 = new THREE.Vector3();
@@ -727,10 +791,39 @@ export default function Game() {
       }
       ambient.sfx('ui'); showHint(`Alvo travado: ${lock.label} · Tab troca/solta`);
     };
-    /** Ponto de mira das magias: o alvo travado ou o que a câmera/cursor aponta. */
-    const aimPoint = (out: THREE.Vector3) => {
-      if (lock && lockValid(lock)) return lockPos(lock, out);
-      return cameraRig.getAimPoint(out, combat.targets);
+    /**
+     * Previsão de movimento (PvP): tempo até a magia chegar ao alvo. Explosões com atraso fixo (Vollzanbel forma a
+     * bola por 1,2 s e voa 0,3 s) e projéteis rápidos (tempo = distância / velocidade). Raios e golpes: 0.
+     */
+    const leadTime = (spell: SpellId | null, dist: number) =>
+      spell === 'vollzanbel' ? 1.5 : spell === 'zoltraak' || spell === 'tresLancas' ? dist / 34 : 0;
+    const aimFeet: THREE.Vector3[] = [], tmpAim = new THREE.Vector3();
+    /** Desloca out para onde o jogador id estará daqui a lead s (velocidade enviada no estado; no máx. 4 m). */
+    const addLead = (id: string, out: THREE.Vector3, lead: number) => {
+      const s = remotes.active().find(x => x.id === id); if (!s || lead <= 0) return;
+      let dx = (s.st.vx ?? 0) * lead, dz = (s.st.vz ?? 0) * lead; const l = Math.hypot(dx, dz);
+      if (l > 4) { dx *= 4 / l; dz *= 4 / l; }
+      out.x += dx; out.z += dz;
+    };
+    /**
+     * Ponto de mira das magias: o alvo travado ou o que a câmera/cursor aponta. Com PvP ligado, jogadores hostis
+     * entram na mira (antes o raio só via inimigos e cenário: mirar num jogador acertava o chão atrás dele), com
+     * magnetismo leve e previsão de movimento para magias lentas.
+     */
+    const aimPoint = (out: THREE.Vector3, spell: SpellId | null = null) => {
+      if (lock && lockValid(lock)) {
+        lockPos(lock, out);
+        if (lock.player) addLead(lock.player, out, leadTime(spell, out.distanceTo(hero.root.position)));
+        return out;
+      }
+      cameraRig.getAimPoint(out, combat.targets);
+      const targets = combat.pvpTargets;
+      if (pvp.on && targets.length) {
+        aimFeet.length = 0; for (const t of targets) aimFeet.push(t.pos);
+        const i = cameraRig.pickCapsule(aimFeet, PLAYER_HIT_RADIUS, PLAYER_HIT_LOW, PLAYER_HIT_HIGH, tmpAim);
+        if (i >= 0) { out.copy(tmpAim); addLead(targets[i].id, out, leadTime(spell, out.distanceTo(hero.root.position))); }
+      }
+      return out;
     };
     const castAbility = (spell: SpellId) => {
       if (uiOpenRef.current || combat.health <= 0 || elapsed < cine.until || grab) return;
@@ -738,7 +831,7 @@ export default function Game() {
       ambient.start();
       hero.ensureStaff();
       hero.spellPoint.getWorldPosition(spellOrigin);
-      aimPoint(spellAim);
+      aimPoint(spellAim, spell);
       spellDirection.copy(spellAim).sub(spellOrigin).normalize();
       if (spell === 'flight' && cls().weapon !== 'staff') return;
       if (!progression.unlocked(spell)) { const n = unlockNode(progression.cls, spell); showHint(`Habilidade bloqueada · desbloqueie “${n?.name ?? spell}” na árvore de habilidades (,)`); return; }
@@ -775,7 +868,7 @@ export default function Game() {
     // Zoltraak carregável: segurar Q / clique esquerdo carrega; soltar dispara o raio.
     const aimNow = () => {
       hero.spellPoint.getWorldPosition(spellOrigin);
-      aimPoint(spellAim);
+      aimPoint(spellAim, 'zoltraak');
       spellDirection.copy(spellAim).sub(spellOrigin).normalize();
       magic.setAim(spellOrigin, spellDirection);
     };
@@ -854,6 +947,11 @@ export default function Game() {
           caught.hit(10);
           startCinematic('FÚRIA DA VANGUARDA', 'Agarrão', GRAB.drag * (.5 + .5 * progression.stats.grab) + GRAB.slam + .45);
           grabCam.until = cine.until; grabCam.blend = 0; grabCam.dir.copy(g.dir); grabCam.side = g.side;
+        } else if (pvp.on && combat.pvpTargets.some(t => capsuleDistance(t.pos, grabFrom) <= 1.1)) {
+          // PvP: a vítima é dona da própria posição (não dá para arrastá-la); o Agarrão vira um tranco forte com empurrão
+          combat.damageAt(grabFrom, 1.1, 40 * magic.buffDamage * progression.meleeMultiplier());
+          hitstop = .12; magic.grabCatchFx(grabFrom); ambient.sfx('hitEnemy', 1.2); reticleHitUntil = elapsed + .28;
+          attackUntil = elapsed + .3; endGrab(); return 0;
         } else if (!ok || g.t >= GRAB.dash) { attackUntil = elapsed + .3; endGrab(); return 0; }
         return g.speed;
       }
@@ -908,10 +1006,24 @@ export default function Game() {
     shieldRef.current = { start: startShield, release: releaseShield };
     const performAttack = () => {
       if (uiOpenRef.current || combat.health <= 0 || magic.shieldActive || grab) return;
-      const facing = hero.root.userData.facing ?? hero.root.rotation.y;
-      const target = hero.root.position.clone().add(new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing)).multiplyScalar(2.15));
-      target.y += 1.2;
-      const atk = cls().attack;
+      const atk = cls().attack, hp = hero.root.position;
+      let facing: number = hero.root.userData.facing ?? hero.root.rotation.y;
+      // trava suave: o golpe vira para o alvo travado ou para o hostil mais perto à frente (até ±75°) ao alcance.
+      // Antes o golpe saía só para onde o corpo apontava (a última direção andada) e errava quem estava ao lado.
+      const reachMax = atk.reach + atk.radius + .7;
+      let best = Infinity, bx = 0, bz = 0;
+      const consider = (x: number, z: number, locked: boolean) => {
+        const dx = x - hp.x, dz = z - hp.z, d = Math.hypot(dx, dz); if (d > reachMax || d < .05) return;
+        const off = Math.abs(THREE.MathUtils.euclideanModulo(Math.atan2(dx, dz) - facing + Math.PI, Math.PI * 2) - Math.PI);
+        if (!locked && off > 1.3) return;
+        const score = locked ? -1 : d + off * 1.2; if (score < best) { best = score; bx = dx; bz = dz; }
+      };
+      if (lock && lockValid(lock)) { lockPos(lock, tmpLock); consider(tmpLock.x, tmpLock.z, true); }
+      if (pvp.on) for (const t of combat.pvpTargets) consider(t.pos.x, t.pos.z, false);
+      for (const t of combat.targets) { const info = combat.targetInfo(t); if (!info?.alive) continue; t.getWorldPosition(tmpLock2); consider(tmpLock2.x, tmpLock2.z, false); }
+      if (boss.alive) { boss.center(tmpLock2); consider(tmpLock2.x, tmpLock2.z, false); }
+      if (best < Infinity) { facing = Math.atan2(bx, bz); hero.root.userData.facing = facing; }
+      const target = new THREE.Vector3();
       target.copy(hero.root.position).add(new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing)).multiplyScalar(atk.reach)); target.y += 1.2;
       const crit = progression.rollCrit(), dmg = atk.damage * magic.buffDamage * progression.meleeMultiplier() * crit, hits = combat.damageAt(target, atk.radius, dmg);
       if (hits > 0) { reticleHitUntil = elapsed + .28; magic.drain(dmg * hits); if (crit > 1) magic.critFx(target); }
@@ -935,7 +1047,7 @@ export default function Game() {
       // ganchos de benchmark (só em desenvolvimento): cenários reproduzíveis sem depender de teclado/mouse
       const at = new THREE.Vector3(), from = new THREE.Vector3(), dir = new THREE.Vector3();
       (window as unknown as { __ecos?: unknown }).__ecos = {
-        perf, scene, start: () => startRef.current(),
+        perf, scene, camera, progression, boss, start: () => startRef.current(),
         teleport: (x: number, z: number, yaw?: number) => { hero.root.position.set(x, terrainHeight(x, z), z); motor.reset(); if (yaw !== undefined) cameraRig.yaw = yaw; },
         spin: (dy: number) => { cameraRig.yaw += dy; },
         look: (yaw: number, pitch: number, distance?: number) => { cameraRig.yaw = yaw; cameraRig.pitch = pitch; if (distance !== undefined) cameraRig.distance = distance; },
@@ -1099,6 +1211,7 @@ export default function Game() {
         case 'rel': if (combat.netRole === 'host') combat.netRelease(Number(m.i), Number(m.x), Number(m.z)); return;
         case 'strike': combat.receiveStrike(Number(m.d), Number(m.x), Number(m.z), hero.root.position, netBlock); return;
         case 'phit': receivePvpHit(from, m); return;
+        case 'lb': case 'lba': case 'lbs': case 'lbgo': case 'lbh': case 'lbr': case 'lbd': case 'lbx': boss.netMessage(from, m as Record<string, unknown>); return;
         case 'pkill': {
           const killer = String(m.k ?? '');
           if (killer === net.id) { progression.recordExperience(PVP_KILL_XP); story.pvpKill(); pvp.kills++; showHint(`⚔ Você derrotou ${peerName(from)} em combate PvP. +${PVP_KILL_XP} XP`); }
@@ -1282,6 +1395,7 @@ export default function Game() {
         showHint(`Revivendo ${peerName(reviveTarget)}… fique perto`); ambient.sfx('cast');
         return;
       }
+      if (key === 'g' && boss.nearPillar(hero.root.position) && boss.phase === 'dormant' && !uiOpenRef.current && combat.health > 0) { boss.requestStart(); return; }
       if (key === 'g' && isNearNpc && !uiOpenRef.current) { talkToNpc(); return; }
       if (key === 'g' && storyPlace && !uiOpenRef.current) { if (storyPlace === 'marco') interactMarker(); interactPlace(storyPlace); return; }
       if (key === 'g' && isNearMarker && !uiOpenRef.current) {
@@ -1437,7 +1551,7 @@ export default function Game() {
         if (!npcDialogRef.current) elapsed += delta;
         magic.update(delta, elapsed);
         combat.barrier = magic.shieldBarrier(shieldBarrier);
-        combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to));
+        combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to)); boss.update(delta, elapsed);
         netPose = 'idle'; netOverlay = null; netSpeed = 0; netStep(delta, true);
       }
       if (uiOpenRef.current && !npcDialogRef.current && frameCount % 3 !== 0) return;
@@ -1463,6 +1577,8 @@ export default function Game() {
         if (!grab) combat.pushPlayer(hero.root.position); // inimigos têm corpo sólido
         activities.xpScale = 1 + (progression.level - 1) * .12;
         activities.update(delta, elapsed, hero.root.position.x, hero.root.position.z, combat.health > 0);
+        portalStep();
+        { const near = boss.nearPillar(hero.root.position) && boss.phase === 'dormant'; if (near && !pillarPrompt) showHint('🩸 Cristal de sangue · G para despertar o Lieb (todos na arena entram na luta)'); pillarPrompt = near; }
         storyTick += delta; if (storyTick > .5) {
           storyTick = 0;
           const left = activities.timeLeft;
@@ -1503,7 +1619,8 @@ export default function Game() {
           if (downedRef.current) downedRef.current.textContent = String(Math.max(0, Math.ceil(wait - deathTimer)));
           if (deathTimer >= wait || respawnNow) {
             respawnNow = false; if (downedShown) { downedShown = false; setDowned(false); }
-            hero.root.position.set(0, 0, 2);
+            // caiu na arena do Lieb: renasce na entrada da arena (a luta continua)
+            if (LiebBoss.inArena(hero.root.position)) hero.root.position.copy(LIEB_POINTS.entry); else hero.root.position.set(0, 0, 2);
             hero.root.rotation.set(0, Math.PI, 0);
             hero.root.userData.facing = Math.PI;
             motor.reset();
@@ -1543,7 +1660,7 @@ export default function Game() {
         ambient.setBeam(magic.charging ? 1 : magic.beamActive ? 2 : 0, magic.charging ? magic.chargeLevel : magic.beamPower);
         magic.update(delta, elapsed);
         combat.barrier = magic.shieldBarrier(shieldBarrier);
-        combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to));
+        combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to)); boss.update(delta, elapsed); bossHud();
         netStep(delta, true);
         // salvamento automático local a cada 30 s
         autosaveAcc += delta; if (autosaveAcc >= 30) { autosaveAcc = 0; saveNow(true); }
@@ -1898,6 +2015,8 @@ export default function Game() {
     {/* avisos fora do jogo (o toast do HUD fica oculto na tela inicial): ex. confirmação de save importado */}
     {!playing && hint && <div className="toast title-toast" role="status"><span>✦</span>{hint}</div>}
     <input ref={importInputRef} type="file" accept=".json,application/json" hidden onChange={e => { void onImportFile(e.target.files?.[0]); e.target.value = ''; }} />
+      <div ref={bossBarRef} className="boss-bar" style={{ display: 'none' }} role="status"><div className="boss-title"><b>🩸 Lieb</b><small>Senhor do Sangue</small></div><div className="boss-track"><i className="boss-hp" /><i className="boss-shield" /></div><span className="boss-num" /></div>
+      <div ref={bossCapRef} className="boss-caption" aria-hidden="true"><small /><strong /></div>
     <div ref={captionRef} className="spell-caption" aria-hidden="true"><small>INVOCAÇÃO DAS CHAMAS INFERNAIS</small><strong>Vollzanbel</strong></div>
 
     {/* ======================= TELA INICIAL ======================= */}

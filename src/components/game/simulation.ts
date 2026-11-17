@@ -275,6 +275,12 @@ export class ThirdPersonCamera {
     this.aimObjects = [...parts.blockers, parts.ground];
   }
 
+  /** Cenário extra para mira e (opcional) colisão da câmera, ex.: chão e paredes da arena do Lieb. */
+  addSurfaces(objects: THREE.Object3D[], collide = true) {
+    this.aimObjects.push(...objects);
+    if (collide) this.collisionObjects.push(...objects);
+  }
+
   setShiftLock(enabled: boolean) { this.shiftLocked = enabled; }
 
   /** Gira a câmera suavemente para olhar na direção (x, z) a partir do herói (alvo travado). */
@@ -433,6 +439,44 @@ export class ThirdPersonCamera {
         if (!blocked && d <= hitDistance + 2) { out.copy(this.tmpV); this.aimLocked = true; }
       }
     }
+    this.lastAimDistance = this.aimLocked ? out.distanceTo(this.raycaster.ray.origin) : hitDistance;
     return out;
+  }
+
+  /** Distância até o ponto escolhido pelo último getAimPoint (cenário ou inimigo). */
+  private lastAimDistance = Infinity;
+  private readonly segA = new THREE.Vector3();
+  private readonly segB = new THREE.Vector3();
+  private readonly onRay = new THREE.Vector3();
+  private readonly onSeg = new THREE.Vector3();
+
+  /**
+   * Mira em alvos sem malha (jogadores): cápsula vertical com os pés em feet[i]. Usa o raio do último getAimPoint.
+   * Acerta direto quando o raio passa pela cápsula e, fora dela, aplica "magnetismo": um cone que aceita pequenos
+   * erros (mais largo de perto, como em jogos de ação em terceira pessoa). Ignora alvos atrás de paredes/árvores e
+   * mais longe que o que o raio já tocou. Devolve o índice escolhido (e o ponto em out) ou -1.
+   */
+  pickCapsule(feet: readonly THREE.Vector3[], radius: number, low: number, high: number, out: THREE.Vector3) {
+    const ray = this.raycaster.ray;
+    let best = -1, bestScore = Infinity;
+    for (let i = 0; i < feet.length; i++) {
+      const f = feet[i];
+      this.segA.set(f.x, f.y + low, f.z); this.segB.set(f.x, f.y + high, f.z);
+      const miss = Math.sqrt(ray.distanceSqToSegment(this.segA, this.segB, this.onRay, this.onSeg));
+      const d = this.onRay.distanceTo(ray.origin);
+      if (d < 1 || d > this.aimRange || d > this.lastAimDistance + 2.5) continue;
+      if (this.tmpV.copy(this.onRay).sub(ray.origin).dot(ray.direction) <= 0) continue;
+      const direct = miss <= radius, cone = this.aimAssistCone * 1.5 * (1 + 6 / d);
+      const ang = Math.max(0, miss - radius) / d;
+      if (!direct && ang > cone) continue;
+      // linha de visão até o corpo (os troncos/pedras que somem perto da câmera não contam)
+      this.losRay.set(ray.origin, this.tmpDir.copy(this.onSeg).sub(ray.origin).normalize()); this.losRay.near = .1; this.losRay.far = Math.max(.2, d - .6);
+      this.losHits.length = 0; this.losRay.intersectObjects(this.aimObjects, true, this.losHits);
+      if (this.losHits.some(h => !((h.object.name === 'forest-trunks' || h.object.name === 'field-stones') && h.distance < 4.6))) continue;
+      const score = direct ? -1 / d : ang / cone;
+      if (score < bestScore) { bestScore = score; best = i; out.copy(this.onSeg); }
+    }
+    if (best >= 0) { out.y = THREE.MathUtils.clamp(out.y, feet[best].y + low + .35, feet[best].y + high - .25); this.aimLocked = true; }
+    return best;
   }
 }
