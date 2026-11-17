@@ -511,7 +511,7 @@ function buildStream(scene: THREE.Scene, M: Mats, colliders: WorldCollider[]) {
     const x = cp.x - (cq.y - cp.y) / cl * k * .95, z = cp.y + (cq.x - cp.x) / cl * k * .95;
     put(x, z, .42, 11800 + k + 2, STREAM_BANK[cross] - .62);
   }
-  rocks.count = n; rocks.castShadow = rocks.receiveShadow = true; rocks.instanceMatrix.needsUpdate = true; if (rocks.instanceColor) rocks.instanceColor.needsUpdate = true; scene.add(rocks);
+  rocks.count = n; rocks.castShadow = false; rocks.receiveShadow = true; rocks.instanceMatrix.needsUpdate = true; if (rocks.instanceColor) rocks.instanceColor.needsUpdate = true; scene.add(rocks);
 
   const stemGeo = new THREE.CylinderGeometry(.012, .02, 1, 4); stemGeo.translate(0, .5, 0);
   const headGeo = new THREE.CapsuleGeometry(.04, .2, 2, 6);
@@ -599,7 +599,7 @@ function buildUndergrowth(scene: THREE.Scene, colliders: WorldCollider[]) {
       caps.setColorAt(nm++, tc.set(kind).offsetHSL(0, 0, (seeded(k) - .5) * .08));
     }
   }
-  caps.count = stalks.count = nm; caps.castShadow = true; [caps, stalks].forEach(m => { m.instanceMatrix.needsUpdate = true; m.receiveShadow = true; scene.add(m); out.push(m); });
+  caps.count = stalks.count = nm; caps.castShadow = false; [caps, stalks].forEach(m => { m.instanceMatrix.needsUpdate = true; m.receiveShadow = true; scene.add(m); out.push(m); });
   if (caps.instanceColor) caps.instanceColor.needsUpdate = true;
 
   // tocos com anéis no topo

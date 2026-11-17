@@ -7,6 +7,8 @@ import { adoptFragments, bindSkin, computeSkin, placeAt, segDist, tearSeams, tex
 import { terrainHeight, type WorldCollider } from './world';
 import type { SfxName } from './audio';
 import type { LootItemId } from './progression';
+import { capsuleDistance, segmentCapsuleDistance, pvpDamage } from './pvp';
+import { MeshoptSimplifier } from 'meshoptimizer';
 
 export type MobKind = 'wolf' | 'bandit' | 'demon';
 type V3 = [number, number, number];
@@ -27,9 +29,11 @@ type Pose = {
   head: number; headYaw: number; jaw: number;
   rX: number; rZ: number; rE: number; lX: number; lZ: number; lE: number;
   reach: number; tail: number; glow: number;
+  /** Humanoides: avanço (m) e elevação do pé da frente (passo do golpe). */
+  step: number; stepY: number;
 };
-const POSE_FIELDS: (keyof Pose)[] = ['lean', 'twist', 'roll', 'drop', 'push', 'head', 'headYaw', 'jaw', 'rX', 'rZ', 'rE', 'lX', 'lZ', 'lE', 'reach', 'tail', 'glow'];
-const newPose = (): Pose => ({ lean: 0, twist: 0, roll: 0, drop: 0, push: 0, head: 0, headYaw: 0, jaw: 0, rX: 0, rZ: 0, rE: 0, lX: 0, lZ: 0, lE: 0, reach: 0, tail: 0, glow: 0 });
+const POSE_FIELDS: (keyof Pose)[] = ['lean', 'twist', 'roll', 'drop', 'push', 'head', 'headYaw', 'jaw', 'rX', 'rZ', 'rE', 'lX', 'lZ', 'lE', 'reach', 'tail', 'glow', 'step', 'stepY'];
+const newPose = (): Pose => ({ lean: 0, twist: 0, roll: 0, drop: 0, push: 0, head: 0, headYaw: 0, jaw: 0, rX: 0, rZ: 0, rE: 0, lX: 0, lZ: 0, lE: 0, reach: 0, tail: 0, glow: 0, step: 0, stepY: 0 });
 const clearPose = (p: Pose) => { for (const f of POSE_FIELDS) p[f] = 0; };
 
 type Ease = 'smooth' | 'in' | 'out' | 'back';
@@ -44,19 +48,41 @@ function ease(kind: Ease, u: number) {
   }
 }
 
+/**
+ * Amostra as poses-chave. Trechos com `ease` explícito (golpes secos) usam a curva pedida; os demais usam uma
+ * curva cúbica que PASSA pelas chaves sem parar nelas (tangentes monotônicas: sem passar do alvo em chaves de
+ * pausa). Antes cada chave tinha velocidade zero, e o corpo "travava" em cada pose como um boneco.
+ */
 function sampleKeys(keys: Key[], t: number, out: Pose) {
   t = clamp(t, 0, 1);
   let i = 0;
   while (i < keys.length - 2 && t > keys[i + 1].t) i++;
-  const a = keys[i], b = keys[i + 1];
-  const u = clamp((t - a.t) / Math.max(1e-4, b.t - a.t), 0, 1);
-  const e = ease(b.ease ?? 'smooth', u);
-  for (const f of POSE_FIELDS) { const av = a[f] ?? 0, bv = b[f] ?? 0; out[f] = av + (bv - av) * e; }
+  const a = keys[i], b = keys[i + 1], h = Math.max(1e-4, b.t - a.t);
+  const u = clamp((t - a.t) / h, 0, 1);
+  if (b.ease) {
+    const e = ease(b.ease, u);
+    for (const f of POSE_FIELDS) { const av = a[f] ?? 0, bv = b[f] ?? 0; out[f] = av + (bv - av) * e; }
+    return;
+  }
+  const prev = keys[i - 1], next = keys[i + 2];
+  const u2 = u * u, u3 = u2 * u, h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+  for (const f of POSE_FIELDS) {
+    const av = a[f] ?? 0, bv = b[f] ?? 0, s = (bv - av) / h;
+    out[f] = h00 * av + h10 * h * keyTangent(prev, a, s, f, false) + h01 * bv + h11 * h * keyTangent(next, b, s, f, true);
+  }
+}
+/** Tangente na chave k: média das inclinações vizinhas, zerada em picos/vales e limitada (sem ultrapassar). */
+function keyTangent(other: Key | undefined, k: Key, s: number, f: keyof Pose, after: boolean) {
+  if (!other || other.ease) return 0; // primeira/última chave ou vizinho seco: parte/chega devagar
+  const so = after ? ((other[f] ?? 0) - (k[f] ?? 0)) / Math.max(1e-4, other.t - k.t) : ((k[f] ?? 0) - (other[f] ?? 0)) / Math.max(1e-4, k.t - other.t);
+  if (so * s <= 0) return 0;
+  const m = (so + s) / 2, lim = 3 * Math.min(Math.abs(so), Math.abs(s));
+  return Math.sign(m) * Math.min(Math.abs(m), lim);
 }
 
-type AttackId = 'bite' | 'overhead' | 'slash' | 'swipe' | 'slam';
-/** Ordem fixa dos golpes (índice enviado pela rede nas fotos do host). */
-const ATTACK_IDS: AttackId[] = ['bite', 'overhead', 'slash', 'swipe', 'slam'];
+type AttackId = 'bite' | 'overhead' | 'slash' | 'swipe' | 'slam' | 'thrust' | 'combo';
+/** Ordem fixa dos golpes (índice enviado pela rede nas fotos do host): golpes novos entram SEMPRE no fim. */
+const ATTACK_IDS: AttackId[] = ['bite', 'overhead', 'slash', 'swipe', 'slam', 'thrust', 'combo'];
 type AttackDef = {
   id: AttackId; duration: number; hitAt: number;
   lunge: number; lungeFrom: number; lungeTo: number; air: number;
@@ -65,6 +91,8 @@ type AttackDef = {
 
 // Arm convention: X negative = raise forward/up, E = elbow flexion, Z = outward.
 // lean/head positive = forward/down. twist positive pulls the weapon-side shoulder back.
+// Golpes humanoides em 4 tempos: antecipação (o peso recua e a arma sobe) → tensão no topo → golpe com passo à
+// frente (step) → acompanhamento que passa do ponto → recuperação. Chaves sem `ease` fluem pela curva cúbica.
 const ATTACKS: Record<AttackId, AttackDef> = {
   bite: {
     id: 'bite', duration: .85, hitAt: .55, lunge: 1.05, lungeFrom: .34, lungeTo: .55, air: .3, damage: 1, aoe: false, arc: 'none',
@@ -77,54 +105,95 @@ const ATTACKS: Record<AttackId, AttackDef> = {
       { t: 1 },
     ],
   },
+  // bandido: golpe de cima, com a arma erguida atrás da cabeça e um passo pesado no impacto
   overhead: {
-    id: 'overhead', duration: 1.1, hitAt: .54, lunge: .5, lungeFrom: .4, lungeTo: .56, air: 0, damage: 1, aoe: false, arc: 'v',
+    id: 'overhead', duration: 1.15, hitAt: .52, lunge: .5, lungeFrom: .4, lungeTo: .54, air: 0, damage: 1, aoe: false, arc: 'v',
     keys: [
       { t: 0 },
-      { t: .4, lean: -.22, drop: -.04, push: -.1, twist: .2, head: -.14, rX: -2.7, rE: 1, rZ: .2, lX: -.45, lE: .7, lZ: .35, glow: .6 },
-      { t: .54, lean: .4, drop: -.14, push: .2, twist: -.15, head: .22, rX: -.7, rE: .15, rZ: .05, lX: .3, lE: .5, lZ: .45, glow: 1, ease: 'in' },
-      { t: .72, lean: .38, drop: -.13, push: .18, twist: -.15, head: .2, rX: -.65, rE: .2, rZ: .05, lX: .3, lE: .5, lZ: .4 },
+      { t: .15, lean: -.04, drop: -.06, twist: .1, rX: -.7, rE: .7, lX: -.2, lE: .4, glow: .2 },
+      { t: .38, lean: -.26, drop: -.04, push: -.12, twist: .25, roll: .05, head: -.16, rX: -2.85, rE: 1.05, rZ: .22, lX: -.55, lE: .75, lZ: .3, glow: .7, step: .08, stepY: .12 },
+      { t: .46, lean: -.29, drop: -.05, push: -.13, twist: .27, roll: .05, head: -.18, rX: -2.95, rE: 1.1, rZ: .24, lX: -.6, lE: .78, lZ: .32, glow: .85, step: .22, stepY: .15 },
+      { t: .52, lean: .44, drop: -.16, push: .24, twist: -.18, head: .24, rX: -.6, rE: .1, rZ: .05, lX: .35, lE: .45, lZ: .45, glow: 1, step: .5, ease: 'in' },
+      { t: .6, lean: .5, drop: -.21, push: .27, twist: -.22, head: .28, rX: -.32, rE: .12, rZ: .04, lX: .42, lE: .45, lZ: .48, glow: 1, step: .5 },
+      { t: .8, lean: .28, drop: -.12, push: .14, twist: -.1, head: .14, rX: -.62, rE: .32, rZ: .08, lX: .2, lE: .5, lZ: .35, step: .38 },
       { t: 1 },
     ],
   },
+  // bandido: corte horizontal da direita para a esquerda, o quadril gira antes do ombro
   slash: {
-    id: 'slash', duration: .95, hitAt: .5, lunge: .45, lungeFrom: .34, lungeTo: .5, air: 0, damage: 1, aoe: false, arc: 'h',
+    id: 'slash', duration: 1, hitAt: .5, lunge: .45, lungeFrom: .36, lungeTo: .52, air: 0, damage: 1, aoe: false, arc: 'h',
     keys: [
       { t: 0 },
-      { t: .34, lean: -.06, drop: -.1, push: -.12, twist: .85, roll: .12, head: -.05, headYaw: -.35, rX: -1, rE: .5, rZ: .15, lX: -.3, lE: .9, lZ: .4, glow: .6 },
-      { t: .5, lean: .2, drop: -.1, push: .18, twist: -.85, roll: -.1, head: .05, headYaw: .3, rX: -1.2, rE: .15, rZ: .1, lX: .2, lE: .3, lZ: .9, glow: 1, ease: 'out' },
-      { t: .68, lean: .2, drop: -.1, push: .18, twist: -.8, roll: -.1, head: .05, headYaw: .3, rX: -1.2, rE: .2, rZ: .1, lX: .2, lE: .3, lZ: .8 },
+      { t: .14, lean: -.03, drop: -.04, twist: .32, rX: -.6, rE: .5, rZ: .15, lE: .5, glow: .2 },
+      { t: .36, lean: -.08, drop: -.1, push: -.12, twist: .95, roll: .14, head: -.05, headYaw: -.4, rX: -1.05, rE: .55, rZ: .2, lX: -.35, lE: .95, lZ: .45, glow: .6, step: .12, stepY: .1 },
+      { t: .5, lean: .22, drop: -.12, push: .2, twist: -.9, roll: -.12, head: .05, headYaw: .32, rX: -1.25, rE: .12, rZ: .1, lX: .25, lE: .3, lZ: .95, glow: 1, step: .48, ease: 'out' },
+      { t: .6, lean: .27, drop: -.13, push: .22, twist: -1.15, roll: -.16, head: .06, headYaw: .38, rX: -1, rE: .16, rZ: .3, lX: .3, lE: .3, lZ: .9, glow: 1, step: .48 },
+      { t: .82, lean: .1, drop: -.06, push: .08, twist: -.35, roll: -.05, headYaw: .1, rX: -.5, rE: .35, rZ: .12, lX: .1, lE: .5, lZ: .4, step: .3 },
       { t: 1 },
     ],
   },
+  // demônio: garras em arco amplo, o corpo todo acompanha
   swipe: {
-    id: 'swipe', duration: 1, hitAt: .5, lunge: .4, lungeFrom: .34, lungeTo: .5, air: 0, damage: 1, aoe: false, arc: 'h',
+    id: 'swipe', duration: 1, hitAt: .5, lunge: .45, lungeFrom: .36, lungeTo: .52, air: 0, damage: 1, aoe: false, arc: 'h',
     keys: [
       { t: 0 },
-      { t: .36, lean: -.1, drop: -.1, push: -.1, twist: .55, roll: .08, head: -.06, headYaw: -.3, rX: -.8, rE: .6, rZ: .5, lX: -.5, lE: 1, lZ: .4, glow: 1 },
-      { t: .5, lean: .28, drop: -.1, push: .25, twist: -.6, roll: -.08, head: .1, headYaw: .25, rX: -1.2, rE: .1, rZ: .1, lX: -1, lE: .3, lZ: .1, glow: 1, ease: 'out' },
-      { t: .7, lean: .25, drop: -.08, push: .22, twist: -.55, head: .08, headYaw: .2, rX: -1.1, rE: .15, rZ: .1, lX: -.9, lE: .3, lZ: .1 },
+      { t: .18, lean: -.04, drop: -.05, twist: .2, rX: -.4, rE: .6, lX: -.3, lE: .5, glow: .4 },
+      { t: .38, lean: -.14, drop: -.12, push: -.12, twist: .65, roll: .1, head: -.1, headYaw: -.35, rX: -.9, rE: .7, rZ: .6, lX: -.55, lE: 1.05, lZ: .45, glow: 1, step: .1, stepY: .1 },
+      { t: .5, lean: .32, drop: -.12, push: .28, twist: -.7, roll: -.1, head: .12, headYaw: .28, rX: -1.25, rE: .08, rZ: .05, lX: -1.05, lE: .3, lZ: .1, glow: 1, step: .45, ease: 'out' },
+      { t: .62, lean: .36, drop: -.14, push: .3, twist: -.88, roll: -.13, head: .14, headYaw: .32, rX: -1, rE: .12, rZ: -.12, lX: -.9, lE: .35, lZ: .12, glow: 1, step: .45 },
+      { t: .84, lean: .14, drop: -.06, push: .1, twist: -.25, head: .05, headYaw: .1, rX: -.5, rE: .35, rZ: .1, lX: -.4, lE: .4, lZ: .15, step: .28 },
       { t: 1 },
     ],
   },
+  // demônio: salta com os dois braços erguidos e esmaga o chão (área)
   slam: {
-    id: 'slam', duration: 1.3, hitAt: .56, lunge: .25, lungeFrom: .46, lungeTo: .56, air: 0, damage: 1.35, aoe: true, arc: 'none',
+    id: 'slam', duration: 1.35, hitAt: .57, lunge: .35, lungeFrom: .45, lungeTo: .57, air: .22, damage: 1.35, aoe: true, arc: 'none',
     keys: [
       { t: 0 },
-      { t: .46, lean: -.32, drop: -.05, push: -.14, head: -.28, rX: -2.8, rE: .5, rZ: .35, lX: -2.8, lE: .5, lZ: .35, glow: 1 },
-      { t: .56, lean: .5, drop: -.22, push: .28, head: .3, rX: -.4, rE: .2, rZ: .1, lX: -.4, lE: .2, lZ: .1, glow: 1, ease: 'in' },
-      { t: .76, lean: .46, drop: -.2, push: .26, head: .28, rX: -.4, rE: .2, rZ: .1, lX: -.4, lE: .2, lZ: .1 },
+      { t: .2, lean: .1, drop: -.13, push: .02, head: .08, rX: -.5, rE: .65, lX: -.5, lE: .65, glow: .4 },
+      { t: .44, lean: -.36, drop: -.02, push: -.16, head: -.32, rX: -2.9, rE: .55, rZ: .4, lX: -2.9, lE: .55, lZ: .4, glow: 1, step: .1, stepY: .15 },
+      { t: .5, lean: -.39, drop: 0, push: -.17, head: -.34, rX: -3, rE: .45, rZ: .42, lX: -3, lE: .45, lZ: .42, glow: 1, step: .24, stepY: .2 },
+      { t: .57, lean: .55, drop: -.26, push: .3, head: .32, rX: -.3, rE: .15, rZ: .12, lX: -.3, lE: .15, lZ: .12, glow: 1, step: .45, ease: 'in' },
+      { t: .65, lean: .6, drop: -.33, push: .32, head: .36, rX: -.15, rE: .18, rZ: .14, lX: -.15, lE: .18, lZ: .14, glow: 1, step: .45 },
+      { t: .86, lean: .3, drop: -.15, push: .15, head: .15, rX: -.5, rE: .4, rZ: .1, lX: -.5, lE: .4, lZ: .1, step: .3 },
+      { t: 1 },
+    ],
+  },
+  // bandido: estocada rápida, enrola o corpo e estica o braço com um passo longo
+  thrust: {
+    id: 'thrust', duration: .9, hitAt: .48, lunge: .75, lungeFrom: .34, lungeTo: .5, air: 0, damage: .9, aoe: false, arc: 'none',
+    keys: [
+      { t: 0 },
+      { t: .3, lean: -.05, drop: -.16, push: -.2, twist: .55, head: -.08, rX: -.25, rE: 1.5, rZ: .12, lX: -.6, lE: .6, lZ: .4, glow: .7, step: .05, stepY: .12 },
+      { t: .48, lean: .35, drop: -.14, push: .35, twist: -.35, head: .15, rX: -1.45, rE: 0, rZ: .02, lX: .4, lE: .3, lZ: .5, glow: 1, step: .65, ease: 'out' },
+      { t: .6, lean: .38, drop: -.15, push: .37, twist: -.4, head: .16, rX: -1.4, rE: .05, rZ: .02, lX: .45, lE: .3, lZ: .52, glow: 1, step: .65 },
+      { t: .85, lean: .12, drop: -.06, push: .1, twist: -.1, rX: -.5, rE: .5, lX: .1, lE: .5, lZ: .3, step: .35 },
+      { t: 1 },
+    ],
+  },
+  // demônio: finta com a garra esquerda e acerta com a direita (o dano vem no segundo golpe)
+  combo: {
+    id: 'combo', duration: 1.45, hitAt: .7, lunge: .6, lungeFrom: .54, lungeTo: .7, air: 0, damage: 1.15, aoe: false, arc: 'h',
+    keys: [
+      { t: 0 },
+      { t: .2, lean: -.08, drop: -.08, twist: -.5, rX: -.3, rE: .6, lX: -.9, lE: .7, lZ: .6, glow: .6 },
+      { t: .32, lean: .25, drop: -.1, push: .18, twist: .55, headYaw: -.2, rX: -.6, rE: .8, rZ: .4, lX: -1.2, lE: .1, lZ: .05, glow: 1, step: .25, ease: 'out' },
+      { t: .5, lean: 0, drop: -.12, push: .05, twist: .8, roll: .12, headYaw: -.3, rX: -.95, rE: .7, rZ: .6, lX: -.8, lE: .6, lZ: .2, glow: 1, step: .3, stepY: .1 },
+      { t: .7, lean: .34, drop: -.13, push: .3, twist: -.75, roll: -.1, headYaw: .3, rX: -1.25, rE: .08, rZ: .05, lX: -.6, lE: .5, lZ: .15, glow: 1, step: .6, ease: 'out' },
+      { t: .8, lean: .38, drop: -.14, push: .32, twist: -.92, roll: -.13, headYaw: .34, rX: -1, rE: .12, rZ: -.1, lX: -.55, lE: .5, lZ: .15, glow: 1, step: .6 },
+      { t: .92, lean: .14, drop: -.06, push: .1, twist: -.25, headYaw: .1, rX: -.45, rE: .35, lX: -.35, lE: .45, step: .32 },
       { t: 1 },
     ],
   },
 };
 
+// recuo ao levar um golpe: tranco rápido, um pequeno rebote para a frente e a volta à guarda
 const FLINCH: Key[] = [
   { t: 0 },
-  { t: .18, lean: -.3, drop: -.05, push: -.18, head: -.35, jaw: .5, rX: .5, lX: .5, rE: .5, lE: .5, rZ: .5, lZ: .5 },
+  { t: .14, lean: -.34, drop: -.07, push: -.2, head: -.38, jaw: .5, rX: .55, lX: .55, rE: .55, lE: .55, rZ: .5, lZ: .5, ease: 'out' },
+  { t: .42, lean: .06, drop: -.04, push: .03, head: .08, rX: .15, lX: .15, rE: .3, lE: .3, rZ: .15, lZ: .15 },
   { t: 1 },
 ];
-
 /* ------------------------------------------------------------------ *
  *  Rig types
  * ------------------------------------------------------------------ */
@@ -186,6 +255,10 @@ type Mob = {
   netHeldAt?: number;
   /** Corrida do Mixamo: peso atual e tempo no clipe (bandidos com modelo). */
   runW?: number; runT?: number;
+  /** Quanto o golpe atual já avançou o corpo (m): o pé de trás fica plantado enquanto isso. */
+  lungeD?: number;
+  /** Humanoides: pose suavizada por mola (s, v), giro e aceleração recentes (inclinações de peso). */
+  anim?: { s: Pose; v: Pose; yaw: number; yawRate: number; speed: number; accel: number; hover: number; ember: number };
   /** Ameaça por jogador (host): quem mais incomoda vira o alvo. */
   threat?: Map<string, number>;
   /** Alvo atual (id do jogador; host decide, clientes recebem na foto). */
@@ -213,7 +286,9 @@ type Drop = { root: THREE.Group; kind: 'experience' | LootItemId; age: number; v
  * na cena, apenas apagada enquanto estão escondidos.
  */
 const DROP_LIGHTS = 3;
-type FillLight = { light: THREE.PointLight; mob: THREE.Object3D; base: number; offset: THREE.Vector3 };
+type FillLight = { mob: THREE.Object3D; color: THREE.Color; base: number; distance: number; offset: THREE.Vector3 };
+/** Luzes de preenchimento dos inimigos: pool fixo para os mais próximos do jogador (antes era 1 PointLight por inimigo). */
+const MOB_FILL_LIGHTS = 2;
 type Spawn = { kind: MobKind; x: number; z: number };
 
 const SPAWNS: Spawn[] = [
@@ -244,6 +319,8 @@ const GAIT: Record<MobKind, Gait> = {
   bandit: { stride: .7, duty: .62, lift: .14 },
   demon: { stride: .8, duty: .64, lift: .12 },
 };
+/** Demônio: multiplicador de velocidade ao deslizar levitando, e a faixa de velocidade (m/s) em que sai do chão. */
+const DEMON_GLIDE = 1.65, HOVER_FROM = 2.1, HOVER_TO = 2.65;
 /** Galope do lobo procedural: apoio curto (fase aérea), passada longa e patas subindo mais. */
 const WOLF_GALLOP: Gait = { stride: 1.15, duty: .34, lift: .22 };
 /** Velocidades (m/s) em que o lobo passa do trote ao galope. */
@@ -426,6 +503,8 @@ export class CombatSystem {
   private lightRoot = new THREE.Group();
   private fills: FillLight[] = [];
   private dropLights: THREE.PointLight[] = [];
+  private fillLights: THREE.PointLight[] = [];
+  private fillOrder: FillLight[] = [];
   private dropOrder: Drop[] = [];
   private geometries: THREE.BufferGeometry[] = [];
   private materials: THREE.Material[] = [];
@@ -469,6 +548,7 @@ export class CombatSystem {
     this.dropRoot.name = 'mob-drops'; scene.add(this.dropRoot);
     this.lightRoot.name = 'mob-lights'; scene.add(this.lightRoot);
     for (let i = 0; i < DROP_LIGHTS; i++) { const l = new THREE.PointLight('#ffffff', 0, 3); this.lightRoot.add(l); this.dropLights.push(l); }
+    for (let i = 0; i < MOB_FILL_LIGHTS; i++) { const l = new THREE.PointLight('#ffffff', 0, 3.2, 2); this.lightRoot.add(l); this.fillLights.push(l); }
     this.fxRoot.name = 'mob-fx'; scene.add(this.fxRoot);
     this.sphere = this.geometry(new THREE.SphereGeometry(1, 18, 12));
     this.unitCapsule = this.geometry(new THREE.CapsuleGeometry(.5, 1, 6, 12)); // radius .5, total height 2
@@ -497,7 +577,11 @@ export class CombatSystem {
     // lobo modelado (wolf.glb): chega depois de pronto; até lá (ou se falhar) vale o lobo procedural
     new GLTFLoader().load('/models/wolf.glb', gltf => { if (!this.disposed) this.onWolfModel(gltf.scene); }, undefined, () => { /* mantém o procedural */ });
     // demônio modelado (aura.glb): malha de ~1 milhão de vértices, reduzida ao carregar
-    new GLTFLoader().load('/models/aura.glb', gltf => { if (!this.disposed) this.onDemonModel(gltf.scene); }, undefined, () => { /* mantém o procedural */ });
+    new GLTFLoader().load('/models/aura.glb', gltf => {
+      if (this.disposed) return;
+      // o simplificador (WASM) carrega em paralelo; sem ele cai na redução em grade
+      MeshoptSimplifier.ready.then(() => true, () => false).then(ok => { if (!this.disposed) this.onDemonModel(gltf.scene, ok && MeshoptSimplifier.supported); });
+    }, undefined, () => { /* mantém o procedural */ });
     // bandido modelado (perso.glb): cada bandido recebe sua própria cópia do modelo
     const bandits = new GLTFLoader(); registerSpecGloss(bandits);
     bandits.load('/models/perso.glb', gltf => { if (this.disposed) return; this.banditTemplate = gltf.scene; void clipsFor(gltf.scene).then(c => { if (!this.disposed) this.banditRun = c.run ?? null; }); for (const mob of this.mobs) if (mob.kind === 'bandit') this.attachBanditModel(mob); }, undefined, () => { /* mantém o procedural */ });
@@ -543,7 +627,35 @@ export class CombatSystem {
     return out;
   }
 
-  private onDemonModel(scene: THREE.Object3D) {
+  /**
+   * Simplificação por erro quadrático (meshoptimizer): colapsa arestas onde menos muda a forma, preservando as
+   * costuras de UV e normais. A redução em grade fazia vértices vizinhos de lados opostos de uma costura irem para
+   * posições médias diferentes, abrindo rachaduras escuras no vestido e no cabelo.
+   */
+  private static simplify(geo: THREE.BufferGeometry, triangles: number) {
+    const pos = geo.attributes.position as THREE.BufferAttribute, nor = geo.attributes.normal as THREE.BufferAttribute, uv = geo.attributes.uv as THREE.BufferAttribute;
+    const n = pos.count, P = new Float32Array(n * 3), A = new Float32Array(n * 5);
+    for (let i = 0; i < n; i++) {
+      P[i * 3] = pos.getX(i); P[i * 3 + 1] = pos.getY(i); P[i * 3 + 2] = pos.getZ(i);
+      A[i * 5] = nor.getX(i); A[i * 5 + 1] = nor.getY(i); A[i * 5 + 2] = nor.getZ(i); A[i * 5 + 3] = uv.getX(i); A[i * 5 + 4] = uv.getY(i);
+    }
+    const src = geo.index ? Uint32Array.from(geo.index.array as ArrayLike<number>) : Uint32Array.from({ length: n }, (_, i) => i);
+    // normais pesam pouco (silhueta manda), UV pesa mais (a textura não pode escorregar)
+    const [idx] = MeshoptSimplifier.simplifyWithAttributes(src, P, 3, A, 5, [.3, .3, .3, 1.2, 1.2], null, Math.min(src.length, triangles * 3), .02);
+    const [remap, m] = MeshoptSimplifier.compactMesh(idx);
+    const OP = new Float32Array(m * 3), ON = new Float32Array(m * 3), OU = new Float32Array(m * 2);
+    for (let i = 0; i < n; i++) {
+      const j = remap[i]; if (j === 0xffffffff) continue;
+      OP[j * 3] = P[i * 3]; OP[j * 3 + 1] = P[i * 3 + 1]; OP[j * 3 + 2] = P[i * 3 + 2];
+      ON[j * 3] = A[i * 5]; ON[j * 3 + 1] = A[i * 5 + 1]; ON[j * 3 + 2] = A[i * 5 + 2]; OU[j * 2] = A[i * 5 + 3]; OU[j * 2 + 1] = A[i * 5 + 4];
+    }
+    const out = new THREE.BufferGeometry();
+    out.setAttribute('position', new THREE.BufferAttribute(OP, 3)); out.setAttribute('normal', new THREE.BufferAttribute(ON, 3)); out.setAttribute('uv', new THREE.BufferAttribute(OU, 2));
+    out.setIndex(new THREE.BufferAttribute(m > 65535 ? idx : new Uint16Array(idx), 1));
+    return out;
+  }
+
+  private onDemonModel(scene: THREE.Object3D, meshopt: boolean) {
     scene.updateMatrixWorld(true);
     let src: THREE.Mesh | null = null; scene.traverse(o => { if (!src && (o as THREE.Mesh).isMesh) src = o as THREE.Mesh; });
     if (!src) return;
@@ -553,7 +665,11 @@ export class CombatSystem {
     // tamanho final e pés no chão, antes de reduzir (a célula é relativa à altura)
     baked.rotateY(CombatSystem.DEMON_YAW); baked.scale(k, k, k); baked.computeBoundingBox();
     const bb = baked.boundingBox!; baked.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2);
-    const geo = CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.0045, 1 / 900);
+    // o modelo original tem ~1 milhão de triângulos; ~90 mil bastam a esta distância de câmera.
+    // Reserva (sem WASM): célula de ~3,7 cm na grade, que deixa rachaduras nas costuras de UV.
+    let geo: THREE.BufferGeometry;
+    try { geo = meshopt ? CombatSystem.simplify(baked, 90000) : CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.016, 1 / 160); }
+    catch { geo = CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.016, 1 / 160); }
     baked.dispose();
     // o eixo do corpo (pernas, tronco) fica na origem; a caixa envolvente estava deslocada pela cauda do vestido
     geo.translate(0, 0, DEMON_DZ);
@@ -629,7 +745,8 @@ export class CombatSystem {
     const r = mob.rig, A = DEMON_ANAT, root = mob.root;
     const fit: RigFit = {
       pelvisY: A.pelvis[1], pelvisZ: A.pelvis[2], walkDrop: .015, jaw: 1, arm: { x: 0, z: 0, e: 0 },
-      gait: { stride: .6, duty: .6, lift: .09 }, gallop: null, cadence: 3.4, legScale: 1, compass: true,
+      // passadas longas e calmas (antes .6 m a ~3,6 passos/s parecia um arrastar apressado)
+      gait: { stride: .74, duty: .6, lift: .08 }, gallop: null, cadence: 2.6, legScale: 1, compass: true,
     };
     r.fit = fit;
     this.neutralPose(mob)();
@@ -817,8 +934,34 @@ export class CombatSystem {
       if (this.tmpA.distanceTo(point) > radius + stats.radius) continue;
       this.applyHit(mob, point, damage, 1); count++;
     }
+    for (const t of this.pvpTargets) {
+      if (capsuleDistance(t.pos, point) > radius) continue;
+      this.hitPlayer(t, point, damage, radius, 1); count++;
+    }
     return count;
   }
+
+  /* ==================================================================== PvP (ver pvp.ts)
+   * Os mesmos testes de dano (área, segmento, primeiro contato) também valem para os jogadores hostis.
+   * O dano NÃO é aplicado aqui: onPlayerHit manda o golpe para a vítima, que valida e aplica.
+   */
+  /** Jogadores que posso ferir agora (flag PvP dos dois lados, fora do grupo, vivos). O jogo atualiza a cada quadro. */
+  pvpTargets: { id: string; pos: THREE.Vector3 }[] = [];
+  /** Meu golpe acertou o jogador id: o jogo envia `phit` para ele. */
+  onPlayerHit: (id: string, damage: number, point: THREE.Vector3, radius: number, knock: number) => void = () => {};
+  private readonly pvpKeys = new Map<string, object>();
+  private readonly pvpTmp = new THREE.Vector3();
+  /** Objeto estável por jogador (para o conjunto `once` dos projéteis que atravessam). */
+  private pvpKey(id: string) { let k = this.pvpKeys.get(id); if (!k) this.pvpKeys.set(id, k = { id }); return k; }
+  private hitPlayer(t: { id: string; pos: THREE.Vector3 }, point: THREE.Vector3, damage: number, radius: number, knock: number) {
+    this.onPlayerHit(t.id, damage, point, radius, knock);
+    // retorno imediato na tela do atacante (o número é uma previsão: sem esquiva/escudo/resistência da vítima)
+    this.onDamageNumber(new THREE.Vector3(t.pos.x, t.pos.y + 2.2, t.pos.z), Math.round(pvpDamage(damage)), 'mine');
+    this.onSfx('hitEnemy', damage / 60);
+    this.tmpD.set(t.pos.x, t.pos.y + 1, t.pos.z); this.particles.emit(this.tmpD, '#ff8a6a', 6 + Math.min(8, Math.floor(damage / 6)), 3.2, 1.8, .4, 1);
+  }
+  /** Algum jogador hostil a até pad da cápsula do ponto? (colisão de projéteis) */
+  hitsPlayer(point: THREE.Vector3, pad: number) { return this.pvpTargets.some(t => capsuleDistance(t.pos, point) <= pad); }
 
   /**
    * Primeiro inimigo vivo tocado pelo segmento from → to (raio radius + corpo do inimigo). Não causa dano:
@@ -835,6 +978,11 @@ export class CombatSystem {
       if (contact.distanceTo(this.tmpA) > radius + stats.radius) continue;
       const d = contact.distanceToSquared(from);
       if (d < best) { best = d; out.copy(contact); }
+    }
+    for (const t of this.pvpTargets) {
+      if (segmentCapsuleDistance(t.pos, from, to, this.pvpTmp) > radius) continue;
+      const d = this.pvpTmp.distanceToSquared(from);
+      if (d < best) { best = d; out.copy(this.pvpTmp); }
     }
     return best < Infinity ? out : null;
   }
@@ -857,6 +1005,14 @@ export class CombatSystem {
       once?.add(mob);
       onHit?.(contact);
       this.applyHit(mob, contact, damage, knock); count++;
+    }
+    for (const t of this.pvpTargets) {
+      const key = this.pvpKey(t.id); if (once?.has(key)) continue;
+      if (segmentCapsuleDistance(t.pos, from, to, this.pvpTmp) > radius) continue;
+      once?.add(key);
+      const contact = this.pvpTmp.clone();
+      onHit?.(contact);
+      this.hitPlayer(t, contact, damage, radius, knock); count++;
     }
     return count;
   }
@@ -902,6 +1058,8 @@ export class CombatSystem {
     }
   }
 
+  /** Dano recebido vindo de (x, z): o jogo mostra o indicador de direção. */
+  onHurtFrom: (x: number, z: number) => void = () => {};
   /** Durante a cutscene do Agarrão a heroína não recebe golpes. */
   invulnerable = false;
 
@@ -1047,6 +1205,7 @@ export class CombatSystem {
     if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
+    this.onHurtFrom(fromX, fromZ);
     this.tmpA.set(player.x, player.y + 1, player.z); this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
 
@@ -1079,7 +1238,7 @@ export class CombatSystem {
     mob.vel.x = damp(mob.vel.x, (pos.x - mob.prev.x) * inv, 12, dt); mob.vel.y = damp(mob.vel.y, (pos.z - mob.prev.y) * inv, 12, dt);
     mob.prev.set(pos.x, pos.z);
     mob.vf = mob.vel.x * sy + mob.vel.y * cy; mob.vs = mob.vel.x * cy - mob.vel.y * sy;
-    mob.speed = damp(mob.speed, Math.min(stats.speed * 1.5, Math.hypot(mob.vel.x, mob.vel.y)), 8, dt);
+    mob.speed = damp(mob.speed, Math.min(stats.speed * 1.8, Math.hypot(mob.vel.x, mob.vel.y)), 8, dt);
     const dist = Math.hypot(player.x - pos.x, player.z - pos.z);
     mob.aggro = dist < 24; mob.alert = damp(mob.alert, mob.aggro ? 1 : 0, 4, dt);
     mob.look = damp(mob.look, 0, 6, dt);
@@ -1282,9 +1441,15 @@ export class CombatSystem {
     }
 
     // luzes de contagem fixa (ver DROP_LIGHTS)
-    for (const f of this.fills) {
-      const on = f.mob.visible; f.light.intensity = on ? f.base : 0;
-      if (on) f.mob.localToWorld(f.light.position.copy(f.offset));
+    // preenchimento: o pool fixo (MOB_FILL_LIGHTS) vai para os inimigos visíveis mais próximos
+    const fo = this.fillOrder; fo.length = 0;
+    for (const f of this.fills) if (f.mob.visible) fo.push(f);
+    if (fo.length > MOB_FILL_LIGHTS) fo.sort((a, b) => a.mob.position.distanceToSquared(player) - b.mob.position.distanceToSquared(player));
+    for (let i = 0; i < MOB_FILL_LIGHTS; i++) {
+      const l = this.fillLights[i], f = fo[i];
+      if (!f) { l.intensity = 0; continue; }
+      l.intensity = f.base; l.color.copy(f.color); l.distance = f.distance;
+      f.mob.localToWorld(l.position.copy(f.offset));
     }
     const order = this.dropOrder; order.length = 0; order.push(...this.drops);
     if (order.length > DROP_LIGHTS) order.sort((a, b) => a.root.position.distanceToSquared(player) - b.root.position.distanceToSquared(player));
@@ -1350,6 +1515,8 @@ export class CombatSystem {
     if (!def && mob.stagger <= 0) {
       if (mob.aggro && distance > stats.range * .8) {
         want = stats.speed * (mob.kind === 'wolf' && distance > 9 ? 1.4 : 1);
+        // demônio longe da presa: levita e desliza rente ao chão (applyHumanoid lê a velocidade, inclusive no cliente)
+        if (mob.kind === 'demon' && distance > 6.5) want = stats.speed * DEMON_GLIDE;
         if (mob.kind === 'wolf' && distance < 4.8 && mob.attackTimer > .5) { want *= .6; strafe = mob.strafeDir * .75; }
       } else if (returning) want = stats.speed * .45;
     }
@@ -1370,7 +1537,7 @@ export class CombatSystem {
       const span = def.lungeTo - def.lungeFrom;
       const u = clamp((progress - def.lungeFrom) / span, 0, 1), f = u * u * (3 - 2 * u);
       const move = Math.min(def.lunge * (f - mob.lungeU), Math.max(0, distance - .85));
-      mob.lungeU = f;
+      mob.lungeU = f; mob.lungeD = (mob.lungeD ?? 0) + move;
       pos.x += sy * move; pos.z += cy * move;
       mob.air = def.air * Math.sin(clamp((progress - def.lungeFrom) / (span + .1), 0, 1) * Math.PI);
     } else mob.air = damp(mob.air, 0, 12, dt);
@@ -1461,10 +1628,13 @@ export class CombatSystem {
 
   private beginAttack(mob: Mob) {
     const stats = MOB_STATS[mob.kind];
-    const id: AttackId = mob.kind === 'wolf' ? 'bite' : mob.kind === 'bandit' ? (Math.random() < .5 ? 'overhead' : 'slash') : (Math.random() < .35 ? 'slam' : 'swipe');
+    const r = Math.random();
+    const id: AttackId = mob.kind === 'wolf' ? 'bite'
+      : mob.kind === 'bandit' ? (r < .38 ? 'overhead' : r < .74 ? 'slash' : 'thrust')
+      : (r < .3 ? 'slam' : r < .55 ? 'combo' : 'swipe');
     const def = ATTACKS[id];
     this.onSfx(mob.kind === 'wolf' ? 'wolfAttack' : mob.kind === 'bandit' ? 'banditAttack' : 'demonAttack');
-    mob.attack = def; mob.attackAge = 0; mob.attackHit = false; mob.lungeU = 0;
+    mob.attack = def; mob.attackAge = 0; mob.attackHit = false; mob.lungeU = 0; mob.lungeD = 0;
     mob.attackTimer = stats.cadence * (.85 + Math.random() * .3);
     const arc = mob.arc;
     if (arc) {
@@ -1496,6 +1666,7 @@ export class CombatSystem {
     if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = stats.damage * def.damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
+    this.onHurtFrom(root.position.x, root.position.z);
     this.tmpA.set(player.x, player.y + 1, player.z);
     this.particles.emit(this.tmpA, '#ff6a4a', 10, 3.5, 2, .45, 1);
   }
@@ -1631,15 +1802,55 @@ export class CombatSystem {
     }
   }
 
-  private applyHumanoid(mob: Mob, p: Pose, t: number, dt: number) {
-    const r = mob.rig, fit = r.fit, kind = mob.kind, g = this.gaitOf(mob), heavy = kind === 'demon' ? 1.12 : 1;
-    const speedN = clamp(mob.speed / MOB_STATS[kind].speed, 0, 1.5);
-    const amp = strideAmp(g, speedN), w = smoothstep(speedN, .05, .6);
-    const c = mob.gait * TAU, alert = mob.alert, guard = mob.guard;
-    const breath = Math.sin(t * 2.1 + mob.phase), sway = Math.sin(c) * w;
-    const armX = fit?.arm.x ?? 0, armZ = fit?.arm.z ?? 0, armE = fit?.arm.e ?? 0;
+  /**
+   * Segue a pose pedida (golpe, recuo, morte) com uma mola amortecida: dá peso e inércia ao corpo, um leve
+   * passar do ponto no impacto, e nada estala quando um golpe é interrompido ou o recuo começa.
+   */
+  private followPose(mob: Mob, target: Pose, dt: number): Pose {
+    const a = mob.anim ??= { s: { ...target }, v: newPose(), yaw: mob.root.rotation.y, yawRate: 0, speed: mob.speed, accel: 0, hover: 0, ember: 0 };
+    const s = a.s, v = a.v, w = mob.kind === 'demon' ? 17 : 22, z = .74;
+    const n = Math.min(8, Math.max(1, Math.ceil(dt * 120))), h = dt / n;
+    for (let k = 0; k < n; k++) for (const f of POSE_FIELDS) {
+      v[f] += (w * w * (target[f] - s[f]) - 2 * z * w * v[f]) * h;
+      s[f] += v[f] * h;
+    }
+    s.glow = target.glow; // o brilho dos olhos acompanha o golpe sem atraso
+    return s;
+  }
 
+  private applyHumanoid(mob: Mob, target: Pose, t: number, dt: number) {
+    const r = mob.rig, fit = r.fit, kind = mob.kind, g = this.gaitOf(mob), demon = kind === 'demon', heavy = demon ? 1.12 : 1;
+    const p = this.followPose(mob, target, dt), an = mob.anim!, alive = mob.health > 0;
+    // giro e aceleração recentes: o corpo inclina para dentro da curva, "puxa" ao arrancar e segura ao frear
+    const yaw = mob.root.rotation.y, inv = 1 / Math.max(dt, 1e-3);
+    const dYaw = THREE.MathUtils.euclideanModulo(yaw - an.yaw + Math.PI, TAU) - Math.PI; an.yaw = yaw;
+    an.yawRate = damp(an.yawRate, alive ? clamp(dYaw * inv, -6, 6) : 0, 8, dt);
+    an.accel = damp(an.accel, alive ? clamp((mob.speed - an.speed) * inv, -12, 12) : 0, 6, dt); an.speed = mob.speed;
+
+    // demônio levitando: as pernas param de dar passos e pendem, o corpo flutua inclinado e o vestido arrasta
+    an.hover = damp(an.hover, demon && alive && !mob.attack && mob.stagger <= 0 ? smoothstep(mob.speed, HOVER_FROM, HOVER_TO) : 0, 4, dt);
+    const hover = an.hover, ground = 1 - hover;
+    const speedN = clamp(mob.speed / MOB_STATS[kind].speed, 0, 1.5);
+    const amp = strideAmp(g, speedN) * ground, w = smoothstep(speedN, .05, .6) * ground, still = 1 - smoothstep(speedN, .05, .6);
+    const c = mob.gait * TAU, alert = mob.alert, guard = mob.guard;
+    const breath = Math.sin(t * (demon ? 1.5 : 2.1) + mob.phase), sway = Math.sin(c) * w;
+    const armX = fit?.arm.x ?? 0, armZ = fit?.arm.z ?? 0, armE = fit?.arm.e ?? 0, k = fit?.legScale ?? 1;
+    const bank = clamp(-an.yawRate * .05 * (.4 + w), -.16, .16), surge = clamp(an.accel * .025, -.12, .14);
+    // parado: o peso passeia devagar de um pé para o outro, e de vez em quando ele olha em volta
+    const shift = alive ? Math.sin(t * .42 + mob.phase * 3) * still : 0;
+    const gl = Math.sin(t * .23 + mob.phase * 7), glance = alive ? Math.sign(gl) * smoothstep(Math.abs(gl), .8, .97) * .5 * still * (1 - alert) : 0;
+    // demônio: o corpo assenta de leve no contato de cada pé (andar firme, mas elegante; antes afundava 5 cm)
+    const stomp = demon ? Math.pow(Math.max(0, Math.cos(c * 2)), 6) * .02 * w : 0;
+    // levitação: altura com um balanço lento; os pés pendem um pouco atrás, um mais que o outro, com a ponta esticada
+    const hoverY = hover * (.3 + Math.sin(t * 2.1 + mob.phase) * .035);
+
+    // pés: marcha + passo do golpe (pé da frente avança e sobe; o de trás fica plantado enquanto o corpo avança)
+    const atk = mob.attack, prog = atk ? mob.attackAge / atk.duration : 1;
+    const trail = atk ? -Math.min(mob.lungeD ?? 0, .45) * (1 - smoothstep(prog, atk.hitAt + .12, .95)) : 0;
     const feet = r.legs.map(leg => this.footCycle(mob, leg, amp, g));
+    const fz = r.legs.map((leg, i) => lerp(leg.restZ, leg.footZ, w) + feet[i].stepZ + (leg.side < 0 ? p.step * k : trail) - hover * (leg.side < 0 ? .04 : .15));
+    const fy = r.legs.map((leg, i) => leg.footY + feet[i].lift + (leg.side < 0 ? Math.max(0, p.stepY) * k : 0));
+
     let py = (fit?.pelvisY ?? PELVIS_Y) - Math.cos(c * 2) * .04 * w * heavy;
     const pz = (fit?.pelvisZ ?? 0) + p.push;
     if (fit && fit.compass) {
@@ -1647,37 +1858,56 @@ export class CombatSystem {
       // (malha reta no apoio, só dobra no balanço); sobe no meio do apoio e desce no duplo apoio, sem salto na troca
       py = fit.pelvisY;
       r.legs.forEach((leg, i) => {
-        const dz = lerp(leg.restZ, leg.footZ, w) + feet[i].stepZ - (pz + leg.hz);
-        const need = Math.sqrt(Math.max(0, leg.stance * leg.stance - dz * dz)) + leg.footY - leg.hy + feet[i].lift * 3;
+        // pé além do alcance da perna (passada longa, passo do golpe): limita o avanço considerado; antes a pelve
+        // descia até o chão por um quadro e o IK invertia a perna (o quadril girava ~5 rad e voltava)
+        const dz = clamp(fz[i] - (pz + leg.hz), -leg.stance * .8, leg.stance * .8);
+        const need = Math.sqrt(leg.stance * leg.stance - dz * dz) + leg.footY - leg.hy + feet[i].lift * 3;
         if (need < py) py = need;
       });
+      py = Math.max(py, fit.pelvisY * .72);
       py -= fit.walkDrop * w; // sem agachar em alerta: com salto alto a perna de apoio fica esticada
     } else py -= alert * .03;
-    r.pelvis.position.set(sway * .028, py + p.drop + breath * .006, pz);
-    r.pelvis.rotation.set(.03 * w + p.lean * .3 + alert * .04, p.twist * .35 + sway * .1 * heavy, sway * .035 + p.roll * .4);
-    r.chest.rotation.set(p.lean * .7 + w * .04 + breath * .01, p.twist * .65 - sway * .2 * heavy, -sway * .04 + p.roll * .6);
+    py += hoverY;
+    // pés pendentes: sobem com o corpo, mas um pouco menos (joelhos levemente dobrados)
+    if (hover > 0) r.legs.forEach((leg, i) => { fy[i] += hoverY - hover * (leg.side < 0 ? .03 : .07); });
+    // demônio: quadril balança mais de lado e cai do lado da perna no ar (andar de passarela, não de soldado)
+    const hipSway = demon ? .045 : .028, hipDrop = demon ? .07 : .035;
+    r.pelvis.position.set(sway * hipSway + shift * .035, py + p.drop + breath * .006 - guard * .04 * still - stomp, pz);
+    r.pelvis.rotation.set(.03 * w + p.lean * .3 + alert * .04 + surge * .5 + hover * .05, p.twist * .35 + sway * .1 * heavy, sway * hipDrop + p.roll * .4 + bank * .6 - shift * .03);
+    r.chest.rotation.set(p.lean * .7 + w * .04 + breath * (demon ? .025 : .01) + surge + hover * .03,
+      p.twist * .65 - sway * .2 * heavy + clamp(an.yawRate * .04, -.2, .2), -sway * .04 + p.roll * .6 + bank * .4 + shift * .02);
     r.head.rotation.set(
       p.head - (r.pelvis.rotation.x + r.chest.rotation.x) * .6 + .02 + Math.sin(t * 1.6 + mob.phase) * .02,
-      mob.look * .7 + p.headYaw - (r.pelvis.rotation.y + r.chest.rotation.y) * .6, 0);
+      mob.look * .7 + p.headYaw - (r.pelvis.rotation.y + r.chest.rotation.y) * .6 + clamp(an.yawRate * .07, -.35, .35) + glance, 0);
     if (r.breath) {
       const base = r.breath.userData.base as THREE.Vector3;
-      r.breath.scale.set(base.x * (1 + breath * .01), base.y, base.z * (1 + breath * .018));
+      r.breath.scale.set(base.x * (1 + breath * .01), base.y, base.z * (1 + breath * (demon ? .03 : .018)));
     }
 
     for (const arm of r.arms) {
-      const left = arm.side < 0;
+      const left = arm.side < 0, ph = (mob.gait + arm.legPhase) * TAU;
       const pX = left ? p.lX : p.rX, pZ = left ? p.lZ : p.rZ, pE = left ? p.lE : p.rE;
-      const swing = Math.cos((mob.gait + arm.legPhase) * TAU) * (arm.weapon ? .2 : .45) * w * heavy;
+      const swing = Math.cos(ph) * (arm.weapon ? .2 : .45) * w * heavy;
       const guardX = (arm.weapon ? -.5 : -.3) * guard, idleSway = Math.sin(t * 1.7 + mob.phase + arm.side) * .02;
-      arm.shoulder.rotation.set(-.06 + swing + pX + guardX + idleSway + armX, 0, arm.side * (.1 + pZ + armZ));
-      arm.elbow.rotation.x = -(.22 + pE + guard * .55 + w * .12 + armE);
-      arm.wrist.rotation.x = arm.weapon ? -.45 : -.1;
+      // o cotovelo dobra mais no balanço para a frente e o punho chega atrasado (braço solto, não um pêndulo rígido)
+      const elbowSwing = Math.max(0, -Math.cos(ph - .5)) * .35 * w;
+      // levitando: braços abertos e puxados para trás pelo vento, mãos atrasadas, um tremular leve
+      const flutter = Math.sin(t * 3.1 + arm.side * 1.7 + mob.phase) * .05 * hover;
+      arm.shoulder.rotation.set(-.06 + swing + pX + guardX * ground + idleSway + armX + surge * .6 + hover * .42 + flutter, 0, arm.side * (.1 + pZ + armZ + breath * (demon ? .025 : .012) + hover * .28));
+      arm.elbow.rotation.x = -(.22 + pE + guard * .55 * ground + w * .12 + armE + elbowSwing - hover * .12);
+      arm.wrist.rotation.x = (arm.weapon ? -.45 : -.1) + Math.sin(ph - 1) * .12 * w + hover * .3 + flutter;
     }
 
     r.legs.forEach((leg, i) => {
-      const { stepZ, lift, toeOff } = feet[i];
-      this.solveLeg(leg, r.pelvis.position.y, r.pelvis.position.z, r.pelvis.rotation.x, 0, lerp(leg.restZ, leg.footZ, w) + stepZ, leg.footY + lift, toeOff * .4);
+      this.solveLeg(leg, r.pelvis.position.y, r.pelvis.position.z, r.pelvis.rotation.x, 0, fz[i], fy[i], feet[i].toeOff * .4 + hover * .7);
     });
+    // brasas caindo da barra do vestido enquanto flutua
+    if (hover > .5 && (an.ember -= dt) <= 0) {
+      an.ember = .07;
+      const a = Math.random() * TAU, root = mob.root.position;
+      this.tmpA.set(root.x + Math.sin(a) * .35, root.y + hoverY * .6 + .05, root.z + Math.cos(a) * .35);
+      this.particles.emit(this.tmpA, Math.random() < .5 ? '#ff7a5a' : '#ffb27a', 1, .25, .5, .55, .55);
+    }
     // bandido com modelo: corre com a animação 'Running' (public/animations) por cima da passada procedural
     let blend: ClipBlend | undefined;
     if (r.retarget && mob.kind === 'bandit' && this.banditRun) {
@@ -1689,7 +1919,14 @@ export class CombatSystem {
     r.retarget?.update(blend);
 
     for (const chain of r.cloth) {
-      if (chain.segs.length === 1 && chain.angle !== 0) this.stepChain(chain, dt, mob.vf * Math.cos(chain.angle) + mob.vs * Math.sin(chain.angle), 0, t * 2 + chain.angle, 0);
+      if (chain.segs.length === 1 && demon) {
+        // painéis da saia: o pé que avança (ou recua) empurra o painel daquele lado para fora; levitando, o vestido
+        // arrasta para trás e ondula mais
+        const sa = Math.sin(chain.angle), ca = Math.cos(chain.angle);
+        let kick = 0;
+        r.legs.forEach((leg, i) => { kick += Math.max(0, (leg.hip.position.x * sa + (fz[i] - pz) * ca) - .06); });
+        this.stepChain(chain, dt, (mob.vf * ca + mob.vs * sa) * (1 + hover * .25), 0, t * (2 + hover * 2.5) + chain.angle, -kick * .95 - hover * .06);
+      } else if (chain.segs.length === 1 && chain.angle !== 0) this.stepChain(chain, dt, mob.vf * Math.cos(chain.angle) + mob.vs * Math.sin(chain.angle), 0, t * 2 + chain.angle, 0);
       else this.stepChain(chain, dt, mob.vf, mob.vs, t * 2.2 + mob.phase, 0);
     }
     for (const chain of r.braids) this.stepChain(chain, dt, mob.vf, mob.vs, t * 2.6 + mob.phase, 0);
@@ -1763,7 +2000,9 @@ export class CombatSystem {
     root.position.set(spawn.x, terrainHeight(spawn.x, spawn.z), spawn.z); this.root.add(root);
     const rig = spawn.kind === 'wolf' ? this.buildWolf(root) : this.buildHumanoid(root, spawn.kind);
     for (const light of root.children.filter(c => (c as THREE.PointLight).isPointLight) as THREE.PointLight[]) {
-      this.fills.push({ light, mob: root, base: light.intensity, offset: light.position.clone() }); this.lightRoot.add(light);
+      // só guarda a configuração: a luz real vem do pool fixo (fillLights)
+      this.fills.push({ mob: root, color: light.color.clone(), base: light.intensity, distance: light.distance, offset: light.position.clone() });
+      light.removeFromParent(); light.dispose();
     }
     this.targets.push(rig.target);
 

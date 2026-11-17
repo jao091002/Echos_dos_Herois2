@@ -154,7 +154,10 @@ export function adoptFragments(geo: THREE.BufferGeometry, maxVerts: number, maxS
  */
 export function bindSkin(owner: THREE.Object3D, geo: THREE.BufferGeometry, material: THREE.Material, bones: THREE.Object3D[]) {
   const mesh = new THREE.SkinnedMesh(geo, material);
-  mesh.castShadow = true; mesh.receiveShadow = true; mesh.frustumCulled = false;
+  mesh.castShadow = true; mesh.receiveShadow = true;
+  // esfera fixa no espaço do inimigo (cobre lobo e demônio em qualquer pose): o frustum culling volta a valer,
+  // e inimigos fora da tela (ou fora da área de sombra) deixam de ser desenhados
+  mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 1.1, 0), 2.6);
   owner.add(mesh); owner.updateMatrixWorld(true);
   // Skeleton aceita qualquer Object3D como osso (usa só matrixWorld); os inversos saem da pose atual
   const skeleton = new THREE.Skeleton(bones as unknown as THREE.Bone[]);
