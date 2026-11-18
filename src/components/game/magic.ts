@@ -4,6 +4,7 @@ import type { SfxName } from './audio';
 import type { CombatSystem } from './combat';
 import type { PlayerProgression } from './progression';
 import { createChurch, type Church } from './sanctuary-church';
+import { GlyphParticles, MathForm, CartesianDomain, MathSpells, MathBarrier, isMathSpell, DOMAIN_DRAIN, MC } from './math';
 
 export type SpellId = 'zoltraak' | 'vollzanbel' | 'judradjim' | 'shield' | 'flight'
   // guerreiro
@@ -13,8 +14,10 @@ export type SpellId = 'zoltraak' | 'vollzanbel' | 'judradjim' | 'shield' | 'flig
   // desbloqueadas na árvore de habilidades (teclas 3 e 4)
   | 'chuvaEstelar' | 'passoArcano' | 'fenda' | 'lancaSagrada' | 'santuario'
   // clérigo (kit do livro sagrado)
-  | 'tresLancas' | 'curaEquipe' | 'despertar';
-export const SPELL_IDS: SpellId[] = ['zoltraak', 'vollzanbel', 'judradjim', 'shield', 'flight', 'golpe', 'redemoinho', 'agarrao', 'investida', 'brado', 'julgamento', 'cura', 'consagracao', 'bencao', 'chuvaEstelar', 'passoArcano', 'fenda', 'lancaSagrada', 'santuario', 'tresLancas', 'curaEquipe', 'despertar'];
+  | 'tresLancas' | 'curaEquipe' | 'despertar'
+  // matemático: normais, versões do Plano Cartesiano e a própria expansão de domínio
+  | 'seno' | 'numeros' | 'exponencial' | 'piCirculo' | 'imaginario' | 'fourier' | 'fibonacci' | 'euler' | 'integral' | 'infinito' | 'planoCartesiano';
+export const SPELL_IDS: SpellId[] = ['zoltraak', 'vollzanbel', 'judradjim', 'shield', 'flight', 'golpe', 'redemoinho', 'agarrao', 'investida', 'brado', 'julgamento', 'cura', 'consagracao', 'bencao', 'chuvaEstelar', 'passoArcano', 'fenda', 'lancaSagrada', 'santuario', 'tresLancas', 'curaEquipe', 'despertar', 'seno', 'numeros', 'exponencial', 'piCirculo', 'imaginario', 'fourier', 'fibonacci', 'euler', 'integral', 'infinito', 'planoCartesiano'];
 type SigilStyle = 'rune' | 'sun' | 'arc' | 'wind';
 type Vec3 = THREE.Vector3;
 type LightSlot = { light: THREE.PointLight; age: number; life: number; peak: number; active: boolean; held: boolean };
@@ -47,6 +50,8 @@ export const COST: Record<SpellId, number> = {
   julgamento: 14, cura: 32, consagracao: 38, bencao: 30,
   chuvaEstelar: 42, passoArcano: 16, fenda: 30, lancaSagrada: 22, santuario: 45,
   tresLancas: 20, curaEquipe: 40, despertar: 35,
+  seno: 12, numeros: 18, exponencial: 28, piCirculo: 32, imaginario: 16,
+  fourier: 10, fibonacci: 16, euler: 26, integral: 24, infinito: 12, planoCartesiano: 30,
 };
 const COOLDOWN: Record<SpellId, number> = {
   zoltraak: .38, vollzanbel: 7, judradjim: 3.4, shield: 9, flight: .7,
@@ -54,6 +59,8 @@ const COOLDOWN: Record<SpellId, number> = {
   julgamento: 1.1, cura: 7, consagracao: 11, bencao: 20,
   chuvaEstelar: 12, passoArcano: 4.5, fenda: 9, lancaSagrada: 4, santuario: 24,
   tresLancas: 2.4, curaEquipe: 10, despertar: 18,
+  seno: .9, numeros: 3, exponencial: 7, piCirculo: 10, imaginario: 4.5,
+  fourier: .6, fibonacci: 2.4, euler: 5.5, integral: 7, infinito: 2.8, planoCartesiano: 4,
 };
 /**
  * Três Lanças da Deusa (clérigo): ajuste fino.
@@ -504,6 +511,16 @@ export class MagicSystem {
   private readonly root = new THREE.Group();
   private readonly fx = new Particles(2600, true);   // additive: glows, sparks, embers
   private readonly soft = new Particles(900, false); // normal blending: smoke, petals, debris, dust
+  /** Glifos (números e símbolos) do matemático: um desenho só para magias, asas, auréolas e o plano cartesiano. */
+  readonly glyphs = new GlyphParticles();
+  private readonly math: MathSpells; private readonly domain: CartesianDomain;
+  private readonly forms: MathForm[] = [];
+  private readonly haloGeo = new THREE.TorusGeometry(.3, .014, 6, 48);
+  private readonly haloMat = new THREE.MeshBasicMaterial({ color: MC.gold, transparent: true, opacity: .85, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+  /** Plano Cartesiano (expansão de domínio do matemático) aberto: consome mana por segundo e troca as habilidades. */
+  domainActive = false;
+  /** Forma transformada do herói local (asas de números e auréola Σ). */
+  readonly mathForm: MathForm;
   private readonly lights: LightSlot[] = [];
   private projectiles: Projectile[] = []; private effects: Effect[] = [];
   /** Efeitos sonoros (ligado pelo jogo ao motor de áudio). */
@@ -554,7 +571,21 @@ export class MagicSystem {
     this.starTex = [starburstTexture(5), starburstTexture(17), starburstTexture(29)];
     this.tex = { rune: sigilTexture('rune', 11), sun: sigilTexture('sun', 23), arc: sigilTexture('arc', 37), wind: sigilTexture('wind', 51), glow: glowTexture() };
     this.healTex = healSigilTexture();
-    this.root.name = 'spell-effects'; scene.add(this.root); this.root.add(this.fx.points, this.soft.points);
+    this.root.name = 'spell-effects'; scene.add(this.root); this.root.add(this.fx.points, this.soft.points, this.glyphs.points);
+    this.domain = new CartesianDomain(this.root, this.glyphs);
+    this.math = new MathSpells({
+      player, glyphs: this.glyphs,
+      spark: (x, y, z, vx, vy, vz, life, size, c0, c1) => this.fx.emit(x, y, z, { vx, vy, vz, life, s0: size, s1: .02, c0, c1, kind: 1, drag: 2 }),
+      flash: (p, c, s, l) => this.flash(p, c, s, l), shock: (p, n, c, r, l) => this.shock(p, n, c, r, l), dome: (p, c, r, l) => this.dome(p, c, r, l),
+      light: (p, c, pk, l, d) => { this.flashLight(p, c, pk, l, d); },
+      effect: (life, step) => this.addEffect(new THREE.Group(), life, step),
+      shake: a => { this.shake = Math.max(this.shake, a); },
+      hit: (at, r, amt) => this.hit(at, r, amt),
+      line: (a, b, r, amt, once) => this.mathLine(a, b, r, amt, once),
+      sfx: (n, v) => this.onSfx(n, v),
+      size: () => this.progression.sizeMultiplier(),
+    });
+    this.mathForm = this.createForm(player);
     this.church = createChurch(this.root);
     for (let i = 0; i < LIGHT_SLOTS; i++) {
       const light = new THREE.PointLight('#ffffff', 0, 10, 2); this.root.add(light);
@@ -565,6 +596,40 @@ export class MagicSystem {
   }
 
   cooldown(id: SpellId) { return this.cooldowns[id]; }
+
+  /* ---------------- Matemático ---------------- */
+  /** Asas de números + auréola Σ para um herói (o local e os avatares remotos, criados uma vez no início). */
+  createForm(root: THREE.Object3D) { const f = new MathForm(root, this.glyphs, this.haloGeo, this.haloMat); this.forms.push(f); return f; }
+  /** Câmera atual (textos de glifos legíveis da esquerda para a direita). */
+  setCamera(camera: THREE.Camera) { this.glyphs.camera = camera; }
+  /** Abre ou fecha o Plano Cartesiano (R). Abrir custa mana; aberto, consome DOMAIN_DRAIN por segundo. */
+  private toggleDomain() {
+    if (this.domainActive) { this.endDomain(); return true; }
+    const cost = this.progression.manaCost(COST.planoCartesiano);
+    if (this.cooldowns.planoCartesiano > 0 || this.mana < cost) return false;
+    this.mana -= cost; this.domainActive = true;
+    this.domain.start(this.player.position); this.mathForm.set(true);
+    this.math.domainBurst(this.player.position.clone(), true); this.onSfx('chargeFull', 1.2);
+    return true;
+  }
+  /** Fecha o Plano Cartesiano (R de novo, mana zerada, morte ou troca de classe). */
+  endDomain() {
+    if (!this.domainActive) return;
+    this.domainActive = false; this.domain.stop(); this.mathForm.set(false);
+    this.math.domainBurst(this.player.position.clone(), false); this.onSfx('shieldDown', 1);
+    this.cooldowns.planoCartesiano = this.cooldownMax.planoCartesiano = COOLDOWN.planoCartesiano;
+  }
+  /** Teletransporte da Rotação i / Limite ao Infinito (o jogo já moveu o herói). */
+  mathBlink(from: Vec3, to: Vec3, big: boolean) { this.math.blink(from, to, big, true); }
+  /** Ataque básico do matemático (números saltando; na expansão, um × gigante). */
+  mathSlash(at: Vec3, big: boolean) { this.math.slash(at, big); }
+  /** Dano em linha das magias do matemático (crítico, buffs e tamanho como nas outras). */
+  private mathLine(a: Vec3, b: Vec3, r: number, amount: number, once: Set<object>) {
+    const crit = this.progression.rollCrit(), dmg = amount * this.progression.damageMultiplier() * this.buffDamage * crit;
+    const n = this.combat.damageSegment(a, b, r * this.progression.sizeMultiplier(), dmg, .5, p => { if (crit > 1) this.critFx(p); }, once);
+    if (n > 0) { this.onConfirmedHit(); this.drain(dmg * n); }
+    return n;
+  }
 
   /* ---------------- Escudo segurável: dura enquanto o botão estiver pressionado ---------------- */
   /** Durabilidade 0..1 (cai a cada golpe bloqueado; ao zerar, o escudo quebra). */
@@ -579,9 +644,13 @@ export class MagicSystem {
    * Estilo do escudo: 'arcane' = muralha de favos (maga, clérigo); 'physical' = o escudo de verdade na mão
    * do guerreiro — sem muralha mágica, bloqueia só o que vem pela frente, numa largura do tamanho do escudo.
    */
-  private shieldStyle: 'arcane' | 'physical' = 'arcane';
+  private shieldStyle: 'arcane' | 'physical' | 'math' = 'arcane';
+  /** Sinal de Igual do matemático: mini plano cartesiano no lugar da muralha de favos. */
+  private mathShield!: MathBarrier;
+  /** Barreira de números para o avatar de outro matemático. */
+  createBarrier(parent: THREE.Object3D) { return new MathBarrier(parent, this.glyphs); }
   private shieldHand: THREE.Object3D | null = null;
-  setShieldStyle(style: 'arcane' | 'physical', hand: THREE.Object3D | null = null) {
+  setShieldStyle(style: 'arcane' | 'physical' | 'math', hand: THREE.Object3D | null = null) {
     if (this.shieldActive && style !== this.shieldStyle) this.endShield(false);
     this.shieldStyle = style; this.shieldHand = hand;
   }
@@ -616,7 +685,7 @@ export class MagicSystem {
   /** Contadores para o painel de desempenho. */
   perfStats() {
     return {
-      'partículas': this.fx.count + this.soft.count, efeitos: this.effects.length, 'projéteis': this.projectiles.length,
+      'partículas': this.fx.count + this.soft.count, glifos: this.glyphs.count, efeitos: this.effects.length, 'projéteis': this.projectiles.length,
       'luzes de magia': this.lights.filter(s => s.active).length,
       'magias ativas': this.effects.length + this.projectiles.length + (this.charge ? 1 : 0) + (this.beam ? 1 : 0) + (this.shieldActive ? 1 : 0) + (this.flying ? 1 : 0),
     };
@@ -663,7 +732,7 @@ export class MagicSystem {
   }
 
   /** Optional: tell the system the drawing-buffer height (px, including pixel ratio) and camera FOV so particle sizes stay physically consistent. */
-  setViewport(heightPx: number, fovDeg: number) { const s = heightPx / (2 * Math.tan(THREE.MathUtils.degToRad(fovDeg) / 2)); this.fx.setScale(s); this.soft.setScale(s); }
+  setViewport(heightPx: number, fovDeg: number) { const s = heightPx / (2 * Math.tan(THREE.MathUtils.degToRad(fovDeg) / 2)); this.fx.setScale(s); this.soft.setScale(s); this.glyphs.setScale(s); }
 
   /**
    * Compila antes todos os shaders das magias (sem engasgo no primeiro feitiço).
@@ -690,6 +759,10 @@ export class MagicSystem {
       this.spawnProjectile('zoltraak', far, FWD, far2); this.spawnProjectile('vollzanbel', far, FWD, far2);
       this.lightningFx(far, far2, 1); this.vollzanbelFx(far2.clone(), 1);
       this.santuarioFx(); // Catedral de Luz: compila os materiais dela já na pose erguida
+      // matemático: plano cartesiano e auréola (ocultos no resto do tempo) e uma magia de cada tipo
+      this.domain.setVisibleForCompile(true); this.forms.forEach(f => f.setCompile(true));
+      this.shieldRoot.visible = true; this.mathShield.setCompile(true);
+      this.math.cast('exponencial', far, FWD, far2, false); this.math.cast('seno', far, FWD, far2, false);
       renderer.compile(this.scene, camera);
       for (let i = 1; i <= 50; i++) { renderer.compile(this.root, camera, this.scene); this.update(.05, i * .05); }
     } finally {
@@ -697,6 +770,8 @@ export class MagicSystem {
       this.projectiles.forEach(p => { p.object.removeFromParent(); disposeTree(p.object); this.releaseLight(p.light); }); this.projectiles = [];
       this.effects.forEach(e => { e.object.removeFromParent(); disposeTree(e.object); }); this.effects = [];
       this.santuario = null; this.church.hide();
+      this.domain.setVisibleForCompile(false); this.forms.forEach(f => f.setCompile(false)); this.glyphs.clear();
+      this.mathShield.setCompile(false); this.shieldRoot.visible = this.shieldActive && !this.physicalShield;
       this.lights.forEach(sl => this.releaseLight(sl));
       this.fx.clear(); this.soft.clear(); this.shake = 0;
       this.mana = manaBefore; Object.assign(this.cooldowns, cds);
@@ -707,6 +782,7 @@ export class MagicSystem {
 
   cast(id: SpellId, origin: Vec3, direction: Vec3, target: Vec3) {
     if (id === 'zoltraak') { this.setAim(origin, direction); return this.beginCharge() && this.releaseCharge(); }
+    if (id === 'planoCartesiano') return this.toggleDomain();
     const manaCost = this.progression.manaCost(COST[id]);
     if (this.cooldowns[id] > 0 || this.mana < manaCost) return false;
     this.mana -= manaCost; this.cooldowns[id] = this.cooldownMax[id] = COOLDOWN[id] * (1 - this.progression.stats.cdr);
@@ -715,6 +791,7 @@ export class MagicSystem {
     if (id === 'flight') { this.flying = !this.flying; this.flightBurst(this.flying); return true; }
     if (id === 'judradjim') { this.lightningFx(origin, target, this.progression.sizeMultiplier()); return true; }
     if (id === 'vollzanbel') { this.vollzanbelFx(target, this.progression.sizeMultiplier()); return true; }
+    if (isMathSpell(id)) { this.math.cast(id, origin, dir, target, true); return true; } // Rotação i / Infinito: o jogo teletransporta
     switch (id) {
       case 'golpe': this.golpeFx(dir); return true;
       case 'redemoinho': this.redemoinhoFx(); return true;
@@ -767,6 +844,15 @@ export class MagicSystem {
     }
     // ponto de impacto em coordenadas da muralha -> anel que percorre os favos
     const local = this.shieldRoot.worldToLocal(closest.clone());
+    if (this.shieldStyle === 'math') {
+      // golpe no plano: onda saindo do ponto e números espirrando para fora
+      this.mathShield.hit(local.x, local.y);
+      const n = this.shieldRoot.getWorldDirection(new THREE.Vector3()), hit = this.shieldRoot.localToWorld(local.setZ(.05));
+      this.flash(hit, MC.cyan, 1.6 * half, .18); this.flashLight(hit, MC.cyan, 6, .3, 8);
+      for (let i = 0; i < 18; i++) this.glyphs.emit(hit.x, hit.y, hit.z, { vx: n.x * rr(1, 4) + rr(-1.5, 1.5), vy: rr(-.5, 2.5), vz: n.z * rr(1, 4) + rr(-1.5, 1.5), life: rr(.4, .8), s0: .22, s1: .05, c0: MC.white, c1: i % 3 ? MC.cyan : MC.gold, glyph: i % 5 ? (i * 7) % 10 : 14, drag: 2, grav: 2.5 });
+      this.shake = Math.max(this.shake, .14);
+      return true;
+    }
     this.shieldHitUv.value.set(local.x / (MagicSystem.WALL * .5), local.y / (MagicSystem.WALL * .5)); this.shieldHitT.value = 0;
     const n = this.shieldRoot.getWorldDirection(new THREE.Vector3());
     const hit = this.shieldRoot.localToWorld(local.setZ(.02));
@@ -778,7 +864,9 @@ export class MagicSystem {
   }
 
   update(delta: number, elapsed: number) {
-    this.mana = Math.min(this.maxMana, this.mana + delta * (this.flying ? 1.2 : 4.2) * this.progression.stats.manaRegen);
+    // Plano Cartesiano aberto: a mana não regenera e escoa DOMAIN_DRAIN por segundo; zerou, o domínio se desfaz
+    if (this.domainActive) { this.mana -= delta * DOMAIN_DRAIN; if (this.mana <= 0) { this.mana = 0; this.endDomain(); } }
+    else this.mana = Math.min(this.maxMana, this.mana + delta * (this.flying ? 1.2 : 4.2) * this.progression.stats.manaRegen);
     for (const id of Object.keys(this.cooldowns) as SpellId[]) this.cooldowns[id] = Math.max(0, this.cooldowns[id] - delta);
     if (this.flying) { this.mana -= delta * 8 * this.progression.stats.flyDrain; if (this.mana <= 0) { this.mana = 0; this.flying = false; this.flightBurst(false); } }
     if (this.shieldActive) { this.mana = Math.max(0, this.mana - delta * MagicSystem.SHIELD_DRAIN * this.progression.stats.shieldDrain); this.shieldTime = this.shieldHp / this.shieldHpMax < .25 ? 1 : 99; }
@@ -803,7 +891,9 @@ export class MagicSystem {
       s.age += dt; const t = s.age / s.life;
       if (t >= 1) { s.active = false; s.light.intensity = 0; } else s.light.intensity = s.peak * (1 - t) * (1 - t);
     }
-    this.fx.update(dt); this.soft.update(dt);
+    this.domain.update(dt, elapsed, this.player.position);
+    for (const f of this.forms) f.update(dt, elapsed);
+    this.fx.update(dt); this.soft.update(dt); this.glyphs.update(dt);
     this.shake = Math.max(0, this.shake - delta * 2.2);
   }
 
@@ -813,7 +903,7 @@ export class MagicSystem {
     this.effects.forEach(e => { e.object.removeFromParent(); disposeTree(e.object); }); this.effects = [];
     this.root.removeFromParent(); this.shieldRoot.removeFromParent(); this.aura.removeFromParent();
     disposeTree(this.shieldRoot); disposeTree(this.aura); this.shieldGround.removeFromParent(); disposeTree(this.shieldGround);
-    this.fx.dispose(); this.soft.dispose();
+    this.fx.dispose(); this.soft.dispose(); this.glyphs.dispose(); this.domain.dispose(); this.haloGeo.dispose(); this.haloMat.dispose();
     this.lights.forEach(s => s.light.dispose());
     keptPrograms.forEach(m => m.dispose()); keptPrograms.clear(); keeperRenderer = null;
     matPool.forEach(list => list.forEach(m => m.dispose())); matPool.clear();
@@ -1174,6 +1264,12 @@ export class MagicSystem {
   /** Início (ms) dos Vollzanbel de outros jogadores em curso (limite de efeitos remotos pesados). */
   private remoteVoll: number[] = [];
   remoteFx(spell: SpellId, origin: Vec3, dir: Vec3, target: Vec3) {
+    // matemático: o mesmo efeito, só visual (Rotação i / Infinito chegam com origem e destino do teletransporte)
+    if (isMathSpell(spell)) {
+      if (spell === 'imaginario' || spell === 'infinito') this.math.blink(origin, target, spell === 'infinito', false);
+      else this.math.cast(spell, origin, dir, target, false);
+      return;
+    }
     // Santuário de outro clérigo: a Catedral aparece (só visual), se a minha não estiver em uso
     if (spell === 'santuario' && !this.santuario) { this.church.show(this.groundAt(origin), SANTUARIO_R); this.churchClock.t = 0; this.churchClock.life = 8; return; }
     // Vollzanbel: o efeito real (só visual) forma-se no cajado do outro jogador e voa até o alvo — legível no PvP.
@@ -2083,6 +2179,7 @@ export class MagicSystem {
     this.shieldBack = new THREE.Mesh(this.geo.plane, this.basic(C.barrierCyan, 0, this.tex.rune)); this.shieldBack.position.z = -.25; this.shieldBack.scale.setScalar(1.05); this.shieldRoot.add(this.shieldBack);
     this.shieldGround = new THREE.Mesh(this.geo.plane, this.basic(C.barrier, 0, this.tex.rune)); this.shieldGround.rotation.x = -Math.PI / 2; this.shieldGround.position.y = .06; this.shieldGround.scale.setScalar(1.7); this.player.add(this.shieldGround);
     this.shieldRoot.visible = false;
+    this.mathShield = new MathBarrier(this.shieldRoot, this.glyphs);
   }
 
   /** Jato de faíscas azuis que escorrem pela superfície e são repelidas (estilo da barreira). */
@@ -2107,14 +2204,29 @@ export class MagicSystem {
     if (!this.shieldPlaced || physical) { this.shieldRoot.position.copy(goal); this.shieldRoot.quaternion.copy(this.shieldQ); this.shieldPlaced = true; }
     this.shieldRoot.position.lerp(goal, 1 - Math.exp(-delta * 16));
     this.shieldRoot.quaternion.slerp(this.shieldQ, 1 - Math.exp(-delta * 9));
+    const math = this.shieldStyle === 'math';
+    if (!this.shieldActive || !math) this.mathShield.update(delta, elapsed, false);
     if (!this.shieldActive) { this.shieldRoot.visible = false; this.shieldGround.material.opacity = 0; return; }
     this.shieldAge += delta; const size = this.progression.sizeMultiplier();
     if (physical) { this.shieldRoot.visible = false; this.shieldGround.material.opacity = 0; this.shieldFlash = Math.max(0, this.shieldFlash - delta * 2.4); return; }
-    this.shieldRoot.visible = true;
+    this.shieldRoot.visible = true; this.shieldWall.visible = this.shieldBack.visible = !math;
     this.shieldRoot.scale.setScalar(size * (.86 + .14 * easeOutBack(clamp01(this.shieldAge / .4))) * (1 + Math.sin(elapsed * 2.2) * .008));
     this.shieldFlash = Math.max(0, this.shieldFlash - delta * 2.4);
     if (this.shieldHitT.value < 1) this.shieldHitT.value = Math.min(1, this.shieldHitT.value + delta * 1.5);
     const fade = clamp01(this.shieldTime / .7) * (this.shieldTime < 1.2 ? .75 + .25 * Math.sin(elapsed * 38) : 1);
+    if (math) {
+      // plano cartesiano: números se soltando da superfície em vez das faíscas azuis
+      this.mathShield.update(delta, elapsed, true, fade, this.shieldTime < .5);
+      this.shieldGround.material.opacity = 0;
+      this.shieldSpray += delta * 16 * fade;
+      const n = this.shieldRoot.getWorldDirection(this.tN), half = MagicSystem.WALL * .45;
+      while (this.shieldSpray >= 1) {
+        this.shieldSpray -= 1;
+        const p = this.shieldRoot.localToWorld(this.tB.set(rr(-half, half), rr(-half, half), .02));
+        this.glyphs.emit(p.x, p.y, p.z, { vx: n.x * rr(.3, 1.2), vy: rr(.2, 1), vz: n.z * rr(.3, 1.2), life: rr(.5, .9), s0: .17, s1: .04, c0: MC.white, c1: MC.cyan, glyph: (Math.random() * 10) | 0, drag: 1.2 });
+      }
+      return;
+    }
     const u = this.shieldWall.material.uniforms;
     u.uTime.value = elapsed; u.uFlash.value = this.shieldFlash; u.uAlpha.value = fade;
     u.uReveal.value = this.shieldTime < .5 ? 1.3 * clamp01(this.shieldTime / .5) : easeOutCubic(clamp01(this.shieldAge / .45)) * 1.3; // abre do centro, fecha de fora para dentro
@@ -2141,6 +2253,15 @@ export class MagicSystem {
     }
     this.onSfx('shieldUp');
     const c = this.shieldRoot.getWorldPosition(new THREE.Vector3()), n = this.shieldRoot.getWorldDirection(new THREE.Vector3());
+    if (this.shieldStyle === 'math') {
+      // o plano "abre" do centro: clarão ciano e um "=" grande que se desfaz em algarismos
+      this.flash(c, MC.white, 3.4, .3); this.flashLight(c, MC.cyan, 9, .5, 10);
+      this.glyphs.emit(c.x, c.y, c.z, { life: .5, s0: 1.4, s1: 2.2, c0: MC.white, c1: MC.cyan, glyph: 14 });
+      for (let i = 0; i < 36; i++) { const a = i / 36 * Math.PI * 2; this.glyphs.emit(c.x, c.y, c.z, { vx: Math.cos(a) * 3 + n.x, vy: Math.sin(a) * 3, vz: n.z - Math.cos(a) * n.x * 0, life: rr(.4, .7), s0: .2, s1: .04, c0: MC.white, c1: MC.cyan, glyph: i % 10, drag: 3 }); }
+      const g = this.player.position; this.shock(this.tA.set(g.x, terrainHeight(g.x, g.z) + .08, g.z), UP, MC.cyan, 2.6, .5);
+      this.shake = Math.max(this.shake, .1);
+      return;
+    }
     this.sigil(c.clone().addScaledVector(n, .1), n, 'rune', C.barrierCyan, 2.1, .7, { spin: 1.6, grow: .25 });
     this.flash(c, C.barrierHot, 4, .3); this.flashLight(c, C.barrier, 10, .6, 10);
     this.spray(c, n, 40, 1);
@@ -2158,6 +2279,16 @@ export class MagicSystem {
     }
     // estilhaça: faíscas saindo de pontos espalhados pela muralha
     const n = this.shieldRoot.getWorldDirection(new THREE.Vector3()), half = MagicSystem.WALL * .45 * this.shieldRoot.scale.x, count = broke ? 60 : 26;
+    if (this.shieldStyle === 'math') {
+      // o plano se desmancha: cada célula vira um número que cai
+      for (let i = 0; i < count; i++) {
+        const p = this.shieldRoot.localToWorld(this.tB.set(rr(-1, 1) * MagicSystem.WALL * .45, rr(-1, 1) * MagicSystem.WALL * .45, 0)), sp = rr(.5, broke ? 6 : 2);
+        this.glyphs.emit(p.x, p.y, p.z, { vx: n.x * sp + rr(-1, 1), vy: rr(-.5, 2), vz: n.z * sp + rr(-1, 1), life: rr(.6, 1.2), s0: .22, s1: .05, c0: MC.white, c1: MC.cyan, glyph: i % 10, drag: 1.4, grav: 3.5, rot: rr(-1, 1) });
+      }
+      this.flash(this.shieldRoot.getWorldPosition(this.tA), MC.cyan, broke ? 4 : 2.2, .25);
+      if (broke) this.shake = Math.max(this.shake, .25);
+      return;
+    }
     for (let i = 0; i < count; i++) {
       const p = this.tB.set(rr(-half, half), rr(-half, half), 0).applyMatrix4(this.shieldRoot.matrixWorld);
       const sp = rr(2, broke ? 8 : 3.5);

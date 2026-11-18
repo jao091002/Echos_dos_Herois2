@@ -1627,7 +1627,7 @@ export function createHero(scene: THREE.Scene, opts: { auraLight?: boolean } = {
           // habilidades de guerreiro/clérigo reaproveitam as poses: gritos e bênçãos = braços ao alto (como a decolagem)
           const rawKind = (root.userData.castKind as string | undefined) ?? 'zoltraak';
           // (a Magia de Cura e as Três Lanças usam a pose padrão: braço estendido à frente, como nas referências)
-          const kind = rawKind === 'brado' || rawKind === 'bencao' || rawKind === 'curaEquipe' || rawKind === 'despertar' ? 'flight' : rawKind === 'consagracao' ? 'shield' : rawKind;
+          const kind = rawKind === 'brado' || rawKind === 'bencao' || rawKind === 'curaEquipe' || rawKind === 'despertar' || rawKind === 'planoCartesiano' || rawKind === 'piCirculo' || rawKind === 'euler' ? 'flight' : rawKind === 'consagracao' ? 'shield' : rawKind;
           // camadas: lançando em movimento/voo, a pose base (pernas, quadril, altura, inclinação) continua
           // e a magia controla só a metade superior. A decolagem ('flight') é de corpo inteiro.
           const base = root.userData.locoPose as HeroPose | undefined;

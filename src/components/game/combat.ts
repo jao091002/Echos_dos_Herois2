@@ -540,6 +540,8 @@ export class CombatSystem {
   onKill: (kind: MobKind) => void = () => {};
   /** Barreira física (escudo) que os inimigos não atravessam; atualizada pelo jogo a cada quadro. */
   barrier: { center: THREE.Vector3; normal: THREE.Vector3; half: number } | null = null;
+  /** Barreiras sólidas de outros jogadores (Sinal de Igual do matemático): os inimigos também não atravessam. */
+  barriers: { center: THREE.Vector3; normal: THREE.Vector3; half: number }[] = [];
   private flinchPose = newPose();
   private colliders: WorldCollider[] = [];
   private colliderCount = -1;
@@ -1575,8 +1577,8 @@ export class CombatSystem {
 
     // --- terrain follow + body tilt to the slope
     // escudo sólido: empurra o inimigo para fora da muralha e anula o avanço contra ela
-    const bar = this.barrier;
-    if (bar) {
+    for (let bi = -1; bi < this.barriers.length; bi++) {
+      const bar = bi < 0 ? this.barrier : this.barriers[bi]; if (!bar) continue;
       const r = MOB_STATS[mob.kind].radius * .8, dx = pos.x - bar.center.x, dz = pos.z - bar.center.z;
       const depth = dx * bar.normal.x + dz * bar.normal.z, lat = -dx * bar.normal.z + dz * bar.normal.x;
       if (Math.abs(lat) < bar.half + r * .5 && depth > -1.2 && depth < r) {

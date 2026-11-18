@@ -17,7 +17,8 @@ import { PlayerMotor, ThirdPersonCamera } from './simulation';
 import { PerfMonitor } from './perf-monitor';
 import { QuestGiver, type QuestStage } from './npc';
 import { NetClient, r2, defaultServer, listRooms, OFFICIAL_SERVER, isP2P, type NetMsg, type RoomInfo } from './net';
-import { RemotePlayers, type RemoteState } from './remote-players';
+import { RemotePlayers, type RemoteState, type Barrier } from './remote-players';
+import { DOMAIN_LOOK } from './math';
 import { LiebBoss, LIEB_POINTS } from './lieb';
 import { PvpGuard, canHarm, pvpDamage, capsuleDistance, PVP_ARM_SECS, PVP_DISARM_SECS, PVP_KILL_XP, PLAYER_HIT_RADIUS, PLAYER_HIT_LOW, PLAYER_HIT_HIGH } from './pvp';
 import { WorldActivities, type ActivityView } from './activities';
@@ -40,6 +41,8 @@ type Quality = 'Baixa' | 'Média' | 'Alta';
 type Panel = 'main' | 'options' | 'controls' | 'hero' | 'multi';
 type CombatHud = {
   mana: number; maxMana: number; health: number; maxHealth: number; alive: number; shield: boolean; flying: boolean; blocks: number; brado: boolean; bencao: boolean; despertar: boolean;
+  /** Plano Cartesiano (matemático) aberto. */
+  domain: boolean;
   cooldowns: Record<SpellId, number>; cdFrac: Record<SpellId, number>;
 };
 /** Quanto a câmera "entra na mira": cheio ao carregar/disparar o Zoltraak. */
@@ -72,6 +75,18 @@ const ICONS: Record<SpellId | 'journal' | 'help', ReactNode> = {
   cura: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 3.5h5v6h6v5h-6v6h-5v-6h-6v-5h6z" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" /><path d="M11 7h2v4h4v2h-4v4h-2v-4H7v-2h4z" fill="currentColor" opacity=".6" /></svg>,
   consagracao: <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.3" /><circle cx="12" cy="12" r="5.5" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="2 1.6" /><path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="1.2" /></svg>,
   bencao: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" /><path d="M12 7.5v8M8.5 11h7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>,
+  // matemático
+  seno: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h20M12 3v18" stroke="currentColor" strokeWidth=".8" opacity=".45" /><path d="M2 12c1.7-6.5 4.3-6.5 6 0s4.3 6.5 6 0 4.3-6.5 6 0" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /></svg>,
+  fourier: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12c1.7-6.5 4.3-6.5 6 0s4.3 6.5 6 0 4.3-6.5 6 0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /><path d="M2 12c1-3 2-3 3 0s2 3 3 0 2-3 3 0 2 3 3 0 2-3 3 0 2 3 3 0" fill="none" stroke="currentColor" strokeWidth="1" opacity=".7" /><path d="M2 12c3 8 6 8 10 0s7-8 10 0" fill="none" stroke="currentColor" strokeWidth=".8" opacity=".5" /></svg>,
+  numeros: <svg viewBox="0 0 24 24" aria-hidden="true"><text x="12" y="16.5" textAnchor="middle" fontSize="10.5" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">123</text><path d="M3 20h18" stroke="currentColor" strokeWidth="1" strokeDasharray="2 1.5" /></svg>,
+  fibonacci: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 12a1 1 0 0 1-1 1 2 2 0 0 1-2-2 3 3 0 0 1 3-3 5 5 0 0 1 5 5 8 8 0 0 1-8 8" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /><path d="M10 4h8v8h-8zM10 4v16" fill="none" stroke="currentColor" strokeWidth=".7" opacity=".5" /></svg>,
+  exponencial: <svg viewBox="0 0 24 24" aria-hidden="true"><text x="10" y="18" textAnchor="middle" fontSize="15" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">e</text><text x="17.5" y="9" textAnchor="middle" fontSize="9" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">x</text></svg>,
+  euler: <svg viewBox="0 0 24 24" aria-hidden="true"><text x="7" y="17" textAnchor="middle" fontSize="13" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">e</text><text x="15.5" y="9" textAnchor="middle" fontSize="7.5" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">iπ</text><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" strokeWidth=".8" opacity=".5" /></svg>,
+  piCirculo: <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeDasharray="2.2 1.6" /><text x="12" y="16" textAnchor="middle" fontSize="12" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">π</text></svg>,
+  integral: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 21c-2.5 0-1.2-3.5-.4-9S9.5 3 12 3" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /><path d="M13 19c1.5-5 3-7 4.5-7s2 2 3.5 1v6z" fill="currentColor" opacity=".55" /><path d="M13 19h8" stroke="currentColor" strokeWidth="1" /></svg>,
+  imaginario: <svg viewBox="0 0 24 24" aria-hidden="true"><text x="12" y="17" textAnchor="middle" fontSize="14" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">i</text><path d="M19.5 9A8 8 0 0 0 5 7.5" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><path d="m4 4.5 1 3 3-.8" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" /></svg>,
+  infinito: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12c-2.5-3.5-7-3.5-7 0s4.5 3.5 7 0 7-3.5 7 0-4.5 3.5-7 0z" fill="none" stroke="currentColor" strokeWidth="1.8" /></svg>,
+  planoCartesiano: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18M12 3v18" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /><path d="M7 3v18M17 3v18M3 7h18M3 17h18" stroke="currentColor" strokeWidth=".6" opacity=".5" /><text x="17" y="9.5" textAnchor="middle" fontSize="8" fontWeight="700" fontFamily="Cambria Math, Times New Roman, serif" fill="currentColor">Σ</text></svg>,
   journal: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h9.5a3 3 0 0 1 3 3V20H8a3 3 0 0 1-3-3z" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M5 17a3 3 0 0 1 3-3h9.5M9 8h5M9 10.6h3.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /></svg>,
   help: <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M9.6 9.4a2.5 2.5 0 1 1 3.4 2.3c-.7.3-1 .8-1 1.6v.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /><circle cx="12" cy="16.9" r="1" fill="currentColor" /></svg>,
 };
@@ -81,6 +96,13 @@ const ABILITY_HINT: Record<SpellId, string> = {
   golpe: 'corte pesado à frente', redemoinho: 'giro que fere em volta', agarrao: 'avança, agarra e arrasta o inimigo no chão', fenda: 'erupções de terra em linha à frente', investida: 'avança atravessando inimigos', brado: '+35% de dano e −25% de dano recebido por 8 s',
   julgamento: 'coluna de luz no alvo', cura: 'recupera 35% da vida', consagracao: 'solo sagrado: fere e cura por 6 s', bencao: 'regenera vida por 10 s', lancaSagrada: 'feixe de luz que atravessa a linha', santuario: 'domo: −35% de dano e cura dentro',
   chuvaEstelar: 'estrelas caem sobre a área mirada', passoArcano: 'teletransporte curto na direção da mira',
+  seno: 'onda de números que atravessa a linha (24 m)', numeros: 'seis algarismos disparados em sequência; cada um explode no alvo',
+  exponencial: 'um e cresce como eˣ sobre o alvo e explode em área', piCirculo: 'os dígitos de π giram em volta de você e ferem quem chega perto (4 s)',
+  imaginario: 'multiplica sua posição por i: teletransporte curto que fere ao chegar',
+  fourier: 'Série de Fourier: quatro senoides somadas atravessam a linha (30 m)', fibonacci: 'Espiral de Fibonacci: 12 números pousam numa espiral áurea e explodem',
+  euler: 'e^iπ + 1 = 0: a equação colapsa num 0 gigante sobre a área', integral: 'Integral Definida: a área sob a curva fere tudo à frente, várias vezes',
+  infinito: 'Limite ao Infinito: teletransporte longo que fere todo o caminho',
+  planoCartesiano: 'expansão de domínio: asas de números, auréola Σ e habilidades mais fortes · −1 de mana/s (sem regenerar) · R de novo desfaz',
   tresLancas: 'três lanças de luz que explodem no primeiro inimigo (alcance 22 m)', curaEquipe: 'selo verde no chão: cura 25% + 5 de vida/s por 6 s', despertar: 'remove efeitos negativos · +25% de dano, −20% de dano recebido e +20% de velocidade por 5 s',
 };
 const WEAPON_NAME = { staff: 'cajado', axe: 'machado', mace: 'maça', book: 'livro' } as const;
@@ -116,6 +138,7 @@ function HudPills({ store }: { store: HudStore }) {
     {h.brado && <span className="pill">⚔ Brado de Guerra</span>}
     {h.bencao && <span className="pill">✚ Bênção</span>}
     {h.despertar && <span className="pill">✦ Despertar</span>}
+    {h.domain && <span className="pill pill-gold">Σ Plano Cartesiano</span>}
   </>;
 }
 function EnemiesLeft({ store }: { store: HudStore }) {
@@ -169,6 +192,8 @@ export default function Game() {
   const mobBarsRef = useRef<HTMLDivElement>(null);
   /** Caído no multijogador (esperando um aliado reviver): contagem regressiva e renascer agora. */
   const [downed, setDowned] = useState(false);
+  /** Plano Cartesiano aberto: a barra mostra as versões fortes das habilidades do matemático. */
+  const [domainOn, setDomainOn] = useState(false);
   /** PvP (flag global): estado mostrado no HUD; o loop é a fonte da verdade. */
   const [pvpUi, setPvpUi] = useState<{ mode: 'off' | 'arming' | 'on' | 'disarming'; t: number; k: number; d: number }>({ mode: 'off', t: 0, k: 0, d: 0 });
   const hitDirRef = useRef<HTMLDivElement>(null);
@@ -228,7 +253,7 @@ export default function Game() {
   // HUD de combate (mana, vida, recargas) num store próprio: muda várias vezes por segundo em combate e só os
   // componentes do HUD re-renderizam — antes o componente inteiro do jogo (menus, árvore etc.) era refeito a cada mudança
   const hudStoreRef = useRef<HudStore | null>(null);
-  if (!hudStoreRef.current) hudStoreRef.current = createHudStore({ mana: 100, maxMana: 100, health: 100, maxHealth: 100, alive: 7, shield: false, flying: false, blocks: 0, brado: false, bencao: false, despertar: false, cooldowns: NO_CD, cdFrac: NO_CD });
+  if (!hudStoreRef.current) hudStoreRef.current = createHudStore({ mana: 100, maxMana: 100, health: 100, maxHealth: 100, alive: 7, shield: false, flying: false, blocks: 0, brado: false, bencao: false, despertar: false, domain: false, cooldowns: NO_CD, cdFrac: NO_CD });
   const hudStore = hudStoreRef.current;
   const [progressionHud, setProgressionHud] = useState<ProgressionSnapshot>({ level: 1, experience: 0, nextLevelXp: 100, skillPoints: 0, ranks: { root: 1 }, cls: 'maga', stats: new PlayerProgression().stats, inventory: { echoFragment: 0, sentinelCore: 0, wolfPelt: 0, banditToken: 0, demonAsh: 0, moonFang: 0, ancientSigil: 0, demonHeart: 0 } });
   const [npcDialog, setNpcDialog] = useState(false);
@@ -573,6 +598,18 @@ export default function Game() {
     const xpBonus = () => (1 + .1 * Math.max(0, (partyRef.current?.members.length ?? 1) - 1)) * (elapsed < xpEventUntil ? 2 : 1);
     const combat = new CombatSystem(scene, amount => progression.recordExperience(Math.round(amount * xpBonus())), item => { progression.addItem(item); story.loot(); }, showHint);
     const magic = new MagicSystem(scene, hero.root, combat, world.blockers, progression, () => { reticleHitUntil = elapsed + .28; });
+    magic.setCamera(camera);
+    remotes.attachForms(root => magic.createForm(root)); // asas de números / auréola Σ dos outros matemáticos
+    remotes.attachBarriers(parent => magic.createBarrier(parent)); // Sinal de Igual (barreira de números) dos outros matemáticos
+    /** Barreiras de números dos outros jogadores: sólidas para mim e para os inimigos. */
+    const remoteBars: Barrier[] = [];
+    const pushFromBarrier = (p: THREE.Vector3, b: Barrier) => {
+      const r = .45, dx = p.x - b.center.x, dz = p.z - b.center.z, depth = dx * b.normal.x + dz * b.normal.z, lat = -dx * b.normal.z + dz * b.normal.x;
+      if (Math.abs(lat) > b.half + r * .5 || depth < -.6 || depth > r || p.y > b.center.y + b.half) return;
+      const push = r - depth; p.x += b.normal.x * push; p.z += b.normal.z * push;
+      const into = motor.velocity.x * b.normal.x + motor.velocity.z * b.normal.z;
+      if (into < 0) { motor.velocity.x -= b.normal.x * into; motor.velocity.z -= b.normal.z * into; }
+    };
     /** Classe atual (definida na criação de personagem). */
     const cls = () => CLASSES[heroChoiceRef.current.cls];
     const abilityFor = (key: string) => cls().abilities.find(a => a.key.toLowerCase() === key);
@@ -582,7 +619,8 @@ export default function Game() {
       // cada classe tem a sua árvore de talentos (trocar de classe devolve os pontos)
       if (progression.cls !== c.cls) { progression.setClass(c.cls); setProgressionHud(progression.snapshot()); }
       // guerreiro apara com o próprio machado; maga e clérigo usam a muralha arcana
-      magic.setShieldStyle(def.weapon === 'axe' ? 'physical' : 'arcane', hero.shieldPoint);
+      magic.setShieldStyle(def.weapon === 'axe' ? 'physical' : c.cls === 'matematico' ? 'math' : 'arcane', hero.shieldPoint);
+      if (c.cls !== 'matematico') magic.endDomain(); // só o matemático tem o Plano Cartesiano
       if (def.weapon !== 'staff' && magic.flying) magic.cast('flight', hero.root.position, spellDirection, hero.root.position); // só a maga voa
       combat.health = Math.min(combat.health, combat.maxHealth);
     };
@@ -796,7 +834,8 @@ export default function Game() {
      * bola por 1,2 s e voa 0,3 s) e projéteis rápidos (tempo = distância / velocidade). Raios e golpes: 0.
      */
     const leadTime = (spell: SpellId | null, dist: number) =>
-      spell === 'vollzanbel' ? 1.5 : spell === 'zoltraak' || spell === 'tresLancas' ? dist / 34 : 0;
+      spell === 'vollzanbel' ? 1.5 : spell === 'exponencial' ? 1.1 : spell === 'euler' ? 1 : spell === 'zoltraak' || spell === 'tresLancas' ? dist / 34
+        : spell === 'seno' || spell === 'fourier' ? dist / 27 : spell === 'numeros' ? dist / 32 : 0;
     const aimFeet: THREE.Vector3[] = [], tmpAim = new THREE.Vector3();
     /** Desloca out para onde o jogador id estará daqui a lead s (velocidade enviada no estado; no máx. 4 m). */
     const addLead = (id: string, out: THREE.Vector3, lead: number) => {
@@ -834,7 +873,10 @@ export default function Game() {
       aimPoint(spellAim, spell);
       spellDirection.copy(spellAim).sub(spellOrigin).normalize();
       if (spell === 'flight' && cls().weapon !== 'staff') return;
-      if (!progression.unlocked(spell)) { const n = unlockNode(progression.cls, spell); showHint(`Habilidade bloqueada · desbloqueie “${n?.name ?? spell}” na árvore de habilidades (,)`); return; }
+      // matemático: com o Plano Cartesiano aberto, cada tecla lança a versão mais forte da habilidade
+      const slot = cls().abilities.find(a => a.spell === spell || a.alt?.spell === spell), baseSpell = slot?.spell ?? spell;
+      if (slot?.alt) spell = magic.domainActive ? slot.alt.spell : slot.spell;
+      if (!progression.unlocked(baseSpell)) { const n = unlockNode(progression.cls, baseSpell); showHint(`Habilidade bloqueada · desbloqueie “${n?.name ?? spell}” na árvore de habilidades (,)`); return; }
       const melee = cls().abilities.find(a => a.spell === spell)?.melee;
       if (melee) {
         // golpes do guerreiro: o corpo vira para a mira antes do golpe (o dano sai na direção para onde ele encara)
@@ -842,7 +884,8 @@ export default function Game() {
       }
       if (magic.cast(spell, spellOrigin, spellDirection, spellAim)) {
         hero.root.userData.castKind = spell;
-        broadcastFx(spell, spellOrigin, spellDirection, spellAim); partyEffects(spell);
+        if (spell !== 'imaginario' && spell !== 'infinito') broadcastFx(spell, spellOrigin, spellDirection, spellAim); // teletransporte: blink() avisa com origem e destino
+        partyEffects(spell);
         story.cast();
         if (spell === 'santuario') { const s = magic.santuarioInfo; if (s) startCinematic('DOMÍNIO SAGRADO · SANTUÁRIO', 'Catedral de Luz', 3.6, { c: s.center, R: s.R }); }
         // Brado provoca: os inimigos em volta passam a mirar no guerreiro (no host; o cliente pede ao host)
@@ -852,13 +895,14 @@ export default function Game() {
         }
         if (spell === 'agarrao') { startGrab(); return; }
         if (spell === 'passoArcano') { blink(); return; }
+        if (spell === 'imaginario' || spell === 'infinito') { blink(spell); return; }
         if (melee) {
           attackUntil = elapsed + (spell === 'redemoinho' ? .5 : .42); faceAimUntil = elapsed + .45;
           if (spell === 'investida' && motor.dodge(cameraRig.yaw, 1, 0, 0)) dodgeUntil = elapsed + .42;
           return;
         }
         castUntil = elapsed + (spell === 'vollzanbel' ? 1.35 : spell === 'judradjim' ? .95 : spell === 'shield' ? (cls().weapon === 'axe' ? 0 : .62) : .48);
-        if (spell !== 'shield' && spell !== 'flight' && spell !== 'cura' && spell !== 'bencao' && spell !== 'brado' && spell !== 'consagracao' && spell !== 'curaEquipe' && spell !== 'despertar' && spell !== 'santuario') faceAimUntil = elapsed + (spell === 'judradjim' ? 1 : spell === 'vollzanbel' ? 1.4 : .6);
+        if (spell !== 'shield' && spell !== 'flight' && spell !== 'cura' && spell !== 'bencao' && spell !== 'brado' && spell !== 'consagracao' && spell !== 'curaEquipe' && spell !== 'despertar' && spell !== 'santuario' && spell !== 'piCirculo' && spell !== 'planoCartesiano') faceAimUntil = elapsed + (spell === 'judradjim' ? 1 : spell === 'vollzanbel' ? 1.4 : .6);
         if (spell === 'vollzanbel') startCinematic();
         if (aimReticleRef.current) aimReticleRef.current.classList.add('is-casting');
         if (spell === 'zoltraak') ambient.sfx('cast');
@@ -878,6 +922,27 @@ export default function Game() {
     const cine = { start: -99, until: -99, church: null as { c: THREE.Vector3; R: number; a0: number } | null };
     const tmpCine = new THREE.Vector3();
     let debugCam: { from: THREE.Vector3; to: THREE.Vector3 } | null = null;
+    /*
+     * Plano Cartesiano (ult do matemático): ao abrir, cutscene com a câmera girando em volta enquanto as asas de
+     * números desdobram, a auréola Σ acende e o chão vira um plano cartesiano; ao fechar (R de novo ou mana zerada),
+     * uma cutscene curta com as asas se desfazendo em números. O corpo troca de cores enquanto dura.
+     */
+    let domainShown = false;
+    const domainWatch = () => {
+      if (combat.health <= 0 && magic.domainActive) magic.endDomain();
+      if (magic.domainActive === domainShown) return;
+      domainShown = magic.domainActive; setDomainOn(domainShown);
+      hero.setAppearance(domainShown ? DOMAIN_LOOK : heroChoiceRef.current.look);
+      hero.root.userData.castKind = 'planoCartesiano';
+      if (domainShown) {
+        startCinematic('EXPANSÃO DE DOMÍNIO', 'Plano Cartesiano', 3.2, { c: hero.root.position.clone(), R: 2.6 });
+        castUntil = elapsed + 2.8; ambient.sfx('fireCharge', 1.1);
+        showHint('Σ Plano Cartesiano aberto · todas as habilidades na forma mais forte · −1 de mana/s · R para desfazer');
+      } else {
+        if (combat.health > 0) { startCinematic('O DOMÍNIO SE DESFAZ', 'Plano Cartesiano', 1.8); castUntil = elapsed + 1.2; }
+        showHint(magic.mana <= .5 ? 'A mana acabou: o Plano Cartesiano se desfez.' : 'Plano Cartesiano desfeito.');
+      }
+    };
     const startCinematic = (small = 'INVOCAÇÃO DAS CHAMAS INFERNAIS', big = 'Vollzanbel', duration = 1.3, church: { c: THREE.Vector3; R: number } | null = null) => {
       cine.church = church && { ...church, a0: cameraRig.yaw + .9 };
       cine.start = elapsed; cine.until = elapsed + duration;
@@ -902,18 +967,20 @@ export default function Game() {
     const grabCam = { until: -99, blend: 0, dir: new THREE.Vector3(0, 0, 1), side: 1 };
     const blockedAt = (x: number, z: number, r: number) => world.colliders.some(c => Math.hypot(x - c.x, z - c.z) < c.radius + r);
     /** Passo Arcano: teletransporte de até 8,5 m na direção da mira, parando antes de árvores/pedras. */
-    const blink = () => {
+    const blink = (kind: 'passoArcano' | 'imaginario' | 'infinito' = 'passoArcano') => {
       const from = hero.root.position.clone(), facing = (hero.root.userData.facing as number | undefined) ?? hero.root.rotation.y;
       const d = new THREE.Vector3(spellAim.x - from.x, 0, spellAim.z - from.z);
       if (d.lengthSq() < 1e-4) d.set(Math.sin(facing), 0, Math.cos(facing));
       d.normalize();
-      let dist = 0; const step = .25, max = 8.5;
+      let dist = 0; const step = .25, max = kind === 'infinito' ? 12.5 : 8.5;
       while (dist + step <= max && !blockedAt(from.x + d.x * (dist + step), from.z + d.z * (dist + step), .45)) dist += step;
       const to = new THREE.Vector3(from.x + d.x * dist, 0, from.z + d.z * dist);
       to.y = magic.flying ? Math.max(from.y, terrainHeight(to.x, to.z) + .2) : terrainHeight(to.x, to.z);
       hero.root.position.copy(to); motor.velocity.set(0, 0, 0);
       hero.root.userData.facing = Math.atan2(d.x, d.z);
-      magic.blinkFx(from, to); castUntil = elapsed + .3;
+      if (kind === 'passoArcano') magic.blinkFx(from, to);
+      else { magic.mathBlink(from, to, kind === 'infinito'); broadcastFx(kind, from, d, to); }
+      castUntil = elapsed + .3;
     };
     const startGrab = () => {
       const yaw = (hero.root.userData.facing as number | undefined) ?? hero.root.rotation.y;
@@ -1025,7 +1092,10 @@ export default function Game() {
       if (best < Infinity) { facing = Math.atan2(bx, bz); hero.root.userData.facing = facing; }
       const target = new THREE.Vector3();
       target.copy(hero.root.position).add(new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing)).multiplyScalar(atk.reach)); target.y += 1.2;
-      const crit = progression.rollCrit(), dmg = atk.damage * magic.buffDamage * progression.meleeMultiplier() * crit, hits = combat.damageAt(target, atk.radius, dmg);
+      // matemático no Plano Cartesiano: o golpe vira um × gigante (+80% de dano, área maior)
+      const mathAtk = cls().id === 'matematico', big = mathAtk && magic.domainActive;
+      const crit = progression.rollCrit(), dmg = atk.damage * (big ? 1.8 : 1) * magic.buffDamage * progression.meleeMultiplier() * crit, hits = combat.damageAt(target, atk.radius + (big ? .6 : 0), dmg);
+      if (mathAtk) magic.mathSlash(target, big);
       if (hits > 0) { reticleHitUntil = elapsed + .28; magic.drain(dmg * hits); if (crit > 1) magic.critFx(target); }
       attackUntil = elapsed + .38;
       ambient.start(); ambient.sfx('swing');
@@ -1266,7 +1336,7 @@ export default function Game() {
           const hp = hero.root.position;
           net.send({ t: 'st', x: r2(hp.x), y: r2(hp.y), z: r2(hp.z), vx: r2(motor.velocity.x), vz: r2(motor.velocity.z), yaw: r2(hero.root.rotation.y), pose: netPose, lp: netLoco, spd: r2(netSpeed),
             ov: netOverlay, ck: (hero.root.userData.castKind as string | undefined) ?? null, hp: Math.round(combat.health), mhp: Math.round(combat.maxHealth),
-            cls: heroChoiceRef.current.cls, look: heroChoiceRef.current.look, name: net.myName || mpNameRef.current, lvl: progression.level, pvp: pvp.on ? 1 : 0 });
+            cls: heroChoiceRef.current.cls, look: heroChoiceRef.current.look, name: net.myName || mpNameRef.current, lvl: progression.level, pvp: pvp.on ? 1 : 0, dm: magic.domainActive ? 1 : 0 });
         }
       }
       combat.selfId = net.online ? net.id : 'self';
@@ -1550,6 +1620,7 @@ export default function Game() {
       if (uiOpenRef.current && net.online) {
         if (!npcDialogRef.current) elapsed += delta;
         magic.update(delta, elapsed);
+        domainWatch();
         combat.barrier = magic.shieldBarrier(shieldBarrier);
         combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to)); boss.update(delta, elapsed);
         netPose = 'idle'; netOverlay = null; netSpeed = 0; netStep(delta, true);
@@ -1575,6 +1646,8 @@ export default function Game() {
         const grabSpeed = grab ? stepGrab(delta) : 0;
         const moving = grab ? grabSpeed > .5 : combat.health > 0 && motor.update(delta, THREE.MathUtils.clamp(forward, -1, 1), THREE.MathUtils.clamp(side, -1, 1), touchSprintRef.current, keys.has(' ') || touchJumpRef.current, cameraRig.yaw, magic.flying, Number(keys.has(' ') || touchJumpRef.current) - Number(keys.has('control')), cameraRig.pitch);
         if (!grab) combat.pushPlayer(hero.root.position); // inimigos têm corpo sólido
+        combat.barriers = remotes.mathBarriers(remoteBars);
+        if (!grab) for (const b of remoteBars) pushFromBarrier(hero.root.position, b);
         activities.xpScale = 1 + (progression.level - 1) * .12;
         activities.update(delta, elapsed, hero.root.position.x, hero.root.position.z, combat.health > 0);
         portalStep();
@@ -1659,6 +1732,7 @@ export default function Game() {
         netOverlay = overlay ? [overlay.mode, Math.round(overlay.power * 100) / 100] : null;
         ambient.setBeam(magic.charging ? 1 : magic.beamActive ? 2 : 0, magic.charging ? magic.chargeLevel : magic.beamPower);
         magic.update(delta, elapsed);
+        domainWatch(); // Plano Cartesiano: cutscenes, cores do corpo e barra de habilidades
         combat.barrier = magic.shieldBarrier(shieldBarrier);
         combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to)); boss.update(delta, elapsed); bossHud();
         netStep(delta, true);
@@ -1694,7 +1768,7 @@ export default function Game() {
           const ids = SPELL_IDS;
           const cooldowns = {} as Record<SpellId, number>, cdFrac = {} as Record<SpellId, number>;
           for (const id of ids) { cooldowns[id] = Math.ceil(magic.cooldown(id) * 10) / 10; cdFrac[id] = Math.round(magic.cooldownFraction(id) * 40) / 40; }
-          const hud: CombatHud = { mana: Math.round(magic.mana), maxMana: Math.round(magic.maxMana), health: Math.round(combat.health), maxHealth: Math.round(combat.maxHealth), alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, brado: magic.buffs.brado > 0, bencao: magic.buffs.bencao > 0, despertar: magic.buffs.despertar > 0, cooldowns, cdFrac };
+          const hud: CombatHud = { mana: Math.round(magic.mana), maxMana: Math.round(magic.maxMana), health: Math.round(combat.health), maxHealth: Math.round(combat.maxHealth), alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, brado: magic.buffs.brado > 0, bencao: magic.buffs.bencao > 0, despertar: magic.buffs.despertar > 0, domain: magic.domainActive, cooldowns, cdFrac };
           const hudKey = JSON.stringify(hud);
           if (hudKey !== lastHudKey) { lastHudKey = hudKey; hudStore.set(hud); }
           const snap = progression.snapshot(), snapKey = JSON.stringify(snap);
@@ -2158,7 +2232,8 @@ export default function Game() {
         : placePrompt ? <div className="interaction"><span className="keycap">G</span><span>{placePrompt}</span></div>
           : nearLandmark && <div className="interaction"><span className="keycap">G</span><span>Ouvir o Eco do marco</span></div>}
         <div className="hotbar">
-          {classDef.abilities.map((a, i) => <SpellSlot key={a.spell} store={hudStore} spell={a.spell} hotkey={a.key} label={a.label} resource={classDef.resource} signature={i === 0} cast={castAbilityRef} lockedBy={isUnlocked(heroChoice.cls, progressionHud.ranks, a.spell) ? null : unlockNode(heroChoice.cls, a.spell)?.name} />)}
+          {classDef.abilities.map((a, i) => { const v = domainOn && a.alt ? a.alt : a;
+            return <SpellSlot key={v.spell} store={hudStore} spell={v.spell} hotkey={a.key} label={v.label} resource={classDef.resource} signature={i === 0 || v !== a} cast={castAbilityRef} lockedBy={isUnlocked(heroChoice.cls, progressionHud.ranks, a.spell) ? null : unlockNode(heroChoice.cls, a.spell)?.name} />; })}
           <span className="hotbar-sep" aria-hidden="true" />
           <button type="button" className="slot-btn util" onClick={toggleQuest} title="Diário de viagem (J)"><span className="slot-face">{ICONS.journal}</span><span className="slot-key">J</span><span className="slot-name">Jornada</span></button>
           <button type="button" className="slot-btn util" onClick={toggleHelp} title="Controles (H)"><span className="slot-face">{ICONS.help}</span><span className="slot-key">H</span><span className="slot-name">Ajuda</span></button>
