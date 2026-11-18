@@ -365,9 +365,9 @@ export type MathKit = {
   effect: (life: number, step: (t: number, dt: number) => void) => void;
   shake: (amount: number) => void;
   /** Dano em área (crítico, buffs e tamanho aplicados). Retorna se acertou alguém. */
-  hit: (at: THREE.Vector3, radius: number, amount: number) => boolean;
+  hit: (at: THREE.Vector3, radius: number, amount: number, pvpCap?: { hits: Map<string, number>; max: number }) => boolean;
   /** Dano em linha; once evita acertar o mesmo alvo duas vezes no mesmo feitiço. */
-  line: (from: THREE.Vector3, to: THREE.Vector3, radius: number, amount: number, once: Set<object>) => number;
+  line: (from: THREE.Vector3, to: THREE.Vector3, radius: number, amount: number, once: Set<object>, pvpCap?: { hits: Map<string, number>; max: number }) => number;
   sfx: (name: SfxName, v?: number) => void;
   size: () => number;
 };
@@ -502,6 +502,7 @@ export class MathSpells {
       return { n, x: c.x + Math.cos(th) * r, z: c.z + Math.sin(th) * r, at: .12 + i * .075, done: false, rad: .9 + i * .07 };
     });
     let age = 0;
+    const pvpCap = { hits: new Map<string, number>(), max: 3 }; // no PvP, no máx. 3 das 12 explosões acertam cada jogador
     k.sfx('chargeFull', .8);
     this.label('φ=1.618', c.clone().setY(c.y + 3.4), .4, MC.gold);
     k.effect(2, (t, dt) => {
@@ -517,7 +518,7 @@ export class MathSpells {
         const y = terrainHeight(p.x, p.z);
         if (!p.done) {
           p.done = true; this.v1.set(p.x, y + .9, p.z);
-          if (live) k.hit(this.v1, p.rad, 24);
+          if (live) k.hit(this.v1, p.rad, 24, pvpCap);
           k.flash(this.v1, MC.gold, 1 + p.rad * .5, .2); k.shock(this.v2.set(p.x, y + .08, p.z), UP, MC.cyan, p.rad * 1.3, .35);
           for (let i = 0; i < 5; i++) k.spark(p.x, y + .9, p.z, rr(-2.5, 2.5), rr(1, 4), rr(-2.5, 2.5), .5, .25, MC.white, MC.gold);
         }
@@ -603,6 +604,7 @@ export class MathSpells {
     const start = from.addScaledVector(d, 1.2), end = start.clone().addScaledVector(d, len);
     const f = (s: number) => 1.3 + .9 * Math.sin(s * .55) + .35 * Math.sin(s * 1.7);
     let age = 0, tick = .25;
+    const pvpCap = { hits: new Map<string, number>(), max: 3 }; // no PvP, no máx. 3 dos 5 golpes da área acertam cada jogador
     k.sfx('lightCharge', .8);
     k.effect(life, (_, dt) => {
       age += dt; const fill = smooth(age / .5) * len, fade = smooth((life - age) * 2);
@@ -624,7 +626,7 @@ export class MathSpells {
       if (tick <= 0 && age < life - .3) {
         tick = .5;
         const once = new Set<object>(), a = this.v1.copy(start).setY(gy0 + 1), b = this.v2.copy(start).addScaledVector(d, fill); b.y = terrainHeight(b.x, b.z) + 1;
-        if (live) k.line(a, b, 1.7, 34, once);
+        if (live) k.line(a, b, 1.7, 34, once, pvpCap);
         for (let i = 0; i < 6; i++) { const s = Math.random() * fill, x = start.x + d.x * s, z = start.z + d.z * s; k.spark(x, terrainHeight(x, z) + .3, z, 0, rr(2, 4), 0, .5, .3, MC.cyan, MC.white); }
       }
     });
