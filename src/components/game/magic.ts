@@ -596,8 +596,8 @@ export class MagicSystem {
       light: (p, c, pk, l, d) => { this.flashLight(p, c, pk, l, d); },
       effect: (life, step) => this.addEffect(new THREE.Group(), life, step),
       shake: a => { this.shake = Math.max(this.shake, a); },
-      hit: (at, r, amt) => this.hit(at, r, amt),
-      line: (a, b, r, amt, once) => this.mathLine(a, b, r, amt, once),
+      hit: (at, r, amt, cap) => this.hit(at, r, amt, false, cap),
+      line: (a, b, r, amt, once, cap) => this.mathLine(a, b, r, amt, once, cap),
       sfx: (n, v) => this.onSfx(n, v),
       size: () => this.progression.sizeMultiplier(),
     });
@@ -676,9 +676,9 @@ export class MagicSystem {
   /** Ataque básico do matemático (números saltando; na expansão, um × gigante). */
   mathSlash(at: Vec3, big: boolean) { this.math.slash(at, big); }
   /** Dano em linha das magias do matemático (crítico, buffs e tamanho como nas outras). */
-  private mathLine(a: Vec3, b: Vec3, r: number, amount: number, once: Set<object>) {
+  private mathLine(a: Vec3, b: Vec3, r: number, amount: number, once: Set<object>, pvpCap?: { hits: Map<string, number>; max: number }) {
     const crit = this.progression.rollCrit(), dmg = amount * this.progression.damageMultiplier() * this.buffDamage * crit;
-    const n = this.combat.damageSegment(a, b, r * this.progression.sizeMultiplier(), dmg, .5, p => { if (crit > 1) this.critFx(p); }, once);
+    const n = this.combat.damageSegment(a, b, r * this.progression.sizeMultiplier(), dmg, .5, p => { if (crit > 1) this.critFx(p); }, once, pvpCap);
     if (n > 0) { this.onConfirmedHit(); this.drain(dmg * n); }
     return n;
   }
@@ -1273,10 +1273,10 @@ export class MagicSystem {
    * Dano em área das técnicas novas: multiplicadores da árvore (mágico ou corpo a corpo), Brado, crítico e roubo de vida.
    * melee = golpe físico (usa o dano corpo a corpo em vez do mágico).
    */
-  private hit(at: Vec3, radius: number, amount: number, melee = false) {
+  private hit(at: Vec3, radius: number, amount: number, melee = false, pvpCap?: { hits: Map<string, number>; max: number }) {
     const crit = this.progression.rollCrit();
     const dmg = amount * (melee ? this.progression.meleeMultiplier() : this.progression.damageMultiplier()) * this.buffDamage * crit;
-    const n = this.combat.damageAt(at, radius * this.progression.sizeMultiplier(), dmg);
+    const n = this.combat.damageAt(at, radius * this.progression.sizeMultiplier(), dmg, pvpCap);
     if (n > 0) { this.onConfirmedHit(); this.drain(dmg * n); if (crit > 1) this.critFx(at); return true; }
     return false;
   }

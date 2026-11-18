@@ -901,7 +901,11 @@ export class CombatSystem {
 
   respawnPlayer() { this.health = this.maxHealth; }
 
-  damageAt(point: THREE.Vector3, radius: number, damage: number) {
+  /**
+   * pvpCap: feitiços de muitos golpes (Espiral de Fibonacci) limitam quantos acertam cada jogador no PvP — o teto
+   * suave do PvP vale por golpe, então 12 explosões somadas apagariam um jogador de uma vez. Inimigos não têm limite.
+   */
+  damageAt(point: THREE.Vector3, radius: number, damage: number, pvpCap?: { hits: Map<string, number>; max: number }) {
     let count = 0;
     for (const mob of this.mobs) {
       if (mob.health <= 0) continue;
@@ -912,6 +916,7 @@ export class CombatSystem {
     }
     for (const t of this.pvpTargets) {
       if (capsuleDistance(t.pos, point) > radius) continue;
+      if (pvpCap) { const n = pvpCap.hits.get(t.id) ?? 0; if (n >= pvpCap.max) continue; pvpCap.hits.set(t.id, n + 1); }
       this.hitPlayer(t, point, damage, radius, 1); count++;
     }
     for (const e of this.extraTargets) {
@@ -993,7 +998,7 @@ export class CombatSystem {
    * Dano ao longo de um segmento (raios contínuos). Cada inimigo é atingido no máximo uma vez por chamada;
    * knock escala o empurrão (raios aplicam vários "ticks" pequenos). onHit recebe o ponto de contato no raio.
    */
-  damageSegment(from: THREE.Vector3, to: THREE.Vector3, radius: number, damage: number, knock = .35, onHit?: (point: THREE.Vector3) => void, once?: Set<object>) {
+  damageSegment(from: THREE.Vector3, to: THREE.Vector3, radius: number, damage: number, knock = .35, onHit?: (point: THREE.Vector3) => void, once?: Set<object>, pvpCap?: { hits: Map<string, number>; max: number }) {
     let count = 0;
     const seg = this.segment.set(from, to);
     for (const mob of this.mobs) {
@@ -1011,6 +1016,7 @@ export class CombatSystem {
     for (const t of this.pvpTargets) {
       const key = this.pvpKey(t.id); if (once?.has(key)) continue;
       if (segmentCapsuleDistance(t.pos, from, to, this.pvpTmp) > radius) continue;
+      if (pvpCap) { const n = pvpCap.hits.get(t.id) ?? 0; if (n >= pvpCap.max) continue; pvpCap.hits.set(t.id, n + 1); } // ver damageAt
       once?.add(key);
       const contact = this.pvpTmp.clone();
       onHit?.(contact);
