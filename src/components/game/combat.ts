@@ -1205,12 +1205,12 @@ export class CombatSystem {
     m.knockback.set(pushX, 0, pushZ); m.stagger = m.staggerMax = .9; m.staggerPower = 1; m.attackTimer = Math.max(m.attackTimer, 1.4);
   }
   /** Jogador local recebeu um golpe de inimigo vindo do host (aplica escudo, resistência e invulnerabilidade daqui). */
-  receiveStrike(damage: number, fromX: number, fromZ: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  receiveStrike(damage: number, fromX: number, fromZ: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     if (this.invulnerable || this.health <= 0) return;
     this.tmpC.set(player.x, player.y + 2.2, player.z);
     if (this.isDodging()) { this.onDamageNumber(this.tmpC, 0, 'dodge'); return; }
     this.tmpA.set(player.x, player.y + .9, player.z); this.tmpB.set(fromX, player.y + 1, fromZ);
-    if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
+    if (block(this.tmpA, this.tmpB, damage)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
     this.onHurtFrom(fromX, fromZ);
@@ -1395,7 +1395,7 @@ export class CombatSystem {
     }
   }
 
-  update(delta: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  update(delta: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     const dt = Math.min(delta, .05);
     this.lastPlayer.copy(player);
     for (const mob of this.mobs) {
@@ -1489,7 +1489,7 @@ export class CombatSystem {
   /* ------------------------------------------------------------------ *
    *  Per-mob simulation
    * ------------------------------------------------------------------ */
-  private updateMob(mob: Mob, dt: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  private updateMob(mob: Mob, dt: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     const stats = MOB_STATS[mob.kind], root = mob.root, pos = root.position;
     const dx = player.x - pos.x, dz = player.z - pos.z;
     const distance = Math.hypot(dx, dz);
@@ -1651,7 +1651,7 @@ export class CombatSystem {
     }
   }
 
-  private resolveStrike(mob: Mob, def: AttackDef, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  private resolveStrike(mob: Mob, def: AttackDef, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     const stats = MOB_STATS[mob.kind], root = mob.root;
     const dx = player.x - root.position.x, dz = player.z - root.position.z;
     const dist = Math.hypot(dx, dz);
@@ -1671,7 +1671,7 @@ export class CombatSystem {
     if (this.isDodging()) { this.onDamageNumber(this.tmpC, 0, 'dodge'); return; } // esquiva: invulnerável
     this.tmpA.set(player.x, player.y + .9, player.z);
     this.tmpB.set(root.position.x, root.position.y + 1, root.position.z);
-    if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
+    if (block(this.tmpA, this.tmpB, stats.damage * def.damage)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = stats.damage * def.damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
     this.onHurtFrom(root.position.x, root.position.z);

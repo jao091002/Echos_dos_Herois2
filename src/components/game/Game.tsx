@@ -43,6 +43,8 @@ type CombatHud = {
   mana: number; maxMana: number; health: number; maxHealth: number; alive: number; shield: boolean; flying: boolean; blocks: number; brado: boolean; bencao: boolean; despertar: boolean;
   /** Plano Cartesiano (matemático) aberto. */
   domain: boolean;
+  /** Guarda automática do plano: % de vida, ou segundos de recarga (null = sem guarda). */
+  guard: { frac: number; cd: number } | null;
   cooldowns: Record<SpellId, number>; cdFrac: Record<SpellId, number>;
 };
 /** Quanto a câmera "entra na mira": cheio ao carregar/disparar o Zoltraak. */
@@ -138,7 +140,7 @@ function HudPills({ store }: { store: HudStore }) {
     {h.brado && <span className="pill">⚔ Brado de Guerra</span>}
     {h.bencao && <span className="pill">✚ Bênção</span>}
     {h.despertar && <span className="pill">✦ Despertar</span>}
-    {h.domain && <span className="pill pill-gold">Σ Plano Cartesiano</span>}
+    {h.domain && <span className="pill pill-gold">Σ Plano Cartesiano{h.guard && (h.guard.cd > 0 ? ` · guarda volta em ${Math.ceil(h.guard.cd)} s` : ` · guarda ${Math.round(h.guard.frac * 100)}%`)}</span>}
   </>;
 }
 function EnemiesLeft({ store }: { store: HudStore }) {
@@ -253,7 +255,7 @@ export default function Game() {
   // HUD de combate (mana, vida, recargas) num store próprio: muda várias vezes por segundo em combate e só os
   // componentes do HUD re-renderizam — antes o componente inteiro do jogo (menus, árvore etc.) era refeito a cada mudança
   const hudStoreRef = useRef<HudStore | null>(null);
-  if (!hudStoreRef.current) hudStoreRef.current = createHudStore({ mana: 100, maxMana: 100, health: 100, maxHealth: 100, alive: 7, shield: false, flying: false, blocks: 0, brado: false, bencao: false, despertar: false, domain: false, cooldowns: NO_CD, cdFrac: NO_CD });
+  if (!hudStoreRef.current) hudStoreRef.current = createHudStore({ mana: 100, maxMana: 100, health: 100, maxHealth: 100, alive: 7, shield: false, flying: false, blocks: 0, brado: false, bencao: false, despertar: false, domain: false, guard: null, cooldowns: NO_CD, cdFrac: NO_CD });
   const hudStore = hudStoreRef.current;
   const [progressionHud, setProgressionHud] = useState<ProgressionSnapshot>({ level: 1, experience: 0, nextLevelXp: 100, skillPoints: 0, ranks: { root: 1 }, cls: 'maga', stats: new PlayerProgression().stats, inventory: { echoFragment: 0, sentinelCore: 0, wolfPelt: 0, banditToken: 0, demonAsh: 0, moonFang: 0, ancientSigil: 0, demonHeart: 0 } });
   const [npcDialog, setNpcDialog] = useState(false);
@@ -599,6 +601,9 @@ export default function Game() {
     const combat = new CombatSystem(scene, amount => progression.recordExperience(Math.round(amount * xpBonus())), item => { progression.addItem(item); story.loot(); }, showHint);
     const magic = new MagicSystem(scene, hero.root, combat, world.blockers, progression, () => { reticleHitUntil = elapsed + .28; });
     magic.setCamera(camera);
+    // guarda automática do Plano Cartesiano: os outros jogadores veem o mini escudo; aviso quando quebra/volta
+    magic.onGuard = (at, dir) => { if (net.online) net.send({ t: 'mg', o: vArr(at), d: vArr(dir) }); };
+    magic.onGuardState = broken => showHint(broken ? 'Σ A guarda do plano se esgotou · volta em alguns segundos' : 'Σ A guarda do plano voltou');
     remotes.attachForms(root => magic.createForm(root)); // asas de números / auréola Σ dos outros matemáticos
     remotes.attachBarriers(parent => magic.createBarrier(parent)); // Sinal de Igual (barreira de números) dos outros matemáticos
     /** Barreiras de números dos outros jogadores: sólidas para mim e para os inimigos. */
@@ -1198,7 +1203,7 @@ export default function Game() {
     const net = netRef.current!;
     const v3 = (a: unknown, out = new THREE.Vector3()) => { const v = a as number[]; return Array.isArray(v) && v.length === 3 ? out.set(+v[0] || 0, +v[1] || 0, +v[2] || 0) : out.set(0, 0, 0); };
     const vArr = (v: THREE.Vector3) => [r2(v.x), r2(v.y), r2(v.z)];
-    const netBlock = (from: THREE.Vector3, to: THREE.Vector3) => magic.blockProjectile(from, to);
+    const netBlock = (from: THREE.Vector3, to: THREE.Vector3, d?: number) => magic.blockProjectile(from, to, d);
     // dano do cliente → host; golpe de inimigo do host → jogador remoto; Agarrão do cliente → host
     combat.onHitRequest = (i, d, p, k) => net.sendTo(net.host, { t: 'hit', i, d: r2(d), p: vArr(p), k: r2(k), th: combat.threatMult });
     combat.isDodging = () => motor.dodging || elapsed < dodgeUntil;
@@ -1288,6 +1293,7 @@ export default function Game() {
           else showHint(`⚔ ${peerName(killer)} derrotou ${peerName(from)} em combate PvP.`);
           return;
         }
+        case 'mg': { const o = v3(m.o, tmpA); if (o.distanceTo(hero.root.position) < 70) magic.remoteGuard(o, v3(m.d, tmpB)); return; } // mini escudo de outro matemático
         case 'fx': {
           const o = v3(m.o, tmpA); if (o.distanceTo(hero.root.position) > 70) return;
           magic.remoteFx(m.s as SpellId, o, v3(m.d, tmpB), v3(m.g, tmpC)); return;
@@ -1622,7 +1628,7 @@ export default function Game() {
         magic.update(delta, elapsed);
         domainWatch();
         combat.barrier = magic.shieldBarrier(shieldBarrier);
-        combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to)); boss.update(delta, elapsed);
+        combat.update(delta, elapsed, hero.root.position, netBlock); boss.update(delta, elapsed);
         netPose = 'idle'; netOverlay = null; netSpeed = 0; netStep(delta, true);
       }
       if (uiOpenRef.current && !npcDialogRef.current && frameCount % 3 !== 0) return;
@@ -1734,7 +1740,7 @@ export default function Game() {
         magic.update(delta, elapsed);
         domainWatch(); // Plano Cartesiano: cutscenes, cores do corpo e barra de habilidades
         combat.barrier = magic.shieldBarrier(shieldBarrier);
-        combat.update(delta, elapsed, hero.root.position, (from, to) => magic.blockProjectile(from, to)); boss.update(delta, elapsed); bossHud();
+        combat.update(delta, elapsed, hero.root.position, netBlock); boss.update(delta, elapsed); bossHud();
         netStep(delta, true);
         // salvamento automático local a cada 30 s
         autosaveAcc += delta; if (autosaveAcc >= 30) { autosaveAcc = 0; saveNow(true); }
@@ -1768,7 +1774,7 @@ export default function Game() {
           const ids = SPELL_IDS;
           const cooldowns = {} as Record<SpellId, number>, cdFrac = {} as Record<SpellId, number>;
           for (const id of ids) { cooldowns[id] = Math.ceil(magic.cooldown(id) * 10) / 10; cdFrac[id] = Math.round(magic.cooldownFraction(id) * 40) / 40; }
-          const hud: CombatHud = { mana: Math.round(magic.mana), maxMana: Math.round(magic.maxMana), health: Math.round(combat.health), maxHealth: Math.round(combat.maxHealth), alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, brado: magic.buffs.brado > 0, bencao: magic.buffs.bencao > 0, despertar: magic.buffs.despertar > 0, domain: magic.domainActive, cooldowns, cdFrac };
+          const hud: CombatHud = { mana: Math.round(magic.mana), maxMana: Math.round(magic.maxMana), health: Math.round(combat.health), maxHealth: Math.round(combat.maxHealth), alive: combat.alive, shield: magic.shieldActive, flying: magic.flying, blocks: magic.blocks, brado: magic.buffs.brado > 0, bencao: magic.buffs.bencao > 0, despertar: magic.buffs.despertar > 0, domain: magic.domainActive, guard: (g => g && { frac: Math.round(g.frac * 20) / 20, cd: Math.ceil(g.cd) })(magic.guardInfo), cooldowns, cdFrac };
           const hudKey = JSON.stringify(hud);
           if (hudKey !== lastHudKey) { lastHudKey = hudKey; hudStore.set(hud); }
           const snap = progression.snapshot(), snapKey = JSON.stringify(snap);

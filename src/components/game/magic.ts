@@ -4,7 +4,13 @@ import type { SfxName } from './audio';
 import type { CombatSystem } from './combat';
 import type { PlayerProgression } from './progression';
 import { createChurch, type Church } from './sanctuary-church';
-import { GlyphParticles, MathForm, CartesianDomain, MathSpells, MathBarrier, isMathSpell, DOMAIN_DRAIN, MC } from './math';
+import { GlyphParticles, MathForm, CartesianDomain, MathSpells, MathBarrier, MiniGuards, isMathSpell, DOMAIN_DRAIN, MC } from './math';
+/**
+ * Guarda automática do Plano Cartesiano: com a expansão aberta, cada golpe que chega ergue sozinho um mini plano
+ * cartesiano entre o matemático e o atacante. hp: dano total que a guarda aguenta (× durabilidade do escudo da árvore);
+ * mana: custo de cada bloqueio; broken: recarga (s) depois de a guarda se esgotar; regen: vida/s de volta após idle s sem golpes.
+ */
+const GUARD = { hp: 140, mana: 4, broken: 8, regen: 12, idle: 2.5 };
 
 export type SpellId = 'zoltraak' | 'vollzanbel' | 'judradjim' | 'shield' | 'flight'
   // guerreiro
@@ -521,6 +527,15 @@ export class MagicSystem {
   domainActive = false;
   /** Forma transformada do herói local (asas de números e auréola Σ). */
   readonly mathForm: MathForm;
+  private readonly guards: MiniGuards; private readonly remoteGuards: MiniGuards;
+  private guardHp = 0; private guardCd = 0; private guardIdle = 0;
+  /** Mini escudo erguido (o jogo avisa os outros jogadores). at = centro do mini escudo, dir = para onde ele olha. */
+  onGuard: (at: Vec3, dir: Vec3) => void = () => {};
+  /** A guarda automática se esgotou (quebrou) ou voltou. */
+  onGuardState: (broken: boolean) => void = () => {};
+  private get guardMax() { return GUARD.hp * this.progression.stats.shieldHp; }
+  /** Para o HUD: -1 sem guarda; 0..1 vida da guarda; ou { cd } recarregando. */
+  get guardInfo() { return !this.domainActive ? null : this.guardCd > 0 ? { frac: 0, cd: this.guardCd } : { frac: this.guardHp / Math.max(1, this.guardMax), cd: 0 }; }
   private readonly lights: LightSlot[] = [];
   private projectiles: Projectile[] = []; private effects: Effect[] = [];
   /** Efeitos sonoros (ligado pelo jogo ao motor de áudio). */
@@ -573,6 +588,7 @@ export class MagicSystem {
     this.healTex = healSigilTexture();
     this.root.name = 'spell-effects'; scene.add(this.root); this.root.add(this.fx.points, this.soft.points, this.glyphs.points);
     this.domain = new CartesianDomain(this.root, this.glyphs);
+    this.guards = new MiniGuards(this.root, this.glyphs, 4); this.remoteGuards = new MiniGuards(this.root, this.glyphs, 3);
     this.math = new MathSpells({
       player, glyphs: this.glyphs,
       spark: (x, y, z, vx, vy, vz, life, size, c0, c1) => this.fx.emit(x, y, z, { vx, vy, vz, life, s0: size, s1: .02, c0, c1, kind: 1, drag: 2 }),
@@ -608,6 +624,7 @@ export class MagicSystem {
     const cost = this.progression.manaCost(COST.planoCartesiano);
     if (this.cooldowns.planoCartesiano > 0 || this.mana < cost) return false;
     this.mana -= cost; this.domainActive = true;
+    this.guardHp = this.guardMax; this.guardCd = 0; this.guardIdle = 0;
     this.domain.start(this.player.position); this.mathForm.set(true);
     this.math.domainBurst(this.player.position.clone(), true); this.onSfx('chargeFull', 1.2);
     return true;
@@ -618,6 +635,41 @@ export class MagicSystem {
     this.domainActive = false; this.domain.stop(); this.mathForm.set(false);
     this.math.domainBurst(this.player.position.clone(), false); this.onSfx('shieldDown', 1);
     this.cooldowns.planoCartesiano = this.cooldownMax.planoCartesiano = COOLDOWN.planoCartesiano;
+  }
+  /**
+   * Guarda automática (só com o Plano Cartesiano aberto): bloqueia qualquer golpe que passou pelo escudo principal.
+   * Gasta GUARD.mana por bloqueio e o dano bloqueado sai da vida da guarda; zerou, ela quebra e recarrega.
+   */
+  private autoGuard(from: Vec3, to: Vec3, damage: number) {
+    if (!this.domainActive || this.guardCd > 0) return false;
+    const cost = this.progression.manaCost(GUARD.mana);
+    if (this.mana < cost) return false;
+    const p = this.player.position, far = from.distanceToSquared(p) > to.distanceToSquared(p) ? from : to;
+    const dir = this.tN.set(far.x - p.x, 0, far.z - p.z);
+    if (dir.lengthSq() < 1e-4) dir.set(Math.sin(this.player.rotation.y), 0, Math.cos(this.player.rotation.y));
+    dir.normalize();
+    this.mana -= cost; this.guardHp -= damage * (1 - this.progression.stats.resist * .5); this.guardIdle = 0; this.blocks++;
+    const offset = this.tA.set(dir.x * .85, 1.2, dir.z * .85);
+    this.guards.pop(p, offset, dir);
+    const at = this.tB.copy(p).add(offset);
+    this.flash(at, MC.cyan, 1.3, .16); this.flashLight(at, MC.cyan, 5, .25, 7);
+    for (let i = 0; i < 12; i++) this.glyphs.emit(at.x, at.y, at.z, { vx: dir.x * rr(1, 3.5) + rr(-1, 1), vy: rr(-.3, 2), vz: dir.z * rr(1, 3.5) + rr(-1, 1), life: rr(.35, .7), s0: .18, s1: .04, c0: MC.white, c1: i % 3 ? MC.cyan : MC.gold, glyph: (i * 7) % 10, drag: 2.2, grav: 2.5 });
+    this.onSfx('shieldBlock'); this.shake = Math.max(this.shake, .1);
+    this.onGuard(at, dir);
+    if (this.guardHp <= 0) {
+      // a guarda se esgota: o mini plano se desfaz em números e só volta depois da recarga
+      this.guardHp = 0; this.guardCd = GUARD.broken * this.progression.stats.shieldCd;
+      for (let i = 0; i < 30; i++) this.glyphs.emit(p.x + rr(-.8, .8), p.y + rr(.4, 2), p.z + rr(-.8, .8), { vx: rr(-3, 3), vy: rr(0, 3), vz: rr(-3, 3), life: rr(.6, 1.1), s0: .2, s1: .05, c0: MC.white, c1: MC.cyan, glyph: i % 10, drag: 1.5, grav: 3.5 });
+      this.onSfx('shieldBreak'); this.shake = Math.max(this.shake, .22);
+      this.onGuardState(true);
+    }
+    return true;
+  }
+  /** Mini escudo de outro matemático (só visual, parado onde ele estava). */
+  remoteGuard(at: Vec3, dir: Vec3) {
+    this.remoteGuards.pop(at.clone(), new THREE.Vector3(), dir.clone().setY(0).normalize());
+    this.flash(at, MC.cyan, 1.1, .15);
+    for (let i = 0; i < 8; i++) this.glyphs.emit(at.x, at.y, at.z, { vx: dir.x * rr(1, 3) + rr(-1, 1), vy: rr(0, 2), vz: dir.z * rr(1, 3) + rr(-1, 1), life: rr(.3, .6), s0: .16, s1: .04, c0: MC.white, c1: MC.cyan, glyph: i, drag: 2.2, grav: 2.5 });
   }
   /** Teletransporte da Rotação i / Limite ao Infinito (o jogo já moveu o herói). */
   mathBlink(from: Vec3, to: Vec3, big: boolean) { this.math.blink(from, to, big, true); }
@@ -761,7 +813,7 @@ export class MagicSystem {
       this.santuarioFx(); // Catedral de Luz: compila os materiais dela já na pose erguida
       // matemático: plano cartesiano e auréola (ocultos no resto do tempo) e uma magia de cada tipo
       this.domain.setVisibleForCompile(true); this.forms.forEach(f => f.setCompile(true));
-      this.shieldRoot.visible = true; this.mathShield.setCompile(true);
+      this.shieldRoot.visible = true; this.mathShield.setCompile(true); this.guards.setCompile(true);
       this.math.cast('exponencial', far, FWD, far2, false); this.math.cast('seno', far, FWD, far2, false);
       renderer.compile(this.scene, camera);
       for (let i = 1; i <= 50; i++) { renderer.compile(this.root, camera, this.scene); this.update(.05, i * .05); }
@@ -771,7 +823,7 @@ export class MagicSystem {
       this.effects.forEach(e => { e.object.removeFromParent(); disposeTree(e.object); }); this.effects = [];
       this.santuario = null; this.church.hide();
       this.domain.setVisibleForCompile(false); this.forms.forEach(f => f.setCompile(false)); this.glyphs.clear();
-      this.mathShield.setCompile(false); this.shieldRoot.visible = this.shieldActive && !this.physicalShield;
+      this.mathShield.setCompile(false); this.guards.setCompile(false); this.shieldRoot.visible = this.shieldActive && !this.physicalShield;
       this.lights.forEach(sl => this.releaseLight(sl));
       this.fx.clear(); this.soft.clear(); this.shake = 0;
       this.mana = manaBefore; Object.assign(this.cooldowns, cds);
@@ -816,12 +868,13 @@ export class MagicSystem {
     return true;
   }
 
-  blockProjectile(from: Vec3, to: Vec3) {
-    if (!this.shieldActive || this.mana <= 0) return false;
+  /** O escudo segurado bloqueia o golpe? Se não, a guarda automática do Plano Cartesiano tenta. damage: dano do golpe (vida da guarda). */
+  blockProjectile(from: Vec3, to: Vec3, damage = 15) {
+    if (!this.shieldActive || this.mana <= 0) return this.autoGuard(from, to, damage);
     const half = this.shieldHalf;
     const center = this.shieldRoot.getWorldPosition(new THREE.Vector3());
     const segment = new THREE.Line3(from, to), closest = segment.closestPointToPoint(center, true, new THREE.Vector3());
-    if (closest.distanceTo(center) > half * 1.05) return false;
+    if (closest.distanceTo(center) > half * 1.05) return this.autoGuard(from, to, damage);
     if (this.physicalShield) {
       // guarda com a arma (guerreiro): só bloqueia golpes vindos da frente (o ponto mais distante do corpo precisa estar à frente)
       const p = this.player.position, far = from.distanceToSquared(p) > to.distanceToSquared(p) ? from : to;
@@ -892,6 +945,11 @@ export class MagicSystem {
       if (t >= 1) { s.active = false; s.light.intensity = 0; } else s.light.intensity = s.peak * (1 - t) * (1 - t);
     }
     this.domain.update(dt, elapsed, this.player.position);
+    if (this.domainActive) {
+      if (this.guardCd > 0) { this.guardCd = Math.max(0, this.guardCd - delta); if (this.guardCd === 0) { this.guardHp = this.guardMax; this.onGuardState(false); } }
+      else if ((this.guardIdle += delta) > GUARD.idle) this.guardHp = Math.min(this.guardMax, this.guardHp + GUARD.regen * delta);
+    }
+    this.guards.update(dt, elapsed); this.remoteGuards.update(dt, elapsed);
     for (const f of this.forms) f.update(dt, elapsed);
     this.fx.update(dt); this.soft.update(dt); this.glyphs.update(dt);
     this.shake = Math.max(0, this.shake - delta * 2.2);

@@ -694,7 +694,7 @@ export class MathSpells {
 export const MATH_WALL = 3.7;
 const PANEL_VS = `varying vec2 vUv; void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`;
 const PANEL_FS = `
-uniform float uTime; uniform float uAlpha; uniform float uReveal; uniform float uFlash; uniform vec2 uHit; uniform float uHitT;
+uniform float uTime; uniform float uAlpha; uniform float uReveal; uniform float uFlash; uniform vec2 uHit; uniform float uHitT; uniform float uMinor;
 uniform vec3 uDeep; uniform vec3 uGrid; uniform vec3 uAxis; uniform vec3 uCurve;
 varying vec2 vUv;
 vec3 toSRGB(vec3 c){return pow(max(c,vec3(0.0)),vec3(1.0/2.2));}
@@ -703,7 +703,7 @@ void main(){
   vec2 p=(vUv-.5)*8.; // coordenadas do plano: -4..4
   float box=max(abs(p.x),abs(p.y)); if(box>uReveal*4.)discard;
   vec2 g=abs(fract(p-.5)-.5); float grid=max(lineAA(g.x),lineAA(g.y));
-  vec2 g2=abs(fract(p*4.-.5)-.5); float minor=max(lineAA(g2.x),lineAA(g2.y))*.3;
+  vec2 g2=abs(fract(p*4.-.5)-.5); float minor=max(lineAA(g2.x),lineAA(g2.y))*.3*uMinor;
   float axis=max(lineAA(p.x)*1.6,lineAA(p.y)*1.6); axis=clamp(axis,0.,1.);
   // gráfico animado: y = 2·sen(1,3x − t) e uma parábola pontilhada
   float f=2.*sin(p.x*1.3-uTime*2.2); float fy=p.y-f; float curve=1.-smoothstep(0.,2.2,abs(fy)/max(fwidth(fy),1e-4));
@@ -713,7 +713,7 @@ void main(){
   float r=length(p-uHit*4.); float ring=exp(-pow((r-uHitT*9.)*1.6,2.))*(1.-uHitT)*1.5;
   float rim=smoothstep(uReveal*4.-.35,uReveal*4.,box)*step(uReveal,.999);
   vec3 c=uDeep*.55+uGrid*(grid*.55+minor)+uAxis*axis+uCurve*curve+uCurve*para*.6+uAxis*(edge+rim+ring+scan)+uAxis*uFlash*.6;
-  float a=.16+grid*.4+minor*.5+axis*.9+curve*.9+para*.5+edge+rim+ring+scan+uFlash*.35;
+  float a=.16*uMinor+.06+grid*(.2+.2*uMinor)+minor*.5+axis*.9+curve*.9+para*.5+edge+rim+ring+scan+uFlash*.35;
   gl_FragColor=vec4(toSRGB(c),clamp(a*uAlpha,0.,1.));
 }`;
 /**
@@ -724,13 +724,15 @@ void main(){
 export class MathBarrier {
   readonly mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private readonly u = {
-    uTime: { value: 0 }, uAlpha: { value: 0 }, uReveal: { value: 0 }, uFlash: { value: 0 }, uHit: { value: new THREE.Vector2(9, 9) }, uHitT: { value: 1 },
+    uTime: { value: 0 }, uAlpha: { value: 0 }, uReveal: { value: 0 }, uFlash: { value: 0 }, uHit: { value: new THREE.Vector2(9, 9) }, uHitT: { value: 1 }, uMinor: { value: 1 },
     uDeep: { value: MC.deep.clone() }, uGrid: { value: col('#4fb4ff') }, uAxis: { value: MC.white.clone() }, uCurve: { value: MC.gold.clone() },
   };
   private age = 0; private on = false; private readonly w = new THREE.Vector3();
-  constructor(parent: THREE.Object3D, private readonly glyphs: GlyphParticles) {
+  /** gs: escala dos números desenhados (os mini escudos usam números menores). */
+  constructor(parent: THREE.Object3D, private readonly glyphs: GlyphParticles, private readonly gs = 1) {
     this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(MATH_WALL, MATH_WALL), new THREE.ShaderMaterial({ uniforms: this.u, vertexShader: PANEL_VS, fragmentShader: PANEL_FS, transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }));
     this.mesh.renderOrder = 8; this.mesh.visible = false; this.mesh.name = 'math-barrier'; this.mesh.frustumCulled = false;
+    this.u.uMinor.value = gs < 1 ? 0 : 1; // mini escudo: sem a grade fina (pequena demais, estouraria em branco)
     parent.add(this.mesh);
   }
   setCompile(v: boolean) { this.mesh.visible = v || this.on; if (v) { this.u.uAlpha.value = .01; this.u.uReveal.value = 1; } }
@@ -750,7 +752,7 @@ export class MathBarrier {
     const g = this.glyphs, H = MATH_WALL / 2, step = MATH_WALL / 8, reveal = u.uReveal.value, a = fade;
     const put = (lx: number, ly: number, size: number, c: THREE.Color, alpha: number, glyph: number) => {
       if (Math.max(Math.abs(lx), Math.abs(ly)) > H * reveal) return;
-      this.w.set(lx, ly, .04).applyMatrix4(this.mesh.matrixWorld); g.draw(this.w.x, this.w.y, this.w.z, size, c, alpha, glyph);
+      this.w.set(lx, ly, .04).applyMatrix4(this.mesh.matrixWorld); g.draw(this.w.x, this.w.y, this.w.z, size * this.gs, c, alpha, glyph);
     };
     for (let i = -3; i <= 3; i++) {
       if (!i) continue;
@@ -771,4 +773,47 @@ export class MathBarrier {
     }
   }
   dispose() { this.mesh.removeFromParent(); this.mesh.geometry.dispose(); this.mesh.material.dispose(); }
+}
+
+/** Escala dos mini escudos em relação ao Sinal de Igual (painel de ~1,3 m). */
+const MINI = .36;
+type MiniSlot = { holder: THREE.Group; bar: MathBarrier; t: number; life: number; anchor: THREE.Vector3 | null; offset: THREE.Vector3; dir: THREE.Vector3 };
+/**
+ * Mini escudos automáticos do Plano Cartesiano: um pequeno plano cartesiano surge entre o matemático e o golpe,
+ * por um instante, e acompanha o corpo. Pool fixo (sem criar nada em combate).
+ */
+export class MiniGuards {
+  private readonly slots: MiniSlot[] = [];
+  private readonly look = new THREE.Vector3();
+  constructor(parent: THREE.Object3D, glyphs: GlyphParticles, count = 4) {
+    for (let i = 0; i < count; i++) {
+      const holder = new THREE.Group(); holder.name = 'math-mini-guard'; holder.visible = false; parent.add(holder);
+      this.slots.push({ holder, bar: new MathBarrier(holder, glyphs, MINI * 1.6), t: 0, life: 0, anchor: null, offset: new THREE.Vector3(), dir: new THREE.Vector3(0, 0, 1) });
+    }
+  }
+  setCompile(v: boolean) { const s = this.slots[0]; s.holder.visible = v || s.life > 0; s.holder.scale.setScalar(MINI); s.bar.setCompile(v); }
+  /** Ergue um mini escudo em anchor + offset, virado para dir. anchor é seguido enquanto o escudo dura. */
+  pop(anchor: THREE.Vector3, offset: THREE.Vector3, dir: THREE.Vector3, life = .75) {
+    const s = this.slots.find(x => x.life <= 0) ?? this.slots.reduce((a, b) => (a.t / a.life > b.t / b.life ? a : b));
+    s.anchor = anchor; s.offset.copy(offset); s.dir.copy(dir); s.t = 0; s.life = life; s.holder.visible = true;
+    s.bar.update(0, 0, false); s.bar.hit(0, 0);
+    this.place(s, 0);
+    return s.holder;
+  }
+  private place(s: MiniSlot, k: number) {
+    const a = s.anchor!; s.holder.position.copy(a).add(s.offset);
+    s.holder.lookAt(this.look.copy(s.holder.position).add(s.dir));
+    const x = clamp01(k / .18), back = 1 + 2.70158 * Math.pow(x - 1, 3) + 1.70158 * Math.pow(x - 1, 2); // estalo de abertura (easeOutBack)
+    s.holder.scale.setScalar(Math.max(.001, MINI * back));
+  }
+  update(dt: number, time: number) {
+    for (const s of this.slots) {
+      if (s.life <= 0) continue;
+      s.t += dt;
+      if (s.t >= s.life) { s.life = 0; s.holder.visible = false; s.bar.update(dt, time, false); continue; }
+      this.place(s, s.t);
+      const fade = clamp01((s.life - s.t) / .25);
+      s.bar.update(dt, time, true, fade, s.t > s.life - .25);
+    }
+  }
 }
