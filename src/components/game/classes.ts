@@ -1,17 +1,21 @@
 import type { SpellId } from './magic';
 
 /* ============================================================================
- *  CLASSES — Maga, Guerreiro e Clérigo
+ *  CLASSES — Maga, Guerreiro, Clérigo e Matemático
  *  Cada classe define a arma, os atributos base e as 5 habilidades da barra
  *  (as teclas são sempre as mesmas: Q, 1, 2, 3, 4, F, R; 3 e 4 se desbloqueiam na árvore de habilidades).
  * ========================================================================== */
 
-export type HeroClass = 'maga' | 'guerreiro' | 'clerigo';
+export type HeroClass = 'maga' | 'guerreiro' | 'clerigo' | 'matematico';
 export type WeaponKind = 'staff' | 'axe' | 'mace' | 'book';
 
 /** Como a habilidade é acionada: clique simples, segurar para carregar (Zoltraak) ou segurar para manter (escudo). */
 export type AbilityMode = 'tap' | 'charge' | 'hold';
-export type Ability = { spell: SpellId; key: 'Q' | '1' | '2' | '3' | '4' | 'F' | 'R'; label: string; mode: AbilityMode; melee?: boolean };
+export type Ability = {
+  spell: SpellId; key: 'Q' | '1' | '2' | '3' | '4' | 'F' | 'R'; label: string; mode: AbilityMode; melee?: boolean;
+  /** Versão mais forte usada enquanto a expansão de domínio (Plano Cartesiano) está ativa. */
+  alt?: { spell: SpellId; label: string };
+};
 
 export type ClassDef = {
   id: HeroClass; name: string; epithet: string; description: string; color: string; glyph: string;
@@ -74,8 +78,23 @@ export const CLASSES: Record<HeroClass, ClassDef> = {
     ],
     traits: ['Livro sagrado', 'Cura e suporte ao grupo', 'Lanças de luz à distância'],
   },
+  matematico: {
+    id: 'matematico', name: 'Matemático', epithet: 'Senhor dos Números', glyph: 'Σ', color: '#5fd6ff', weapon: 'book', resource: 'MANA',
+    description: 'Escreve a realidade com números: ondas seno, rajadas de algarismos, explosões exponenciais e o círculo de π. Na ult, abre o Plano Cartesiano: ganha asas de números e uma auréola Σ, e cada habilidade vira a sua forma mais forte.',
+    health: 110, resist: .04, attack: { damage: 32, radius: 1.3, reach: 2.15 },
+    abilities: [
+      { spell: 'seno', key: 'Q', label: 'Onda Seno', mode: 'tap', alt: { spell: 'fourier', label: 'Série de Fourier' } },
+      { spell: 'numeros', key: '1', label: 'Rajada Numérica', mode: 'tap', alt: { spell: 'fibonacci', label: 'Espiral de Fibonacci' } },
+      { spell: 'exponencial', key: '2', label: 'Explosão Exponencial', mode: 'tap', alt: { spell: 'euler', label: 'Identidade de Euler' } },
+      { spell: 'piCirculo', key: '3', label: 'Círculo de π', mode: 'tap', alt: { spell: 'integral', label: 'Integral Definida' } },
+      { spell: 'imaginario', key: '4', label: 'Rotação i', mode: 'tap', alt: { spell: 'infinito', label: 'Limite ao Infinito' } },
+      { spell: 'shield', key: 'F', label: 'Sinal de Igual', mode: 'hold' },
+      { spell: 'planoCartesiano', key: 'R', label: 'Plano Cartesiano', mode: 'tap' },
+    ],
+    traits: ['Magia de números à distância', 'Ult: expansão de domínio', 'Ataques mais fortes na expansão'],
+  },
 };
-export const CLASS_LIST: HeroClass[] = ['maga', 'guerreiro', 'clerigo'];
+export const CLASS_LIST: HeroClass[] = ['maga', 'guerreiro', 'clerigo', 'matematico'];
 
 /* ---------------------------------------------------------------- aparência */
 export type Appearance = { body: string; joints: string };
@@ -85,6 +104,7 @@ export const DEFAULT_APPEARANCE: Record<HeroClass, Appearance> = {
   maga: { body: '#c9ccd2', joints: '#a86bff' },
   guerreiro: { body: '#3b3f47', joints: '#e0703c' },
   clerigo: { body: '#d8c7a4', joints: '#f3c95a' },
+  matematico: { body: '#5a6e8c', joints: '#5fe0b0' },
 };
 
 export type HeroChoice = { cls: HeroClass; look: Appearance };

@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { MeshoptSimplifier } from 'meshoptimizer';
 
 /*
  * Skinning procedural para modelos estáticos (malhas sem esqueleto, ex.: lobo e demônio gerados por IA).
@@ -200,4 +201,32 @@ export function placeAt(root: THREE.Object3D, obj: THREE.Object3D, p: V3) {
 export function toLocal(root: THREE.Object3D, obj: THREE.Object3D, p: V3) {
   obj.updateWorldMatrix(true, false);
   return obj.worldToLocal(root.localToWorld(new THREE.Vector3(p[0], p[1], p[2])));
+}
+
+/**
+ * Simplificação por erro quadrático (meshoptimizer): colapsa arestas onde menos muda a forma, preservando as
+ * costuras de UV e normais. A redução em grade fazia vértices vizinhos de lados opostos de uma costura irem para
+ * posições médias diferentes, abrindo rachaduras escuras no vestido e no cabelo.
+ */
+export function simplifyGeometry(geo: THREE.BufferGeometry, triangles: number) {
+  const pos = geo.attributes.position as THREE.BufferAttribute, nor = geo.attributes.normal as THREE.BufferAttribute, uv = geo.attributes.uv as THREE.BufferAttribute;
+  const n = pos.count, P = new Float32Array(n * 3), A = new Float32Array(n * 5);
+  for (let i = 0; i < n; i++) {
+    P[i * 3] = pos.getX(i); P[i * 3 + 1] = pos.getY(i); P[i * 3 + 2] = pos.getZ(i);
+    A[i * 5] = nor.getX(i); A[i * 5 + 1] = nor.getY(i); A[i * 5 + 2] = nor.getZ(i); A[i * 5 + 3] = uv.getX(i); A[i * 5 + 4] = uv.getY(i);
+  }
+  const src = geo.index ? Uint32Array.from(geo.index.array as ArrayLike<number>) : Uint32Array.from({ length: n }, (_, i) => i);
+  // normais pesam pouco (silhueta manda), UV pesa mais (a textura não pode escorregar)
+  const [idx] = MeshoptSimplifier.simplifyWithAttributes(src, P, 3, A, 5, [.3, .3, .3, 1.2, 1.2], null, Math.min(src.length, triangles * 3), .02);
+  const [remap, m] = MeshoptSimplifier.compactMesh(idx);
+  const OP = new Float32Array(m * 3), ON = new Float32Array(m * 3), OU = new Float32Array(m * 2);
+  for (let i = 0; i < n; i++) {
+    const j = remap[i]; if (j === 0xffffffff) continue;
+    OP[j * 3] = P[i * 3]; OP[j * 3 + 1] = P[i * 3 + 1]; OP[j * 3 + 2] = P[i * 3 + 2];
+    ON[j * 3] = A[i * 5]; ON[j * 3 + 1] = A[i * 5 + 1]; ON[j * 3 + 2] = A[i * 5 + 2]; OU[j * 2] = A[i * 5 + 3]; OU[j * 2 + 1] = A[i * 5 + 4];
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(OP, 3)); out.setAttribute('normal', new THREE.BufferAttribute(ON, 3)); out.setAttribute('uv', new THREE.BufferAttribute(OU, 2));
+  out.setIndex(new THREE.BufferAttribute(m > 65535 ? idx : new Uint16Array(idx), 1));
+  return out;
 }

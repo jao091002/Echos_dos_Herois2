@@ -192,6 +192,42 @@ export const SKILL_TREES: Record<HeroClass, SkillTree> = {
     ['Fé máxima', s => `${100 + s.manaMax}`], ['Regeneração', s => `${s.regen.toFixed(1)}/s`], ['Recarga', s => pct(-s.cdr)],
     ['Barreira', s => pct(s.shieldHp - 1)], ['Resistência', s => pct(s.resist)], ['Vida máxima', s => `${s.maxHealth + 25}`],
   ]),
+
+  /* ------------------------------------------------------------------ MATEMÁTICO */
+  matematico: tree({
+    alg: { name: 'Álgebra', subtitle: 'Dano, crítico e área das fórmulas', color: '#5fd6ff' },
+    geo: { name: 'Geometria', subtitle: 'Sinal de Igual, resistência e vida', color: '#b49cff' },
+    cal: { name: 'Cálculo', subtitle: 'Mana, recargas e o Plano Cartesiano', color: '#ffd36b' },
+  }, [
+    ROOT('Primeiro Axioma', 'Tudo começa com uma verdade que não precisa de prova. Escolha o que vai demonstrar.'),
+    { id: 'x_a1', branch: 'alg', name: 'Potência', glyph: '^', max: 5, reqs: ['root'], ang: A.a1, r: 105, description: 'Cada fórmula elevada a um expoente maior.', perRank: '+8% de dano mágico', per: { damage: .08 } },
+    { id: 'x_a2', branch: 'alg', name: 'Variável Livre', glyph: 'x', max: 5, reqs: ['root'], ang: A.a2, r: 105, description: 'Mais espaço na memória para guardar mana.', perRank: '+15 de mana máxima', per: { manaMax: 15 } },
+    { id: 'x_a3', branch: 'alg', name: 'Fatorial', glyph: '!', max: 4, reqs: ['x_a1'], ang: A.b1, r: 190, description: 'Os críticos se multiplicam por si mesmos.', perRank: '+15% de dano crítico', per: { critDmg: .15 } },
+    { id: 'x_a4', branch: 'alg', name: 'Probabilidade', glyph: '%', max: 5, reqs: ['x_a1'], ang: A.b2, r: 200, description: 'Você calcula a chance exata de acertar o ponto fraco.', perRank: '+4% de chance de crítico', per: { crit: .04 } },
+    { id: 'x_a5', branch: 'alg', name: 'Escala', glyph: '×', max: 3, reqs: ['x_a2'], ang: A.b3, r: 190, description: 'Ondas, espirais e explosões cobrem uma área maior.', perRank: '+8% no tamanho e na área das magias', per: { size: .08 } },
+    { id: 'x_a6', branch: 'alg', name: 'Círculo de π', glyph: 'π', max: 1, reqs: ['x_a3', 'x_a4'], ang: A.k1, r: 285, unlock: 'piCirculo', description: 'Nova habilidade (tecla 3): os dígitos de π orbitam você e ferem quem chegar perto. Na expansão vira a Integral Definida.', perRank: 'Desbloqueia Círculo de π', once: { damage: .04 } },
+    { id: 'x_a7', branch: 'alg', name: 'Teorema Fundamental', glyph: '❖', max: 1, reqs: ['x_a4', 'x_a5'], ang: A.k2, r: 285, keystone: true, description: 'A prova está completa: toda magia ganha força, eficiência e críticos mais fortes.', perRank: '+15% de dano · −8% no custo · +40% de dano crítico', once: { damage: .15, costMult: -.08, critDmg: .4 } },
+
+    { id: 'x_g1', branch: 'geo', name: 'Igualdade', glyph: '=', max: 5, reqs: ['root'], ang: B.a1, r: 105, description: 'O Sinal de Igual equilibra mais golpes antes de quebrar.', perRank: '+20% de durabilidade do escudo', per: { shieldHp: .2 } },
+    { id: 'x_g2', branch: 'geo', name: 'Congruência', glyph: '≅', max: 5, reqs: ['root'], ang: B.a2, r: 105, description: 'Seu corpo é uma figura estável: todo dano recebido é reduzido.', perRank: '−4% do dano recebido', per: { resist: .04 } },
+    { id: 'x_g3', branch: 'geo', name: 'Ângulo Reto', glyph: '∟', max: 3, reqs: ['x_g1'], ang: B.b1, r: 190, description: 'Os impactos desviam a 90° e desgastam menos o escudo.', perRank: '−10% de desgaste por golpe bloqueado', per: { blockCost: -.1 } },
+    { id: 'x_g4', branch: 'geo', name: 'Área Máxima', glyph: '□', max: 5, reqs: ['x_g2'], ang: B.b2, r: 200, description: 'Mais superfície, mais vida.', perRank: '+12 de vida máxima', per: { maxHealth: 12 } },
+    { id: 'x_g5', branch: 'geo', name: 'Simetria', glyph: '◇', max: 3, reqs: ['x_g2'], ang: B.b3, r: 190, description: 'O corpo se recompõe em equilíbrio.', perRank: '+0,4 de vida por segundo', per: { regen: .4 } },
+    { id: 'x_g6', branch: 'geo', name: 'Prova por Contradição', glyph: '⊥', max: 1, reqs: ['x_g3', 'x_g4'], ang: B.k1, r: 285, keystone: true, description: 'Cada golpe que tenta te refutar devolve mana e vida.', perRank: 'Cada bloqueio devolve 5 de mana e 4 de vida', once: { blockMana: 5, blockHeal: 4 } },
+    { id: 'x_g7', branch: 'geo', name: 'Sólido Platônico', glyph: '⬡', max: 3, reqs: ['x_g4', 'x_g5'], ang: B.k2, r: 285, description: 'Forma perfeita: mais resistente e com o escudo de volta mais cedo.', perRank: '−3% de dano recebido · −15% na recarga do escudo', per: { resist: .03, shieldCd: -.15 } },
+
+    { id: 'x_c1', branch: 'cal', name: 'Derivada', glyph: '∂', max: 4, reqs: ['root'], ang: C.a1, r: 105, description: 'A taxa de variação da mana aumenta.', perRank: '+20% de regeneração de mana', per: { manaRegen: .2 } },
+    { id: 'x_c2', branch: 'cal', name: 'Velocidade Instantânea', glyph: 'v', max: 5, reqs: ['root'], ang: C.a2, r: 105, description: 'Você percorre o plano mais depressa.', perRank: '+4% de velocidade a pé', per: { moveSpeed: .04 } },
+    { id: 'x_c3', branch: 'cal', name: 'Limite', glyph: '→', max: 4, reqs: ['x_c1'], ang: C.b1, r: 190, description: 'As fórmulas tendem a voltar mais cedo.', perRank: '−4% em todas as recargas', per: { cdr: .04 } },
+    { id: 'x_c4', branch: 'cal', name: 'Série Convergente', glyph: 'Σ', max: 4, reqs: ['x_c1'], ang: C.b2, r: 200, description: 'Cada termo custa um pouco menos que o anterior.', perRank: '−4% no custo de mana', per: { costMult: -.04 } },
+    { id: 'x_c5', branch: 'cal', name: 'Integral Imprópria', glyph: '∫', max: 3, reqs: ['x_c2'], ang: C.b3, r: 190, description: 'Uma área infinita guardada num corpo finito.', perRank: '+12 de mana máxima · +6 de vida máxima', per: { manaMax: 12, maxHealth: 6 } },
+    { id: 'x_c6', branch: 'cal', name: 'Rotação i', glyph: 'i', max: 1, reqs: ['x_c3', 'x_c4'], ang: C.k1, r: 285, unlock: 'imaginario', description: 'Nova habilidade (tecla 4): multiplica sua posição por i e reaparece mais à frente. Na expansão vira o Limite ao Infinito.', perRank: 'Desbloqueia Rotação i', once: { moveSpeed: .03 } },
+    { id: 'x_c7', branch: 'cal', name: 'Domínio Contínuo', glyph: '❂', max: 1, reqs: ['x_c4', 'x_c5'], ang: C.k2, r: 285, keystone: true, description: 'O Plano Cartesiano pesa menos: mana máxima maior, custos menores e recargas curtas.', perRank: '+30 de mana máxima · −8% no custo · −6% nas recargas', once: { manaMax: 30, costMult: -.08, cdr: .06 } },
+  ], [
+    ['Dano mágico', s => pct(s.damage - 1)], ['Crítico', s => `${Math.round(s.crit * 100)}% · ×${s.critDmg.toFixed(2)}`], ['Mana máxima', s => `${100 + s.manaMax}`],
+    ['Custo de mana', s => pct(s.costMult - 1)], ['Recarga', s => pct(-s.cdr)], ['Área', s => pct(s.size - 1)],
+    ['Escudo', s => pct(s.shieldHp - 1)], ['Resistência', s => pct(s.resist)], ['Vida máxima', s => `${s.maxHealth + 10}`],
+  ]),
 };
 
 /** A habilidade está liberada para esta classe com estes níveis? (habilidades sem nó na árvore estão sempre liberadas) */

@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { registerSpecGloss, retargetModel, type Retarget, type ClipBlend } from './rig-retarget';
 import { clipsFor } from './anim-library';
-import { adoptFragments, bindSkin, computeSkin, placeAt, segDist, tearSeams, textureSampler, toLocal, type SkinSeg } from './mob-skin';
+import { adoptFragments, bindSkin, computeSkin, simplifyGeometry, placeAt, segDist, tearSeams, textureSampler, toLocal, type SkinSeg } from './mob-skin';
 import { terrainHeight, type WorldCollider } from './world';
 import type { SfxName } from './audio';
 import type { LootItemId } from './progression';
@@ -231,6 +231,8 @@ type Rig = {
   fit?: RigFit;
 };
 type MatEntry = { m: THREE.MeshStandardMaterial; base: number };
+/** Alvo extra (chefe de raid): cápsula vertical com os pés em pos; recebe os mesmos golpes que os inimigos. */
+export type ExtraTarget = { pos: THREE.Vector3; radius: number; low: number; high: number; alive: () => boolean; hit: (damage: number, point: THREE.Vector3) => void };
 type ArcFx = { pivot: THREE.Group; ring: THREE.Mesh; material: THREE.MeshBasicMaterial; axis: 'x' | 'y'; from: number; to: number };
 
 type Mob = {
@@ -538,6 +540,8 @@ export class CombatSystem {
   onKill: (kind: MobKind) => void = () => {};
   /** Barreira física (escudo) que os inimigos não atravessam; atualizada pelo jogo a cada quadro. */
   barrier: { center: THREE.Vector3; normal: THREE.Vector3; half: number } | null = null;
+  /** Barreiras sólidas de outros jogadores (Sinal de Igual do matemático): os inimigos também não atravessam. */
+  barriers: { center: THREE.Vector3; normal: THREE.Vector3; half: number }[] = [];
   private flinchPose = newPose();
   private colliders: WorldCollider[] = [];
   private colliderCount = -1;
@@ -627,34 +631,6 @@ export class CombatSystem {
     return out;
   }
 
-  /**
-   * Simplificação por erro quadrático (meshoptimizer): colapsa arestas onde menos muda a forma, preservando as
-   * costuras de UV e normais. A redução em grade fazia vértices vizinhos de lados opostos de uma costura irem para
-   * posições médias diferentes, abrindo rachaduras escuras no vestido e no cabelo.
-   */
-  private static simplify(geo: THREE.BufferGeometry, triangles: number) {
-    const pos = geo.attributes.position as THREE.BufferAttribute, nor = geo.attributes.normal as THREE.BufferAttribute, uv = geo.attributes.uv as THREE.BufferAttribute;
-    const n = pos.count, P = new Float32Array(n * 3), A = new Float32Array(n * 5);
-    for (let i = 0; i < n; i++) {
-      P[i * 3] = pos.getX(i); P[i * 3 + 1] = pos.getY(i); P[i * 3 + 2] = pos.getZ(i);
-      A[i * 5] = nor.getX(i); A[i * 5 + 1] = nor.getY(i); A[i * 5 + 2] = nor.getZ(i); A[i * 5 + 3] = uv.getX(i); A[i * 5 + 4] = uv.getY(i);
-    }
-    const src = geo.index ? Uint32Array.from(geo.index.array as ArrayLike<number>) : Uint32Array.from({ length: n }, (_, i) => i);
-    // normais pesam pouco (silhueta manda), UV pesa mais (a textura não pode escorregar)
-    const [idx] = MeshoptSimplifier.simplifyWithAttributes(src, P, 3, A, 5, [.3, .3, .3, 1.2, 1.2], null, Math.min(src.length, triangles * 3), .02);
-    const [remap, m] = MeshoptSimplifier.compactMesh(idx);
-    const OP = new Float32Array(m * 3), ON = new Float32Array(m * 3), OU = new Float32Array(m * 2);
-    for (let i = 0; i < n; i++) {
-      const j = remap[i]; if (j === 0xffffffff) continue;
-      OP[j * 3] = P[i * 3]; OP[j * 3 + 1] = P[i * 3 + 1]; OP[j * 3 + 2] = P[i * 3 + 2];
-      ON[j * 3] = A[i * 5]; ON[j * 3 + 1] = A[i * 5 + 1]; ON[j * 3 + 2] = A[i * 5 + 2]; OU[j * 2] = A[i * 5 + 3]; OU[j * 2 + 1] = A[i * 5 + 4];
-    }
-    const out = new THREE.BufferGeometry();
-    out.setAttribute('position', new THREE.BufferAttribute(OP, 3)); out.setAttribute('normal', new THREE.BufferAttribute(ON, 3)); out.setAttribute('uv', new THREE.BufferAttribute(OU, 2));
-    out.setIndex(new THREE.BufferAttribute(m > 65535 ? idx : new Uint16Array(idx), 1));
-    return out;
-  }
-
   private onDemonModel(scene: THREE.Object3D, meshopt: boolean) {
     scene.updateMatrixWorld(true);
     let src: THREE.Mesh | null = null; scene.traverse(o => { if (!src && (o as THREE.Mesh).isMesh) src = o as THREE.Mesh; });
@@ -668,7 +644,7 @@ export class CombatSystem {
     // o modelo original tem ~1 milhão de triângulos; ~90 mil bastam a esta distância de câmera.
     // Reserva (sem WASM): célula de ~3,7 cm na grade, que deixa rachaduras nas costuras de UV.
     let geo: THREE.BufferGeometry;
-    try { geo = meshopt ? CombatSystem.simplify(baked, 90000) : CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.016, 1 / 160); }
+    try { geo = meshopt ? simplifyGeometry(baked, 90000) : CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.016, 1 / 160); }
     catch { geo = CombatSystem.decimate(baked, CombatSystem.DEMON_HEIGHT * 0.016, 1 / 160); }
     baked.dispose();
     // o eixo do corpo (pernas, tronco) fica na origem; a caixa envolvente estava deslocada pela cauda do vestido
@@ -938,6 +914,10 @@ export class CombatSystem {
       if (capsuleDistance(t.pos, point) > radius) continue;
       this.hitPlayer(t, point, damage, radius, 1); count++;
     }
+    for (const e of this.extraTargets) {
+      if (!e.alive() || this.extraPointDist(e, point) > radius + e.radius) continue;
+      e.hit(damage, point); count++;
+    }
     return count;
   }
 
@@ -960,6 +940,23 @@ export class CombatSystem {
     this.onSfx('hitEnemy', damage / 60);
     this.tmpD.set(t.pos.x, t.pos.y + 1, t.pos.z); this.particles.emit(this.tmpD, '#ff8a6a', 6 + Math.min(8, Math.floor(damage / 6)), 3.2, 1.8, .4, 1);
   }
+  /** Chefes e outros alvos sem rig de inimigo (ver ExtraTarget). */
+  extraTargets: ExtraTarget[] = [];
+  private readonly exA = new THREE.Vector3(); private readonly exB = new THREE.Vector3(); private readonly exSeg = new THREE.Line3();
+  private extraPointDist(e: ExtraTarget, p: THREE.Vector3) {
+    this.exA.set(e.pos.x, e.pos.y + e.low, e.pos.z); this.exB.set(e.pos.x, e.pos.y + e.high, e.pos.z);
+    return this.exSeg.set(this.exA, this.exB).closestPointToPoint(p, true, this.tmpD).distanceTo(p);
+  }
+  /** Distância segmento → eixo da cápsula (amostrado em 5 alturas); out = ponto de contato no segmento. */
+  private extraSegDist(e: ExtraTarget, from: THREE.Vector3, to: THREE.Vector3, out: THREE.Vector3) {
+    let best = Infinity; const seg = this.exSeg.set(from, to);
+    for (let i = 0; i < 5; i++) {
+      this.exA.set(e.pos.x, e.pos.y + e.low + (e.high - e.low) * i / 4, e.pos.z);
+      const c = seg.closestPointToPoint(this.exA, true, this.exB), d = c.distanceTo(this.exA);
+      if (d < best) { best = d; out.copy(c); }
+    }
+    return best;
+  }
   /** Algum jogador hostil a até pad da cápsula do ponto? (colisão de projéteis) */
   hitsPlayer(point: THREE.Vector3, pad: number) { return this.pvpTargets.some(t => capsuleDistance(t.pos, point) <= pad); }
 
@@ -981,6 +978,11 @@ export class CombatSystem {
     }
     for (const t of this.pvpTargets) {
       if (segmentCapsuleDistance(t.pos, from, to, this.pvpTmp) > radius) continue;
+      const d = this.pvpTmp.distanceToSquared(from);
+      if (d < best) { best = d; out.copy(this.pvpTmp); }
+    }
+    for (const e of this.extraTargets) {
+      if (!e.alive() || this.extraSegDist(e, from, to, this.pvpTmp) > radius + e.radius) continue;
       const d = this.pvpTmp.distanceToSquared(from);
       if (d < best) { best = d; out.copy(this.pvpTmp); }
     }
@@ -1013,6 +1015,12 @@ export class CombatSystem {
       const contact = this.pvpTmp.clone();
       onHit?.(contact);
       this.hitPlayer(t, contact, damage, radius, knock); count++;
+    }
+    for (const e of this.extraTargets) {
+      if (once?.has(e) || !e.alive() || this.extraSegDist(e, from, to, this.pvpTmp) > radius + e.radius) continue;
+      once?.add(e);
+      const contact = this.pvpTmp.clone(); onHit?.(contact);
+      e.hit(damage, contact); count++;
     }
     return count;
   }
@@ -1197,12 +1205,12 @@ export class CombatSystem {
     m.knockback.set(pushX, 0, pushZ); m.stagger = m.staggerMax = .9; m.staggerPower = 1; m.attackTimer = Math.max(m.attackTimer, 1.4);
   }
   /** Jogador local recebeu um golpe de inimigo vindo do host (aplica escudo, resistência e invulnerabilidade daqui). */
-  receiveStrike(damage: number, fromX: number, fromZ: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  receiveStrike(damage: number, fromX: number, fromZ: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     if (this.invulnerable || this.health <= 0) return;
     this.tmpC.set(player.x, player.y + 2.2, player.z);
     if (this.isDodging()) { this.onDamageNumber(this.tmpC, 0, 'dodge'); return; }
     this.tmpA.set(player.x, player.y + .9, player.z); this.tmpB.set(fromX, player.y + 1, fromZ);
-    if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
+    if (block(this.tmpA, this.tmpB, damage)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
     this.onHurtFrom(fromX, fromZ);
@@ -1387,7 +1395,7 @@ export class CombatSystem {
     }
   }
 
-  update(delta: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  update(delta: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     const dt = Math.min(delta, .05);
     this.lastPlayer.copy(player);
     for (const mob of this.mobs) {
@@ -1481,7 +1489,7 @@ export class CombatSystem {
   /* ------------------------------------------------------------------ *
    *  Per-mob simulation
    * ------------------------------------------------------------------ */
-  private updateMob(mob: Mob, dt: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  private updateMob(mob: Mob, dt: number, elapsed: number, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     const stats = MOB_STATS[mob.kind], root = mob.root, pos = root.position;
     const dx = player.x - pos.x, dz = player.z - pos.z;
     const distance = Math.hypot(dx, dz);
@@ -1569,8 +1577,8 @@ export class CombatSystem {
 
     // --- terrain follow + body tilt to the slope
     // escudo sólido: empurra o inimigo para fora da muralha e anula o avanço contra ela
-    const bar = this.barrier;
-    if (bar) {
+    for (let bi = -1; bi < this.barriers.length; bi++) {
+      const bar = bi < 0 ? this.barrier : this.barriers[bi]; if (!bar) continue;
       const r = MOB_STATS[mob.kind].radius * .8, dx = pos.x - bar.center.x, dz = pos.z - bar.center.z;
       const depth = dx * bar.normal.x + dz * bar.normal.z, lat = -dx * bar.normal.z + dz * bar.normal.x;
       if (Math.abs(lat) < bar.half + r * .5 && depth > -1.2 && depth < r) {
@@ -1643,7 +1651,7 @@ export class CombatSystem {
     }
   }
 
-  private resolveStrike(mob: Mob, def: AttackDef, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3) => boolean) {
+  private resolveStrike(mob: Mob, def: AttackDef, player: THREE.Vector3, block: (from: THREE.Vector3, to: THREE.Vector3, damage?: number) => boolean) {
     const stats = MOB_STATS[mob.kind], root = mob.root;
     const dx = player.x - root.position.x, dz = player.z - root.position.z;
     const dist = Math.hypot(dx, dz);
@@ -1663,7 +1671,7 @@ export class CombatSystem {
     if (this.isDodging()) { this.onDamageNumber(this.tmpC, 0, 'dodge'); return; } // esquiva: invulnerável
     this.tmpA.set(player.x, player.y + .9, player.z);
     this.tmpB.set(root.position.x, root.position.y + 1, root.position.z);
-    if (block(this.tmpA, this.tmpB)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
+    if (block(this.tmpA, this.tmpB, stats.damage * def.damage)) { this.onDamageNumber(this.tmpC, 0, 'block'); return; }
     const dealt = stats.damage * def.damage * (1 - this.resist);
     this.health = Math.max(0, this.health - dealt); this.onSfx('hurt'); this.onDamageNumber(this.tmpC, Math.round(dealt), 'hurt');
     this.onHurtFrom(root.position.x, root.position.z);

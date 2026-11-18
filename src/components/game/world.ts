@@ -97,7 +97,14 @@ function baseHeight(x: number, z: number) {
   return (broad + detail) * meadowFade * edge;
 }
 
+/**
+ * Arena do Lieb (raid): bolsão fechado longe do mapa (a cúpula própria esconde o resto do mundo), com chão plano.
+ * Chega-se pelo Portal Arruinado (lieb.ts). O chão vale para tudo que usa terrainHeight (jogador, magias, efeitos).
+ */
+export const ARENA = { x: 0, z: 640, r: 26, y: 0 } as const;
+
 export function terrainHeight(x: number, z: number) {
+  if (Math.abs(z - ARENA.z) < ARENA.r + 40 && Math.abs(x - ARENA.x) < ARENA.r + 40) return ARENA.y;
   let h = baseHeight(x, z);
   const st = streamInfo(x, z);
   if (st.d < 16) {

@@ -3,6 +3,10 @@ import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { createHero, type HeroPose, type HeroRig } from './hero';
 import { CLASSES, type Appearance, type HeroClass } from './classes';
 import { terrainHeight } from './world';
+import { DOMAIN_LOOK, type MathForm, type MathBarrier, MATH_WALL } from './math';
+
+/** Barreira sólida (mesmo formato de CombatSystem.barrier): centro, normal para fora e meia-largura. */
+export type Barrier = { center: THREE.Vector3; normal: THREE.Vector3; half: number };
 
 /* ============================================================================
  *  JOGADORES REMOTOS — avatares dos outros jogadores da sala
@@ -22,9 +26,11 @@ export type RemoteState = {
   hp: number; mhp: number; cls: HeroClass; look: Appearance; name: string;
   /** PvP ligado (1) ou desligado (0/ausente). */
   pvp?: number;
+  /** Matemático com o Plano Cartesiano aberto (1): asas de números, auréola Σ e cores da expansão. */
+  dm?: number;
 };
 
-type Slot = { hero: HeroRig; id: string | null; st: RemoteState | null; cls: HeroClass | null; look: string; seen: number };
+type Slot = { hero: HeroRig; id: string | null; st: RemoteState | null; cls: HeroClass | null; look: string; seen: number; form: MathForm | null; barrier: MathBarrier | null; bar: Barrier };
 const PARK_Y = -400;
 
 export class RemotePlayers {
@@ -35,8 +41,29 @@ export class RemotePlayers {
     for (let i = 0; i < count; i++) {
       const hero = createHero(scene, { auraLight: false });
       hero.root.position.set(i * 3, PARK_Y, 0); hero.root.visible = false; hero.root.name = `remote-player-${i}`;
-      this.slots.push({ hero, id: null, st: null, cls: null, look: '', seen: 0 });
+      this.slots.push({ hero, id: null, st: null, cls: null, look: '', seen: 0, form: null, barrier: null, bar: { center: new THREE.Vector3(), normal: new THREE.Vector3(), half: MATH_WALL / 2 } });
     }
+  }
+
+  /** Asas de números + auréola do matemático para cada avatar (criadas uma vez, pelo sistema de magias). */
+  attachForms(make: (root: THREE.Object3D) => MathForm) { for (const s of this.slots) s.form = make(s.hero.root); }
+  /** Sinal de Igual (barreira de números) de cada avatar, à frente do peito como a do jogador local. */
+  attachBarriers(make: (parent: THREE.Object3D) => MathBarrier) {
+    for (const s of this.slots) { const holder = new THREE.Group(); holder.position.set(0, 1.45, 1.05); holder.name = 'remote-math-barrier'; s.hero.root.add(holder); s.barrier = make(holder); }
+  }
+  /** O avatar está segurando o Sinal de Igual (matemático com escudo, vivo)? */
+  private shielding(s: Slot) { return !!s.st && s.st.cls === 'matematico' && s.st.ov?.[0] === 'shield' && s.st.hp > 0; }
+  /** Barreiras de números ativas dos outros jogadores (colisão para o jogador local e, no host, para os inimigos). */
+  mathBarriers(out: Barrier[]) {
+    out.length = 0;
+    for (const s of this.slots) {
+      if (!s.id || !this.shielding(s)) continue;
+      const r = s.hero.root, yaw = r.rotation.y, b = s.bar;
+      b.normal.set(Math.sin(yaw), 0, Math.cos(yaw));
+      b.center.set(r.position.x + b.normal.x * 1.05, r.position.y + 1.45, r.position.z + b.normal.z * 1.05);
+      out.push(b);
+    }
+    return out;
   }
 
   /** Corpo esquelético (Xbot) para todos os avatares, a partir do glTF já carregado pelo herói local. */
@@ -56,15 +83,16 @@ export class RemotePlayers {
       s.hero.root.position.set(st.x, st.y, st.z); s.hero.root.rotation.y = st.yaw; s.hero.root.visible = true;
     }
     if (s.cls !== st.cls) { s.cls = st.cls; s.hero.setWeapon(CLASSES[st.cls]?.weapon ?? 'staff'); s.hero.ensureStaff(); }
-    const lookKey = `${st.look.body}|${st.look.joints}`;
-    if (s.look !== lookKey) { s.look = lookKey; s.hero.setAppearance(st.look); }
+    const lookKey = `${st.look.body}|${st.look.joints}|${st.dm ? 1 : 0}`;
+    if (s.look !== lookKey) { s.look = lookKey; s.hero.setAppearance(st.dm ? DOMAIN_LOOK : st.look); }
+    s.form?.set(!!st.dm);
     s.st = st; s.seen = now;
     return true;
   }
 
   remove(id: string) {
     const s = this.slots.find(x => x.id === id); if (!s) return;
-    s.id = null; s.st = null; s.hero.root.position.set(0, PARK_Y, 0); s.hero.root.visible = false;
+    s.id = null; s.st = null; s.form?.set(false, true); s.barrier?.update(0, 0, false); s.hero.root.position.set(0, PARK_Y, 0); s.hero.root.visible = false;
   }
   clear() { for (const s of this.slots) if (s.id) this.remove(s.id); }
 
@@ -83,6 +111,7 @@ export class RemotePlayers {
       root.userData.facing = st.yaw; root.userData.castKind = st.ck ?? undefined; root.userData.locoPose = st.lp;
       const ov = st.ov ? { mode: st.ov[0] as 'charge' | 'beam' | 'shield' | 'grab', power: st.ov[1] } : undefined;
       s.hero.update(time, dt, st.hp <= 0 ? 'defeat' : st.pose, st.spd, ov);
+      s.barrier?.update(dt, time, this.shielding(s), 1);
     }
   }
 
